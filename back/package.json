@@ -1,0 +1,26 @@
+{
+  "name": "back",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "d1:init": "wrangler d1 execute chack-db --file=schema.sql --local"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@graphql-tools/schema": "^10.0.23",
+    "grammy": "^1.21.1",
+    "graphql": "^16.8.1",
+    "graphql-scalars": "^1.22.4",
+    "graphql-type-json": "^0.3.2",
+    "graphql-yoga": "^5.1.1",
+    "hono": "^4.0.8"
+  },
+  "devDependencies": {
+    "wrangler": "^3.30.0"
+  }
+}

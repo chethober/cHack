@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+dist/
+.wrangler/
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Log files
+*.log
+logs/
+
+# Database files
+local.db
+local.db-journal
+local.db-wal
+
+# Temporary state
+resume.cfg
+temp_job_*.json

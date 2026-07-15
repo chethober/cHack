@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "chack-back",
+  "main": "src/index.js",
+  "compatibility_date": "2024-03-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "chack-db",
+      "database_id": "1d51b6f5-f361-4df2-a4c5-c49a3845d696"
+    }
+  ],
+  "vars": {
+    "GRAPHQL_ENDPOINT": "https://chack-back.chethober.workers.dev/graphql",
+    "TELEGRAM_BOT_TOKEN": "***REMOVED***",
+    "ADMIN_IDS": "***REMOVED***",
+    "RUNNERS": "VPS-1,VPS-2"
+  }
+}
