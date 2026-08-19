@@ -79,3 +79,77 @@ CREATE TABLE IF NOT EXISTS runners (
   country TEXT,
   last_seen INTEGER NOT NULL -- Unix timestamp in seconds
 );
+
+-- Findings table (Vulnerabilities, misconfigurations, takeover, CVEs)
+CREATE TABLE IF NOT EXISTS findings (
+  id TEXT PRIMARY KEY,
+  domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+  company_id TEXT REFERENCES companies(id) ON DELETE CASCADE,
+  tool TEXT NOT NULL,
+  severity TEXT NOT NULL, -- critical, high, medium, low, info
+  vuln_type TEXT NOT NULL, -- xss, sqli, takeover, secret, cve, cors, exposure, idor, ssrf, etc.
+  title TEXT NOT NULL,
+  url TEXT,
+  description TEXT,
+  evidence TEXT,
+  poc TEXT,
+  cve TEXT,
+  status TEXT NOT NULL DEFAULT 'open', -- open, verified, false_positive, resolved
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_findings_domain_id ON findings(domain_id);
+CREATE INDEX IF NOT EXISTS idx_findings_company_id ON findings(company_id);
+CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
+CREATE INDEX IF NOT EXISTS idx_findings_vuln_type ON findings(vuln_type);
+
+-- Discovered Endpoints / URLs table
+CREATE TABLE IF NOT EXISTS endpoints (
+  id TEXT PRIMARY KEY,
+  domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  method TEXT DEFAULT 'GET',
+  params TEXT DEFAULT '[]', -- JSON array of parameter names
+  status_code INTEGER,
+  content_type TEXT,
+  source TEXT, -- katana, gau, waymore, hakrawler, etc.
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_endpoints_domain_id ON endpoints(domain_id);
+CREATE INDEX IF NOT EXISTS idx_endpoints_url ON endpoints(url);
+
+-- Discovered Secrets & Leaks table (JS analysis, git/env exposure)
+CREATE TABLE IF NOT EXISTS secrets (
+  id TEXT PRIMARY KEY,
+  domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+  rule_name TEXT NOT NULL,
+  secret_type TEXT NOT NULL,
+  match_snippet TEXT NOT NULL,
+  file_url TEXT,
+  severity TEXT NOT NULL DEFAULT 'high', -- critical, high, medium, low
+  status TEXT NOT NULL DEFAULT 'open',
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_secrets_domain_id ON secrets(domain_id);
+CREATE INDEX IF NOT EXISTS idx_secrets_rule_name ON secrets(rule_name);
+
+-- Network Services & Port Scan table
+CREATE TABLE IF NOT EXISTS network_services (
+  id TEXT PRIMARY KEY,
+  domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+  ip TEXT NOT NULL,
+  port INTEGER NOT NULL,
+  protocol TEXT DEFAULT 'tcp',
+  service TEXT,
+  product TEXT,
+  version TEXT,
+  banner TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_net_services_domain_id ON network_services(domain_id);
+CREATE INDEX IF NOT EXISTS idx_net_services_ip_port ON network_services(ip, port);
+

@@ -134,6 +134,106 @@ const typeDefs = `
     status: String!
   }
 
+  type Finding {
+    id: ID!
+    domain_id: ID
+    company_id: ID
+    tool: String!
+    severity: String!
+    vuln_type: String!
+    title: String!
+    url: String
+    description: String
+    evidence: String
+    poc: String
+    cve: String
+    status: String!
+    created_at: DateTime!
+    updated_at: DateTime!
+  }
+
+  type Endpoint {
+    id: ID!
+    domain_id: ID
+    url: String!
+    method: String
+    params: JSON
+    status_code: Int
+    content_type: String
+    source: String
+    created_at: DateTime!
+  }
+
+  type Secret {
+    id: ID!
+    domain_id: ID
+    rule_name: String!
+    secret_type: String!
+    match_snippet: String!
+    file_url: String
+    severity: String!
+    status: String!
+    created_at: DateTime!
+  }
+
+  type NetworkService {
+    id: ID!
+    domain_id: ID
+    ip: String!
+    port: Int!
+    protocol: String
+    service: String
+    product: String
+    version: String
+    banner: String
+    created_at: DateTime!
+  }
+
+  input FindingInput {
+    id: ID
+    tool: String!
+    severity: String!
+    vuln_type: String!
+    title: String!
+    url: String
+    description: String
+    evidence: String
+    poc: String
+    cve: String
+    status: String
+  }
+
+  input EndpointInput {
+    id: ID
+    url: String!
+    method: String
+    params: JSON
+    status_code: Int
+    content_type: String
+    source: String
+  }
+
+  input SecretInput {
+    id: ID
+    rule_name: String!
+    secret_type: String!
+    match_snippet: String!
+    file_url: String
+    severity: String
+    status: String
+  }
+
+  input NetworkServiceInput {
+    id: ID
+    ip: String!
+    port: Int!
+    protocol: String
+    service: String
+    product: String
+    version: String
+    banner: String
+  }
+
   type Query {
     user(id: ID, username: String, number_id: BigInt): User
     users: [User!]!
@@ -162,6 +262,11 @@ const typeDefs = `
     # Scanner queries
     domainsToScan: [Company!]!
     ongoingJobs: [ScanJob!]!
+    findings(domain: String, severity: String): [Finding!]!
+    secrets(domain: String): [Secret!]!
+    endpoints(domain: String, limit: Int): [Endpoint!]!
+    networkServices(domain: String): [NetworkService!]!
+    domainReport(domain: String!): JSON!
   }
 
   type Mutation {
@@ -186,6 +291,13 @@ const typeDefs = `
     updatePortScanResults(domain: String!, ports: JSON!, ips: JSON!): Boolean!
     updateKatanaResults(domain: String!, results: [JSON!]!): Boolean!
     updateNucleiResults(domain: String!, results: JSON!): Boolean!
+    updateJsResults(domain: String!, results: [JSON!]!): Boolean!
+    updateExposureResults(domain: String!, results: [JSON!]!): Boolean!
+    updateTakeoverResults(domain: String!, results: [JSON!]!): Boolean!
+    createFindingsBatch(domain: String!, findings: [FindingInput!]!): Boolean!
+    createEndpointsBatch(domain: String!, endpoints: [EndpointInput!]!): Boolean!
+    createSecretsBatch(domain: String!, secrets: [SecretInput!]!): Boolean!
+    createNetworkServicesBatch(domain: String!, services: [NetworkServiceInput!]!): Boolean!
   }
 
   type Subscription {
@@ -403,6 +515,116 @@ const resolvers = {
         });
       }
       return enrichedJobs;
+    },
+    findings: async (_, { domain, severity }, { env }) => {
+      let query = `
+        SELECT f.* FROM findings f
+        JOIN domains d ON f.domain_id = d.id
+        LEFT JOIN companies c ON d.company_id = c.id
+        WHERE 1=1
+      `;
+      const binds = [];
+      if (domain) {
+        query += " AND (lower(d.host) = lower(?) OR lower(c.slug) = lower(?) OR lower(c.name) = lower(?))";
+        binds.push(domain, domain, domain);
+      }
+      if (severity) {
+        query += " AND lower(f.severity) = lower(?)";
+        binds.push(severity);
+      }
+      query += " ORDER BY CASE f.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END, f.created_at DESC";
+      const { results } = await env.DB.prepare(query).bind(...binds).all();
+      return results;
+    },
+    secrets: async (_, { domain }, { env }) => {
+      let query = `
+        SELECT s.* FROM secrets s
+        JOIN domains d ON s.domain_id = d.id
+        LEFT JOIN companies c ON d.company_id = c.id
+        WHERE 1=1
+      `;
+      const binds = [];
+      if (domain) {
+        query += " AND (lower(d.host) = lower(?) OR lower(c.slug) = lower(?) OR lower(c.name) = lower(?))";
+        binds.push(domain, domain, domain);
+      }
+      query += " ORDER BY s.created_at DESC";
+      const { results } = await env.DB.prepare(query).bind(...binds).all();
+      return results;
+    },
+    endpoints: async (_, { domain, limit = 200 }, { env }) => {
+      let query = `
+        SELECT e.* FROM endpoints e
+        JOIN domains d ON e.domain_id = d.id
+        LEFT JOIN companies c ON d.company_id = c.id
+        WHERE 1=1
+      `;
+      const binds = [];
+      if (domain) {
+        query += " AND (lower(d.host) = lower(?) OR lower(c.slug) = lower(?) OR lower(c.name) = lower(?))";
+        binds.push(domain, domain, domain);
+      }
+      query += " ORDER BY e.created_at DESC LIMIT ?";
+      binds.push(limit);
+      const { results } = await env.DB.prepare(query).bind(...binds).all();
+      return results;
+    },
+    networkServices: async (_, { domain }, { env }) => {
+      let query = `
+        SELECT ns.* FROM network_services ns
+        JOIN domains d ON ns.domain_id = d.id
+        LEFT JOIN companies c ON d.company_id = c.id
+        WHERE 1=1
+      `;
+      const binds = [];
+      if (domain) {
+        query += " AND (lower(d.host) = lower(?) OR lower(c.slug) = lower(?) OR lower(c.name) = lower(?))";
+        binds.push(domain, domain, domain);
+      }
+      query += " ORDER BY ns.port ASC";
+      const { results } = await env.DB.prepare(query).bind(...binds).all();
+      return results;
+    },
+    domainReport: async (_, { domain }, { env }) => {
+      const dom = await env.DB.prepare("SELECT * FROM domains WHERE lower(host) = lower(?)").bind(domain).first();
+      const comp = await env.DB.prepare("SELECT * FROM companies WHERE lower(name) = lower(?) OR lower(slug) = lower(?)").bind(domain, domain).first();
+      const companyId = dom ? dom.company_id : (comp ? comp.id : null);
+      
+      const { results: findings } = await env.DB.prepare(`
+        SELECT f.* FROM findings f
+        JOIN domains d ON f.domain_id = d.id
+        WHERE lower(d.host) = lower(?) OR d.company_id = ?
+      `).bind(domain, companyId).all();
+
+      const { results: secrets } = await env.DB.prepare(`
+        SELECT s.* FROM secrets s
+        JOIN domains d ON s.domain_id = d.id
+        WHERE lower(d.host) = lower(?) OR d.company_id = ?
+      `).bind(domain, companyId).all();
+
+      const { results: services } = await env.DB.prepare(`
+        SELECT ns.* FROM network_services ns
+        JOIN domains d ON ns.domain_id = d.id
+        WHERE lower(d.host) = lower(?) OR d.company_id = ?
+      `).bind(domain, companyId).all();
+
+      const stats = {
+        critical: findings.filter(f => f.severity.toLowerCase() === 'critical').length,
+        high: findings.filter(f => f.severity.toLowerCase() === 'high').length,
+        medium: findings.filter(f => f.severity.toLowerCase() === 'medium').length,
+        low: findings.filter(f => f.severity.toLowerCase() === 'low').length,
+        info: findings.filter(f => f.severity.toLowerCase() === 'info').length,
+        secrets: secrets.length,
+        services: services.length,
+      };
+
+      return {
+        domain,
+        stats,
+        findings,
+        secrets,
+        services
+      };
     }
   },
 
@@ -711,10 +933,193 @@ const resolvers = {
         await env.DB.batch(statements);
       }
       return true;
+    },
+    updateJsResults: async (_, { domain, results }, { env }) => {
+      const domRow = await env.DB.prepare("SELECT company_id FROM domains WHERE lower(host) = lower(?) LIMIT 1").bind(domain).first();
+      if (!domRow) return false;
+      const companyId = domRow.company_id;
+
+      const statements = [];
+      for (const result of results) {
+        const host = result.host || domain;
+        const patch = JSON.stringify({
+          js_findings: result.findings || [],
+          js_endpoints: result.endpoints || [],
+          last_js_scan: new Date().toISOString()
+        });
+
+        statements.push(
+          env.DB.prepare(
+            `UPDATE domains
+             SET data = json_patch(COALESCE(data, '{}'), ?),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE lower(host) = lower(?)`
+          ).bind(patch, host)
+        );
+      }
+
+      if (statements.length > 0) {
+        await env.DB.batch(statements);
+      }
+      return true;
+    },
+    updateExposureResults: async (_, { domain, results }, { env }) => {
+      const domRow = await env.DB.prepare("SELECT company_id FROM domains WHERE lower(host) = lower(?) LIMIT 1").bind(domain).first();
+      if (!domRow) return false;
+      const companyId = domRow.company_id;
+
+      const statements = [];
+      for (const result of results) {
+        const host = result.host || domain;
+        const patch = JSON.stringify({
+          exposures: result.exposures || [],
+          last_exposure_scan: new Date().toISOString()
+        });
+
+        statements.push(
+          env.DB.prepare(
+            `UPDATE domains
+             SET data = json_patch(COALESCE(data, '{}'), ?),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE lower(host) = lower(?)`
+          ).bind(patch, host)
+        );
+      }
+
+      if (statements.length > 0) {
+        await env.DB.batch(statements);
+      }
+      return true;
+    },
+    updateTakeoverResults: async (_, { domain, results }, { env }) => {
+      const domRow = await env.DB.prepare("SELECT company_id FROM domains WHERE lower(host) = lower(?) LIMIT 1").bind(domain).first();
+      if (!domRow) return false;
+
+      const statements = [];
+      for (const result of results) {
+        const host = result.host || domain;
+        const patch = JSON.stringify({
+          takeover: result.takeover || null,
+          last_takeover_scan: new Date().toISOString()
+        });
+
+        statements.push(
+          env.DB.prepare(
+            `UPDATE domains
+             SET data = json_patch(COALESCE(data, '{}'), ?),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE lower(host) = lower(?)`
+          ).bind(patch, host)
+        );
+      }
+
+      if (statements.length > 0) {
+        await env.DB.batch(statements);
+      }
+      return true;
+    },
+    createFindingsBatch: async (_, { domain, findings }, { env }) => {
+      const domRow = await env.DB.prepare("SELECT id, company_id FROM domains WHERE lower(host) = lower(?) LIMIT 1").bind(domain).first();
+      const domainId = domRow ? domRow.id : null;
+      const companyId = domRow ? domRow.company_id : null;
+
+      const statements = [];
+      for (const f of findings) {
+        const id = f.id || crypto.randomUUID();
+        statements.push(
+          env.DB.prepare(`
+            INSERT OR REPLACE INTO findings (id, domain_id, company_id, tool, severity, vuln_type, title, url, description, evidence, poc, cve, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            id, domainId, companyId,
+            f.tool, f.severity, f.vuln_type, f.title,
+            f.url || null, f.description || null, f.evidence || null,
+            f.poc || null, f.cve || null, f.status || 'open'
+          )
+        );
+      }
+
+      if (statements.length > 0) {
+        await env.DB.batch(statements);
+      }
+      return true;
+    },
+    createEndpointsBatch: async (_, { domain, endpoints }, { env }) => {
+      const domRow = await env.DB.prepare("SELECT id FROM domains WHERE lower(host) = lower(?) LIMIT 1").bind(domain).first();
+      const domainId = domRow ? domRow.id : null;
+
+      const statements = [];
+      for (const ep of endpoints) {
+        const id = ep.id || crypto.randomUUID();
+        const params = Array.isArray(ep.params) ? JSON.stringify(ep.params) : (typeof ep.params === 'string' ? ep.params : '[]');
+        statements.push(
+          env.DB.prepare(`
+            INSERT OR REPLACE INTO endpoints (id, domain_id, url, method, params, status_code, content_type, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            id, domainId, ep.url, ep.method || 'GET',
+            params, ep.status_code || null, ep.content_type || null, ep.source || 'crawler'
+          )
+        );
+      }
+
+      if (statements.length > 0) {
+        await env.DB.batch(statements);
+      }
+      return true;
+    },
+    createSecretsBatch: async (_, { domain, secrets }, { env }) => {
+      const domRow = await env.DB.prepare("SELECT id FROM domains WHERE lower(host) = lower(?) LIMIT 1").bind(domain).first();
+      const domainId = domRow ? domRow.id : null;
+
+      const statements = [];
+      for (const s of secrets) {
+        const id = s.id || crypto.randomUUID();
+        statements.push(
+          env.DB.prepare(`
+            INSERT OR REPLACE INTO secrets (id, domain_id, rule_name, secret_type, match_snippet, file_url, severity, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            id, domainId, s.rule_name, s.secret_type,
+            s.match_snippet, s.file_url || null, s.severity || 'high', s.status || 'open'
+          )
+        );
+      }
+
+      if (statements.length > 0) {
+        await env.DB.batch(statements);
+      }
+      return true;
+    },
+    createNetworkServicesBatch: async (_, { domain, services }, { env }) => {
+      const domRow = await env.DB.prepare("SELECT id FROM domains WHERE lower(host) = lower(?) LIMIT 1").bind(domain).first();
+      const domainId = domRow ? domRow.id : null;
+
+      const statements = [];
+      for (const s of services) {
+        const id = s.id || crypto.randomUUID();
+        statements.push(
+          env.DB.prepare(`
+            INSERT OR REPLACE INTO network_services (id, domain_id, ip, port, protocol, service, product, version, banner)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            id, domainId, s.ip, Number(s.port), s.protocol || 'tcp',
+            s.service || null, s.product || null, s.version || null, s.banner || null
+          )
+        );
+      }
+
+      if (statements.length > 0) {
+        await env.DB.batch(statements);
+      }
+      return true;
     }
   },
 
   // Relationship resolvers
+  Endpoint: {
+    params: (parent) => parseJson(parent.params),
+  },
   Company: {
     data: (parent) => parseJson(parent.data),
     domains: async (parent, __, { env }) => {
@@ -805,12 +1210,21 @@ const getFlagEmoji = (countryCode) => {
 
 
 
+const escapeHtml = (str) => {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+};
+
 const createMainMenu = async (ctx, env) => {
   const currentRunner = ctx.session?.selected_runner || 'default';
-  let runnerText = `⚙️ Runner: ${currentRunner}`;
+  let runnerStatusText = `⚙️ ${currentRunner}`;
 
   try {
-    // Verify runner heartbeat status (active in last 60 seconds)
     const cutoff = Math.floor(Date.now() / 1000) - 60;
     const activeRunner = await env.DB.prepare(
       "SELECT name, ip, country FROM runners WHERE name = ? AND last_seen >= ?"
@@ -818,35 +1232,40 @@ const createMainMenu = async (ctx, env) => {
 
     if (activeRunner) {
       const flag = getFlagEmoji(activeRunner.country);
-      runnerText = `⚙️ Runner: ${flag} ${activeRunner.ip}`;
+      runnerStatusText = `🟢 ${flag} ${activeRunner.name}`;
     } else {
-      // Attempt to query last known IP/country even if offline
       const lastKnown = await env.DB.prepare(
         "SELECT ip, country FROM runners WHERE name = ?"
       ).bind(currentRunner).first();
       if (lastKnown) {
         const flag = getFlagEmoji(lastKnown.country);
-        runnerText = `⚠️ Offline: ${flag} ${lastKnown.ip}`;
+        runnerStatusText = `🔴 ${flag} ${currentRunner}`;
       } else {
-        runnerText = `⚠️ Runner Offline: ${currentRunner}`;
+        runnerStatusText = `🔴 ${currentRunner}`;
       }
     }
   } catch (err) {
     console.error("D1 error in createMainMenu:", err.message);
-    runnerText = `⚙️ Runner: ${currentRunner}`;
   }
 
   return {
     inline_keyboard: [
       [
-        { text: "🔎Person", callback_data: "target_person" },
-        { text: "🔎Company", callback_data: "target_company" },
-        { text: "⚙️Runners", callback_data: "change_runner" }
+        { text: "🚀 Launch Scan", callback_data: "menu_scan" },
+        { text: "📊 Dashboard", callback_data: "menu_dashboard" }
       ],
       [
-        { text: "👥People", callback_data: "view_contacts" },
-        { text: "🎯Targets", callback_data: "view_targets" },
-        { text: "📜Scans", callback_data: "view_new_domains" }
+        { text: "🎯 Targets", callback_data: "view_targets_0" },
+        { text: "👥 Contacts", callback_data: "view_contacts_0" },
+        { text: "📜 Scan Queue", callback_data: "view_new_domains" }
+      ],
+      [
+        { text: "🛡️ Findings", callback_data: "menu_findings" },
+        { text: "🔑 Secrets", callback_data: "menu_secrets_0" },
+        { text: "🔌 Services", callback_data: "menu_services_0" }
+      ],
+      [
+        { text: `⚙️ Runner (${runnerStatusText})`, callback_data: "change_runner" }
       ]
     ]
   };
@@ -879,7 +1298,6 @@ const getBot = (env) => {
       return next();
     }
     
-    // Read session with catch
     try {
       const row = await env.DB.prepare("SELECT value FROM sessions WHERE key = ?").bind(key).first();
       ctx.session = row ? JSON.parse(row.value) : {};
@@ -890,7 +1308,6 @@ const getBot = (env) => {
     
     await next();
     
-    // Write session with catch
     try {
       await env.DB.prepare("INSERT OR REPLACE INTO sessions (key, value) VALUES (?, ?)")
         .bind(key, JSON.stringify(ctx.session))
@@ -906,22 +1323,21 @@ const getBot = (env) => {
     const adminIdsStr = env.ADMIN_IDS || "";
     const adminIds = adminIdsStr.split(",").map(id => Number(id.trim())).filter(id => !isNaN(id));
     
-    if (!adminIds.includes(ctx.from.id)) {
+    if (adminIds.length > 0 && !adminIds.includes(ctx.from.id)) {
       console.log(`Unauthorized access attempt by Telegram ID: ${ctx.from.id}`);
-      return; // Stop execution
+      return;
     }
     await next();
   });
 
   // Helper: auto-register user on first bot interaction
   const registerUser = async (ctx) => {
-    if (ctx.session.user_registered) return;
+    if (ctx.session?.user_registered) return;
     
     const user = ctx.from;
     if (user) {
       const username = user.username || `user_${user.id}`;
       try {
-        // Check if user exists in D1
         const existing = await env.DB.prepare("SELECT id FROM users WHERE number_id = ?").bind(user.id).first();
         if (!existing) {
           const uuid = crypto.randomUUID();
@@ -930,16 +1346,17 @@ const getBot = (env) => {
              VALUES (?, ?, ?, ?, ?)`
           ).bind(uuid, username, user.id, user.first_name || '', user.last_name || '').run();
         }
+        if (!ctx.session) ctx.session = {};
         ctx.session.user_registered = true;
       } catch (err) {
         console.error("D1 user registration error:", err.message);
-        // Do not block execution
+        if (!ctx.session) ctx.session = {};
         ctx.session.user_registered = true;
       }
     }
   };
 
-  // Helper: format domains list
+  // Helper: format domain row
   const formatDomainLine = (d) => {
     const host = d.host || 'N/A';
     const domData = parseJson(d.data);
@@ -956,7 +1373,7 @@ const getBot = (env) => {
       else if (code >= 500 && code < 600) statusStr = `🟣 ${code}`;
       else statusStr = `⚪ ${code}`;
     }
-    return `<b><a href="http://${host}">${host}</a></b> ${statusStr} ~ <i>${title}</i> | <code>${tech}</code>`;
+    return `<b><a href="http://${host}">${escapeHtml(host)}</a></b> ${statusStr} ~ <i>${escapeHtml(title)}</i> | <code>${escapeHtml(tech)}</code>`;
   };
 
   // Queue scan helper
@@ -968,27 +1385,29 @@ const getBot = (env) => {
     } else if (type === 'person') {
       command = `-p "${value}" --sender-id ${userId}`;
     } else if (type === 'company') {
-      // Check if value is domain
       const isDomain = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(value);
       if (isDomain) {
         command = `-d ${value} --sender-id ${userId}`;
       } else {
         command = `-c "${value}" --sender-id ${userId}`;
       }
+    } else if (type === 'infogather') {
+      command = `--info-gather ${value} --sender-id ${userId}`;
+    } else if (type === 'web') {
+      command = `--web ${value} --sender-id ${userId}`;
+    } else if (type === 'network') {
+      command = `--network ${value} --sender-id ${userId}`;
     }
     
-    // Insert into scan_jobs queue
     const id = crypto.randomUUID();
     await env.DB.prepare(
       "INSERT INTO scan_jobs (id, command, domain, runner, status) VALUES (?, ?, ?, ?, 'pending')"
     ).bind(id, command, value, runner).run();
-
-    // Local runner triggers scan queue via polling
+    return id;
   };
 
   const createRunnerKeyboard = async () => {
     const keyboard = [];
-
     try {
       const cutoff = Math.floor(Date.now() / 1000) - 60;
       const { results } = await env.DB.prepare(
@@ -1010,10 +1429,9 @@ const getBot = (env) => {
       console.error("D1 error in createRunnerKeyboard:", err.message);
     }
     
-    // Add Refresh & Cancel options
     keyboard.push([
       { text: "🔄 Refresh", callback_data: "change_runner" },
-      { text: "🔙 Cancel", callback_data: "cancel" }
+      { text: "🔙 Main Menu", callback_data: "main_menu" }
     ]);
     return { inline_keyboard: keyboard };
   };
@@ -1024,25 +1442,186 @@ const getBot = (env) => {
     } catch (err) {
       const desc = err && (err.description || (err.error && err.error.description) || err.message || "");
       if (desc && String(desc).toLowerCase().includes("message is not modified")) {
-        console.log("Ignored: Message is not modified error.");
+        // Ignored
       } else {
         throw err;
       }
     }
   };
 
-  // Bot commands
-  bot.command("start", async (ctx) => {
+  // ----------------------------------------------------
+  // Bot Slash Commands
+  // ----------------------------------------------------
+  bot.command(["start", "menu"], async (ctx) => {
     await registerUser(ctx);
     if (!ctx.session.selected_runner) {
       ctx.session.selected_runner = 'default';
     }
     ctx.session.step = 'MAIN_MENU';
     const menuMarkup = await createMainMenu(ctx, env);
-    await ctx.reply("hey, good 2 c u back", {
+    await ctx.reply("🛰️ <b>cHack C2 Control Center</b>\n\nWelcome back! Manage your targets, active reconnaissance jobs, vulnerability findings, and scanner runners below:", {
       parse_mode: "HTML",
       reply_markup: menuMarkup
     });
+  });
+
+  bot.command(["dashboard", "stats"], async (ctx) => {
+    await registerUser(ctx);
+    try {
+      const compCount = (await env.DB.prepare("SELECT count(*) as cnt FROM companies").first())?.cnt || 0;
+      const domCount = (await env.DB.prepare("SELECT count(*) as cnt FROM domains").first())?.cnt || 0;
+      const peopleCount = (await env.DB.prepare("SELECT count(*) as cnt FROM people").first())?.cnt || 0;
+      
+      const { results: findings } = await env.DB.prepare("SELECT severity, status FROM findings").all();
+      const crit = findings.filter(f => f.severity?.toLowerCase() === 'critical').length;
+      const high = findings.filter(f => f.severity?.toLowerCase() === 'high').length;
+      const med = findings.filter(f => f.severity?.toLowerCase() === 'medium').length;
+      const low = findings.filter(f => f.severity?.toLowerCase() === 'low').length;
+      const info = findings.filter(f => f.severity?.toLowerCase() === 'info').length;
+      const resolved = findings.filter(f => f.status === 'resolved').length;
+
+      const secretsCount = (await env.DB.prepare("SELECT count(*) as cnt FROM secrets").first())?.cnt || 0;
+      const servicesCount = (await env.DB.prepare("SELECT count(*) as cnt FROM network_services").first())?.cnt || 0;
+      const runningJobs = (await env.DB.prepare("SELECT count(*) as cnt FROM scan_jobs WHERE status IN ('pending', 'running')").first())?.cnt || 0;
+      
+      const cutoff = Math.floor(Date.now() / 1000) - 60;
+      const onlineRunners = (await env.DB.prepare("SELECT count(*) as cnt FROM runners WHERE last_seen >= ?").bind(cutoff).first())?.cnt || 0;
+      const totalRunners = (await env.DB.prepare("SELECT count(*) as cnt FROM runners").first())?.cnt || 0;
+
+      const text =
+        `📊 <b>cHack Intelligence & Management Dashboard</b>\n\n` +
+        `🎯 <b>Targets & Assets:</b>\n` +
+        `• 🏢 Companies / Scopes: <b>${compCount}</b>\n` +
+        `• 🌐 Domains / Subdomains: <b>${domCount}</b>\n` +
+        `• 👥 Contacts & People: <b>${peopleCount}</b>\n\n` +
+        `🛡️ <b>Findings & Vulnerabilities (${findings.length}):</b>\n` +
+        `• 🔴 Critical: <b>${crit}</b>\n` +
+        `• 🟠 High: <b>${high}</b>\n` +
+        `• 🟡 Medium: <b>${med}</b>\n` +
+        `• 🔵 Low: <b>${low}</b>\n` +
+        `• ⚪ Info: <b>${info}</b>\n` +
+        `• ✅ Resolved / Fixed: <b>${resolved}</b>\n\n` +
+        `🔑 <b>Secrets & Leaks:</b> <b>${secretsCount}</b>\n` +
+        `🔌 <b>Network Services & Open Ports:</b> <b>${servicesCount}</b>\n\n` +
+        `⚙️ <b>System & Infrastructure:</b>\n` +
+        `• ⏳ Active / Queued Jobs: <b>${runningJobs}</b>\n` +
+        `• 🖥️ Runners Online: <b>${onlineRunners} / ${totalRunners}</b>`;
+
+      await ctx.reply(text, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🔄 Refresh", callback_data: "menu_dashboard" },
+              { text: "🧹 Clear Finished Jobs", callback_data: "action_clean_queue" }
+            ],
+            [
+              { text: "🎯 Manage Targets", callback_data: "view_targets_0" },
+              { text: "🛡️ Triage Findings", callback_data: "menu_findings" }
+            ],
+            [
+              { text: "🔙 Main Menu", callback_data: "main_menu" }
+            ]
+          ]
+        }
+      });
+    } catch (err) {
+      await ctx.reply(`❌ Error loading dashboard: ${escapeHtml(err.message)}`);
+    }
+  });
+
+  bot.command(["targets", "companies"], async (ctx) => {
+    await registerUser(ctx);
+    ctx.session.step = 'MAIN_MENU';
+    const { results: companies } = await env.DB.prepare("SELECT * FROM companies ORDER BY created_at DESC LIMIT 8 OFFSET 0").all();
+    const count = (await env.DB.prepare("SELECT count(*) as cnt FROM companies").first())?.cnt || 0;
+    const totalPages = Math.ceil(count / 8) || 1;
+
+    const keyboard = [];
+    for (const c of companies) {
+      const dCount = (await env.DB.prepare("SELECT count(*) as cnt FROM domains WHERE company_id = ?").bind(c.id).first())?.cnt || 0;
+      keyboard.push([{ text: `🏢 ${c.name} (${dCount} domains)`, callback_data: `view_company_${c.id}` }]);
+    }
+    keyboard.push([{ text: "➕ Add Target Company", callback_data: "target_company" }]);
+    if (totalPages > 1) {
+      keyboard.push([{ text: "Next ➡️", callback_data: "view_targets_1" }]);
+    }
+    keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+
+    await ctx.reply(`🎯 <b>Targets / Companies</b> (Page 1/${totalPages})\n\nSelect a company to view details, domains, or launch scans:`, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: keyboard }
+    });
+  });
+
+  bot.command(["contacts", "people"], async (ctx) => {
+    await registerUser(ctx);
+    ctx.session.step = 'MAIN_MENU';
+    const { results: people } = await env.DB.prepare("SELECT * FROM people ORDER BY created_at DESC LIMIT 8 OFFSET 0").all();
+    const count = (await env.DB.prepare("SELECT count(*) as cnt FROM people").first())?.cnt || 0;
+    const totalPages = Math.ceil(count / 8) || 1;
+
+    const keyboard = [];
+    for (const p of people) {
+      const name = `${p.given_name || ''} ${p.family_name || ''}`.trim() || 'Unnamed';
+      keyboard.push([{ text: `👤 ${name}`, callback_data: `view_contact_${p.id}` }]);
+    }
+    keyboard.push([{ text: "➕ Add New Person", callback_data: "target_person" }]);
+    if (totalPages > 1) {
+      keyboard.push([{ text: "Next ➡️", callback_data: "view_contacts_1" }]);
+    }
+    keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+
+    await ctx.reply(`👥 <b>Contacts & People</b> (Page 1/${totalPages})\n\nSelect a person to inspect details, launch OSINT search, or remove:`, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: keyboard }
+    });
+  });
+
+  bot.command(["queue", "jobs"], async (ctx) => {
+    await registerUser(ctx);
+    ctx.session.step = 'MAIN_MENU';
+    const { results: jobs } = await env.DB.prepare(
+      "SELECT * FROM scan_jobs ORDER BY created_at DESC LIMIT 10"
+    ).all();
+
+    if (!jobs.length) {
+      return await ctx.reply("📜 <b>Scan Queue</b>\n\nNo scan jobs found in the database.", {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🚀 Launch Scan", callback_data: "menu_scan" }],
+            [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+          ]
+        }
+      });
+    }
+
+    const keyboard = [];
+    jobs.forEach(job => {
+      let badge = "⏳";
+      if (job.status === 'running') badge = "🔄";
+      else if (job.status === 'completed') badge = "✅";
+      else if (job.status === 'failed') badge = "🛑";
+      keyboard.push([{ text: `${badge} ${job.domain} (${job.runner || 'default'})`, callback_data: `manage_job:${job.id}` }]);
+    });
+
+    keyboard.push([
+      { text: "🔄 Refresh", callback_data: "view_new_domains" },
+      { text: "🧹 Clean Finished", callback_data: "action_clean_queue" }
+    ]);
+    keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+
+    await ctx.reply(`📜 <b>Scan Jobs Queue (${jobs.length})</b>\n\nClick any job to view live logs, stop, or restart:`, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: keyboard }
+    });
+  });
+
+  bot.command("clean", async (ctx) => {
+    await registerUser(ctx);
+    const res = await env.DB.prepare("DELETE FROM scan_jobs WHERE status IN ('completed', 'failed')").run();
+    await ctx.reply(`🧹 Cleaned up finished/failed scan jobs from queue.`);
   });
 
   bot.command("newcompany", async (ctx) => {
@@ -1059,7 +1638,7 @@ const getBot = (env) => {
   bot.command("newperson", async (ctx) => {
     await registerUser(ctx);
     ctx.session.step = 'PERSON_INPUT';
-    await ctx.reply("🔍 <b>Target: Person</b>\n\nsend me the person's phone number (<code>+1555...</code>), username (<code>@che...</code>), or name (e.g. <code>Cheth Ober</code>):", {
+    await ctx.reply("🔍 <b>Target: Person</b>\n\nSend me the person's phone number (<code>+1555...</code>), username (<code>@che...</code>), or name (e.g. <code>Cheth Ober</code>):", {
       parse_mode: "HTML",
       reply_markup: {
         inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "cancel" }]]
@@ -1067,7 +1646,45 @@ const getBot = (env) => {
     });
   });
 
-  // Query bot command handlers
+  bot.command("delcompany", async (ctx) => {
+    const name = ctx.match?.trim();
+    if (!name) {
+      return await ctx.reply("❌ Usage: <code>/delcompany &lt;company name or slug&gt;</code>", { parse_mode: "HTML" });
+    }
+    const comp = await env.DB.prepare("SELECT * FROM companies WHERE lower(name) = lower(?) OR lower(slug) = lower(?)").bind(name, name).first();
+    if (!comp) {
+      return await ctx.reply(`❌ Company <code>${escapeHtml(name)}</code> not found.`, { parse_mode: "HTML" });
+    }
+    await env.DB.prepare("DELETE FROM companies WHERE id = ?").bind(comp.id).run();
+    await ctx.reply(`🗑️ Company <code>${escapeHtml(comp.name)}</code> and all associated domains/findings deleted.`, { parse_mode: "HTML" });
+  });
+
+  bot.command("deldomain", async (ctx) => {
+    const host = ctx.match?.trim()?.toLowerCase();
+    if (!host) {
+      return await ctx.reply("❌ Usage: <code>/deldomain &lt;host&gt;</code>", { parse_mode: "HTML" });
+    }
+    const dom = await env.DB.prepare("SELECT * FROM domains WHERE lower(host) = lower(?)").bind(host).first();
+    if (!dom) {
+      return await ctx.reply(`❌ Domain <code>${escapeHtml(host)}</code> not found.`, { parse_mode: "HTML" });
+    }
+    await env.DB.prepare("DELETE FROM domains WHERE id = ?").bind(dom.id).run();
+    await ctx.reply(`🗑️ Domain <code>${escapeHtml(host)}</code> deleted.`, { parse_mode: "HTML" });
+  });
+
+  bot.command("delperson", async (ctx) => {
+    const name = ctx.match?.trim();
+    if (!name) {
+      return await ctx.reply("❌ Usage: <code>/delperson &lt;first name&gt;</code>", { parse_mode: "HTML" });
+    }
+    const person = await env.DB.prepare("SELECT * FROM people WHERE lower(given_name) = lower(?) OR lower(given_name || ' ' || coalesce(family_name, '')) = lower(?)").bind(name, name).first();
+    if (!person) {
+      return await ctx.reply(`❌ Person <code>${escapeHtml(name)}</code> not found.`, { parse_mode: "HTML" });
+    }
+    await env.DB.prepare("DELETE FROM people WHERE id = ?").bind(person.id).run();
+    await ctx.reply(`🗑️ Contact <code>${escapeHtml(person.given_name)} ${escapeHtml(person.family_name || '')}</code> deleted.`, { parse_mode: "HTML" });
+  });
+
   bot.command("getuser", async (ctx) => {
     const username = ctx.match?.trim();
     if (!username) {
@@ -1075,14 +1692,14 @@ const getBot = (env) => {
     }
     const user = await env.DB.prepare("SELECT * FROM users WHERE username = ?").bind(username).first();
     if (!user) {
-      return await ctx.reply(`❌ User <code>${username}</code> not found.`, { parse_mode: "HTML" });
+      return await ctx.reply(`❌ User <code>${escapeHtml(username)}</code> not found.`, { parse_mode: "HTML" });
     }
     await ctx.reply(
-      `👤 <b>User: ${user.username}</b>\n\n` +
+      `👤 <b>User: ${escapeHtml(user.username)}</b>\n\n` +
       `• <b>ID:</b> <code>${user.id}</code>\n` +
       `• <b>Telegram ID:</b> <code>${user.number_id || 'N/A'}</code>\n` +
-      `• <b>First Name:</b> ${user.first_name || 'N/A'}\n` +
-      `• <b>Last Name:</b> ${user.last_name || 'N/A'}\n` +
+      `• <b>First Name:</b> ${escapeHtml(user.first_name || 'N/A')}\n` +
+      `• <b>Last Name:</b> ${escapeHtml(user.last_name || 'N/A')}\n` +
       `• <b>Created At:</b> <code>${user.created_at}</code>`,
       { parse_mode: "HTML" }
     );
@@ -1093,28 +1710,36 @@ const getBot = (env) => {
     if (!company_name) {
       return await ctx.reply("❌ Usage: <code>/getcompany &lt;company name&gt;</code>", { parse_mode: "HTML" });
     }
-    const company = await env.DB.prepare("SELECT * FROM companies WHERE name = ?").bind(company_name).first();
+    const company = await env.DB.prepare("SELECT * FROM companies WHERE lower(name) = lower(?) OR lower(slug) = lower(?)").bind(company_name, company_name).first();
     if (!company) {
-      return await ctx.reply(`❌ Company <code>${company_name}</code> not found.`, { parse_mode: "HTML" });
+      return await ctx.reply(`❌ Company <code>${escapeHtml(company_name)}</code> not found.`, { parse_mode: "HTML" });
     }
     const { results: domains } = await env.DB.prepare("SELECT host FROM domains WHERE company_id = ?").bind(company.id).all();
     const { results: people } = await env.DB.prepare("SELECT given_name, family_name FROM people WHERE company_id = ?").bind(company.id).all();
     
     const comp_data = parseJson(company.data);
     const phase = comp_data.phase || 'N/A';
-    const domains_list = domains.length ? domains.map(d => `• <code>${d.host}</code>`).join('\n') : "None";
-    const people_list = people.length ? people.map(p => `• ${p.given_name} ${p.family_name || ''}`).join('\n') : "None";
+    const domains_list = domains.length ? domains.map(d => `• <code>${escapeHtml(d.host)}</code>`).join('\n') : "None";
+    const people_list = people.length ? people.map(p => `• ${escapeHtml(p.given_name)} ${escapeHtml(p.family_name || '')}`).join('\n') : "None";
 
     await ctx.reply(
-      `🏢 <b>Company: ${company.name}</b>\n\n` +
+      `🏢 <b>Company: ${escapeHtml(company.name)}</b>\n\n` +
       `• <b>ID:</b> <code>${company.id}</code>\n` +
       `• <b>Slug:</b> <code>${company.slug || 'N/A'}</code>\n` +
-      `• <b>Description:</b> ${company.description || 'N/A'}\n` +
+      `• <b>Description:</b> ${escapeHtml(company.description || 'N/A')}\n` +
       `• <b>Phase:</b> <code>${phase}</code>\n` +
       `• <b>Created At:</b> <code>${company.created_at}</code>\n\n` +
       `🌐 <b>Domains (${domains.length}):</b>\n${domains_list}\n\n` +
       `👤 <b>People (${people.length}):</b>\n${people_list}`,
-      { parse_mode: "HTML" }
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🌐 View Domains", callback_data: `view_company_domains_${company.id}_0` }],
+            [{ text: "🚀 Launch Recon", callback_data: `scan_company_action_${company.id}` }]
+          ]
+        }
+      }
     );
   });
 
@@ -1125,7 +1750,7 @@ const getBot = (env) => {
     }
     const domain = await env.DB.prepare("SELECT * FROM domains WHERE lower(host) = lower(?)").bind(host).first();
     if (!domain) {
-      return await ctx.reply(`❌ Domain <code>${host}</code> not found.`, { parse_mode: "HTML" });
+      return await ctx.reply(`❌ Domain <code>${escapeHtml(host)}</code> not found.`, { parse_mode: "HTML" });
     }
     const company = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(domain.company_id).first();
     const domData = parseJson(domain.data);
@@ -1135,16 +1760,26 @@ const getBot = (env) => {
     const tech = (domData.tech || []).join(', ') || 'N/A';
 
     await ctx.reply(
-      `🌐 <b>Domain: ${domain.host}</b>\n\n` +
+      `🌐 <b>Domain: ${escapeHtml(domain.host)}</b>\n\n` +
       `• <b>ID:</b> <code>${domain.id}</code>\n` +
-      `• <b>Company:</b> ${company ? company.name : 'N/A'}\n` +
-      `• <b>Canonical URL:</b> ${domain.canonical_url || 'N/A'}\n` +
+      `• <b>Company:</b> ${company ? escapeHtml(company.name) : 'N/A'}\n` +
+      `• <b>Canonical URL:</b> ${escapeHtml(domain.canonical_url || 'N/A')}\n` +
       `• <b>Status Code:</b> <code>${status_code}</code>\n` +
-      `• <b>Title:</b> ${title}\n` +
-      `• <b>Web Server:</b> ${webserver}\n` +
-      `• <b>Tech:</b> ${tech}\n` +
+      `• <b>Title:</b> ${escapeHtml(title)}\n` +
+      `• <b>Web Server:</b> ${escapeHtml(webserver)}\n` +
+      `• <b>Tech:</b> ${escapeHtml(tech)}\n` +
       `• <b>Created At:</b> <code>${domain.created_at}</code>`,
-      { parse_mode: "HTML" }
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🚀 Recon", callback_data: `scan_dom_recon_${domain.id}` },
+              { text: "🛡️ Findings", callback_data: `view_dom_vulns_${domain.id}_0` }
+            ]
+          ]
+        }
+      }
     );
   });
 
@@ -1156,17 +1791,17 @@ const getBot = (env) => {
     const givenName = args[0];
     const familyName = args[1] || null;
 
-    let query = "SELECT * FROM people WHERE given_name = ?";
+    let query = "SELECT * FROM people WHERE lower(given_name) = lower(?)";
     const binds = [givenName];
     if (familyName) {
-      query += " AND family_name = ?";
+      query += " AND lower(family_name) = lower(?)";
       binds.push(familyName);
     }
     
     const { results: people } = await env.DB.prepare(query).bind(...binds).all();
     if (!people.length) {
       const name_str = familyName ? `${givenName} ${familyName}` : givenName;
-      return await ctx.reply(`❌ Person <code>${name_str}</code> not found.`, { parse_mode: "HTML" });
+      return await ctx.reply(`❌ Person <code>${escapeHtml(name_str)}</code> not found.`, { parse_mode: "HTML" });
     }
 
     const msgs = [];
@@ -1176,12 +1811,12 @@ const getBot = (env) => {
       const comp = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(p.company_id).first();
       
       msgs.push(
-        `👤 <b>Person: ${p.given_name} ${p.family_name || ''}</b>\n` +
+        `👤 <b>Person: ${escapeHtml(p.given_name)} ${escapeHtml(p.family_name || '')}</b>\n` +
         `• <b>ID:</b> <code>${p.id}</code>\n` +
-        `• <b>Company:</b> ${comp ? comp.name : 'N/A'}\n` +
-        `• <b>Emails:</b> ${emails}\n` +
-        `• <b>Phones:</b> ${phones}\n` +
-        `• <b>Notes:</b> ${p.notes || 'None'}`
+        `• <b>Company:</b> ${comp ? escapeHtml(comp.name) : 'N/A'}\n` +
+        `• <b>Emails:</b> ${escapeHtml(emails)}\n` +
+        `• <b>Phones:</b> ${escapeHtml(phones)}\n` +
+        `• <b>Notes:</b> ${escapeHtml(p.notes || 'None')}`
       );
     }
     await ctx.reply(msgs.join('\n\n---\n\n'), { parse_mode: "HTML" });
@@ -1205,7 +1840,7 @@ const getBot = (env) => {
     const lines = domains.map(d => {
       const domData = parseJson(d.data);
       const title = domData.title || "No Title";
-      return `• <code>${d.host}</code> - <i>${title}</i>`;
+      return `• <code>${escapeHtml(d.host)}</code> - <i>${escapeHtml(title)}</i>`;
     });
 
     await ctx.reply(
@@ -1215,74 +1850,1337 @@ const getBot = (env) => {
     );
   });
 
-  // Bot callback queries
+  bot.command("recon", async (ctx) => {
+    await registerUser(ctx);
+    const domain = ctx.match?.trim();
+    if (!domain) {
+      return await ctx.reply("❌ Usage: <code>/recon &lt;domain&gt;</code>", { parse_mode: "HTML" });
+    }
+    const runner = ctx.session?.selected_runner || 'default';
+    const jobId = await triggerScan(ctx, 'domain', domain, runner);
+    await ctx.reply(
+      `🚀 <b>Full Recon Scan Queued</b>\n\n` +
+      `• <b>Target:</b> <code>${escapeHtml(domain)}</code>\n` +
+      `• <b>Runner:</b> <code>${runner}</code>\n` +
+      `• <b>Job ID:</b> <code>${jobId}</code>`,
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📜 Inspect Live Job", callback_data: `manage_job:${jobId}` }],
+            [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+          ]
+        }
+      }
+    );
+  });
+
+  bot.command("infogather", async (ctx) => {
+    await registerUser(ctx);
+    const domain = ctx.match?.trim();
+    if (!domain) {
+      return await ctx.reply("❌ Usage: <code>/infogather &lt;domain&gt;</code>", { parse_mode: "HTML" });
+    }
+    const runner = ctx.session?.selected_runner || 'default';
+    const jobId = await triggerScan(ctx, 'infogather', domain, runner);
+    await ctx.reply(
+      `🔍 <b>Info-Gathering Scan Queued</b>\n\n` +
+      `• <b>Target:</b> <code>${escapeHtml(domain)}</code>\n` +
+      `• <b>Runner:</b> <code>${runner}</code>\n` +
+      `• <b>Job ID:</b> <code>${jobId}</code>`,
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📜 Inspect Live Job", callback_data: `manage_job:${jobId}` }],
+            [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+          ]
+        }
+      }
+    );
+  });
+
+  bot.command("web", async (ctx) => {
+    await registerUser(ctx);
+    const domain = ctx.match?.trim();
+    if (!domain) {
+      return await ctx.reply("❌ Usage: <code>/web &lt;domain&gt;</code>", { parse_mode: "HTML" });
+    }
+    const runner = ctx.session?.selected_runner || 'default';
+    const jobId = await triggerScan(ctx, 'web', domain, runner);
+    await ctx.reply(
+      `🌐 <b>Web Recon & Crawl Queued</b>\n\n` +
+      `• <b>Target:</b> <code>${escapeHtml(domain)}</code>\n` +
+      `• <b>Runner:</b> <code>${runner}</code>\n` +
+      `• <b>Job ID:</b> <code>${jobId}</code>`,
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📜 Inspect Live Job", callback_data: `manage_job:${jobId}` }],
+            [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+          ]
+        }
+      }
+    );
+  });
+
+  bot.command("network", async (ctx) => {
+    await registerUser(ctx);
+    const target = ctx.match?.trim();
+    if (!target) {
+      return await ctx.reply("❌ Usage: <code>/network &lt;target/ip/cidr&gt;</code>", { parse_mode: "HTML" });
+    }
+    const runner = ctx.session?.selected_runner || 'default';
+    const jobId = await triggerScan(ctx, 'network', target, runner);
+    await ctx.reply(
+      `🔌 <b>Network & Port Scan Queued</b>\n\n` +
+      `• <b>Target:</b> <code>${escapeHtml(target)}</code>\n` +
+      `• <b>Runner:</b> <code>${runner}</code>\n` +
+      `• <b>Job ID:</b> <code>${jobId}</code>`,
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📜 Inspect Live Job", callback_data: `manage_job:${jobId}` }],
+            [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+          ]
+        }
+      }
+    );
+  });
+
+  bot.command("vulns", async (ctx) => {
+    const args = ctx.match?.trim()?.split(/\s+/) || [];
+    const domain = args[0] || null;
+    const severity = args[1] || null;
+
+    let query = `
+      SELECT f.*, d.host FROM findings f
+      JOIN domains d ON f.domain_id = d.id
+      LEFT JOIN companies c ON d.company_id = c.id
+      WHERE 1=1
+    `;
+    const binds = [];
+    if (domain) {
+      query += " AND (lower(d.host) = lower(?) OR lower(c.slug) = lower(?) OR lower(c.name) = lower(?))";
+      binds.push(domain, domain, domain);
+    }
+    if (severity) {
+      query += " AND lower(f.severity) = lower(?)";
+      binds.push(severity);
+    }
+    query += " ORDER BY CASE f.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END, f.created_at DESC LIMIT 20";
+
+    const { results: findings } = await env.DB.prepare(query).bind(...binds).all();
+    if (!findings.length) {
+      return await ctx.reply(`🛡️ No findings found${domain ? ` for <code>${escapeHtml(domain)}</code>` : ''}.`, { parse_mode: "HTML" });
+    }
+
+    const emojiMap = { critical: '🔴', high: '🟠', medium: '🟡', low: '🔵', info: '⚪' };
+    const lines = findings.map(f => {
+      const em = emojiMap[f.severity.toLowerCase()] || '⚪';
+      const cveStr = f.cve ? ` [<code>${escapeHtml(f.cve)}</code>]` : '';
+      return `${em} <b>[${escapeHtml(f.severity.toUpperCase())}]</b> ${escapeHtml(f.title)}${cveStr}\n   🔗 <code>${escapeHtml(f.url || f.host)}</code> (<i>${escapeHtml(f.tool)}</i>) - <i>${f.status}</i>`;
+    });
+
+    await ctx.reply(
+      `🛡️ <b>Vulnerability Findings (${findings.length})</b>\n\n${lines.join('\n\n')}`,
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [[{ text: "🛡️ Open Triage Center", callback_data: "menu_findings" }]]
+        }
+      }
+    );
+  });
+
+  bot.command("secrets", async (ctx) => {
+    const domain = ctx.match?.trim();
+    let query = `
+      SELECT s.*, d.host FROM secrets s
+      JOIN domains d ON s.domain_id = d.id
+      LEFT JOIN companies c ON d.company_id = c.id
+      WHERE 1=1
+    `;
+    const binds = [];
+    if (domain) {
+      query += " AND (lower(d.host) = lower(?) OR lower(c.slug) = lower(?) OR lower(c.name) = lower(?))";
+      binds.push(domain, domain, domain);
+    }
+    query += " ORDER BY s.created_at DESC LIMIT 15";
+
+    const { results: secrets } = await env.DB.prepare(query).bind(...binds).all();
+    if (!secrets.length) {
+      return await ctx.reply(`🔑 No secrets found${domain ? ` for <code>${escapeHtml(domain)}</code>` : ''}.`, { parse_mode: "HTML" });
+    }
+
+    const lines = secrets.map(s => {
+      return `🔑 <b>${escapeHtml(s.rule_name)}</b> (<code>${escapeHtml(s.secret_type)}</code>)\n   Snippet: <code>${escapeHtml(s.match_snippet.substring(0, 40))}...</code>\n   File: <code>${escapeHtml(s.file_url || s.host)}</code>`;
+    });
+
+    await ctx.reply(
+      `🔑 <b>Discovered Secrets (${secrets.length})</b>\n\n${lines.join('\n\n')}`,
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [[{ text: "🔑 Open Secrets Browser", callback_data: "menu_secrets_0" }]]
+        }
+      }
+    );
+  });
+
+  bot.command("ports", async (ctx) => {
+    const domain = ctx.match?.trim();
+    let query = `
+      SELECT ns.*, d.host FROM network_services ns
+      JOIN domains d ON ns.domain_id = d.id
+      LEFT JOIN companies c ON d.company_id = c.id
+      WHERE 1=1
+    `;
+    const binds = [];
+    if (domain) {
+      query += " AND (lower(d.host) = lower(?) OR lower(c.slug) = lower(?) OR lower(c.name) = lower(?))";
+      binds.push(domain, domain, domain);
+    }
+    query += " ORDER BY ns.port ASC LIMIT 30";
+
+    const { results: services } = await env.DB.prepare(query).bind(...binds).all();
+    if (!services.length) {
+      return await ctx.reply(`🔌 No open ports / services found${domain ? ` for <code>${escapeHtml(domain)}</code>` : ''}.`, { parse_mode: "HTML" });
+    }
+
+    const lines = services.map(s => {
+      const banner = s.banner ? ` - <i>${escapeHtml(s.banner.substring(0, 30))}</i>` : '';
+      return `• <code>${escapeHtml(s.ip)}:${s.port}</code> [${escapeHtml(s.protocol)}] - <b>${escapeHtml(s.service || 'unknown')}</b> ${escapeHtml(s.product || '')} ${escapeHtml(s.version || '')}${banner}`;
+    });
+
+    await ctx.reply(
+      `🔌 <b>Discovered Services (${services.length})</b>\n\n${lines.join('\n')}`,
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [[{ text: "🔌 Open Services Browser", callback_data: "menu_services_0" }]]
+        }
+      }
+    );
+  });
+
+  bot.command("report", async (ctx) => {
+    const domain = ctx.match?.trim();
+    if (!domain) {
+      return await ctx.reply("❌ Usage: <code>/report &lt;domain&gt;</code>", { parse_mode: "HTML" });
+    }
+
+    const dom = await env.DB.prepare("SELECT * FROM domains WHERE lower(host) = lower(?)").bind(domain).first();
+    const comp = await env.DB.prepare("SELECT * FROM companies WHERE lower(name) = lower(?) OR lower(slug) = lower(?)").bind(domain, domain).first();
+    const companyId = dom ? dom.company_id : (comp ? comp.id : null);
+
+    const { results: domains } = await env.DB.prepare("SELECT host FROM domains WHERE company_id = ?").bind(companyId).all();
+    const { results: findings } = await env.DB.prepare(`
+      SELECT f.* FROM findings f
+      JOIN domains d ON f.domain_id = d.id
+      WHERE lower(d.host) = lower(?) OR d.company_id = ?
+    `).bind(domain, companyId).all();
+
+    const { results: secrets } = await env.DB.prepare(`
+      SELECT s.* FROM secrets s
+      JOIN domains d ON s.domain_id = d.id
+      WHERE lower(d.host) = lower(?) OR d.company_id = ?
+    `).bind(domain, companyId).all();
+
+    const { results: services } = await env.DB.prepare(`
+      SELECT ns.* FROM network_services ns
+      JOIN domains d ON ns.domain_id = d.id
+      WHERE lower(d.host) = lower(?) OR d.company_id = ?
+    `).bind(domain, companyId).all();
+
+    const crit = findings.filter(f => f.severity?.toLowerCase() === 'critical').length;
+    const high = findings.filter(f => f.severity?.toLowerCase() === 'high').length;
+    const med = findings.filter(f => f.severity?.toLowerCase() === 'medium').length;
+    const low = findings.filter(f => f.severity?.toLowerCase() === 'low').length;
+    const info = findings.filter(f => f.severity?.toLowerCase() === 'info').length;
+
+    await ctx.reply(
+      `📊 <b>Executive Recon Report: ${escapeHtml(domain)}</b>\n\n` +
+      `🌐 <b>Subdomains Discovered:</b> ${domains.length}\n` +
+      `🔌 <b>Open Services / Ports:</b> ${services.length}\n` +
+      `🔑 <b>Leaked Secrets:</b> ${secrets.length}\n` +
+      `🛡️ <b>Vulnerabilities:</b> ${findings.length}\n\n` +
+      `<b>Severity Breakdown:</b>\n` +
+      `• 🔴 Critical: <b>${crit}</b>\n` +
+      `• 🟠 High: <b>${high}</b>\n` +
+      `• 🟡 Medium: <b>${med}</b>\n` +
+      `• 🔵 Low: <b>${low}</b>\n` +
+      `• ⚪ Info: <b>${info}</b>`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  bot.command("tools", async (ctx) => {
+    await ctx.reply(
+      `🛠️ <b>cHack Integrated Toolset:</b>\n\n` +
+      `• <b>Subdomain & DNS:</b> <code>subfinder</code>, <code>assetfinder</code>, <code>findomain</code>, <code>puredns</code>, <code>dnsx</code>, <code>alterx</code>, <code>scilla</code>, <code>subzy</code>\n` +
+      `• <b>Probing & Visual:</b> <code>httpx</code>, <code>gowitness</code>\n` +
+      `• <b>Network & Ports:</b> <code>naabu</code>, <code>nmap</code>, <code>massdns</code>\n` +
+      `• <b>Crawling & JS:</b> <code>katana</code>, <code>hakrawler</code>, <code>gau</code>, <code>waybackurls</code>, <code>waymore</code>, <code>uro</code>\n` +
+      `• <b>Directory & Fuzz:</b> <code>feroxbuster</code>, <code>dirsearch</code>\n` +
+      `• <b>Vulnerabilities & DAST:</b> <code>nuclei</code> (v3), <code>dalfox</code>, <code>sqlmap</code>`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  bot.command("stop", async (ctx) => {
+    const jobId = ctx.match?.trim();
+    if (!jobId) {
+      return await ctx.reply("❌ Usage: <code>/stop &lt;job_id&gt;</code>", { parse_mode: "HTML" });
+    }
+    await env.DB.prepare("UPDATE scan_jobs SET status = 'failed', stdout = stdout || '\n[CANCELLED BY USER]', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").bind(jobId).run();
+    await ctx.reply(`🛑 Job <code>${escapeHtml(jobId)}</code> marked as stopped/cancelled.`, { parse_mode: "HTML" });
+  });
+
+  bot.command("help", async (ctx) => {
+    await ctx.reply(
+      `📖 <b>cHack Bot Command & Management Guide</b>\n\n` +
+      `<b>Navigation & Dashboard:</b>\n` +
+      `• <code>/menu</code> or <code>/start</code> - Open interactive Main Menu\n` +
+      `• <code>/dashboard</code> or <code>/stats</code> - System stats & asset counts\n` +
+      `• <code>/help</code> - Show this guide\n\n` +
+      `<b>Targets & Assets Management:</b>\n` +
+      `• <code>/targets</code> - Interactive target companies list\n` +
+      `• <code>/contacts</code> - Interactive contacts/leads list\n` +
+      `• <code>/newcompany</code> - Add a new company target\n` +
+      `• <code>/newperson</code> - Add a new person contact\n` +
+      `• <code>/delcompany &lt;name&gt;</code> - Delete company\n` +
+      `• <code>/deldomain &lt;host&gt;</code> - Delete domain\n` +
+      `• <code>/delperson &lt;name&gt;</code> - Delete person\n\n` +
+      `<b>Scans & Queue Management:</b>\n` +
+      `• <code>/queue</code> or <code>/jobs</code> - Manage running & pending scans\n` +
+      `• <code>/recon &lt;domain&gt;</code> - Launch 5-phase full recon\n` +
+      `• <code>/infogather &lt;domain&gt;</code> - Subdomain & live probing\n` +
+      `• <code>/web &lt;domain&gt;</code> - Web crawling & endpoint discovery\n` +
+      `• <code>/network &lt;target&gt;</code> - Port & service scan\n` +
+      `• <code>/stop &lt;job_id&gt;</code> - Terminate a running scan\n` +
+      `• <code>/clean</code> - Clean finished jobs from queue\n\n` +
+      `<b>Findings & Intelligence:</b>\n` +
+      `• <code>/vulns [domain] [severity]</code> - Search vulnerabilities\n` +
+      `• <code>/secrets [domain]</code> - Search discovered secrets\n` +
+      `• <code>/ports [domain]</code> - Search open services\n` +
+      `• <code>/report &lt;domain&gt;</code> - Executive summary report`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ----------------------------------------------------
+  // Bot Interactive Callback Query Handlers
+  // ----------------------------------------------------
   bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
     await registerUser(ctx);
 
-    if (data === "target_domain") {
-      ctx.session.step = 'DOMAIN_INPUT';
-      await ctx.editMessageText("🌐 <b>Target: Domain</b>\n\nsend me the domain name (e.g. <code>example.com</code>):", {
+    // Main Menu & Navigation
+    if (data === "main_menu") {
+      ctx.session.step = 'MAIN_MENU';
+      const menuMarkup = await createMainMenu(ctx, env);
+      await safeEditMessageText(ctx, "🛰️ <b>cHack C2 Control Center</b>\n\nSelect an option below to manage targets, scans, or findings:", {
         parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "cancel" }]]
-        }
-      });
-    } else if (data === "target_person") {
-      ctx.session.step = 'PERSON_INPUT';
-      await ctx.editMessageText("🔍 <b>Target: Person</b>\n\nsend me the person's phone number (<code>+1555...</code>), username (<code>@che...</code>), or name (e.g. <code>Cheth Ober</code>):", {
-        parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "cancel" }]]
-        }
-      });
-    } else if (data === "target_company") {
-      ctx.session.step = 'COMPANY_INPUT';
-      await ctx.editMessageText("🏢 <b>Target: Company / Domain</b>\n\nPlease send me the company name or domain (e.g. <code>CHTH Corp</code> or <code>chth.xyz</code>):", {
-        parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "cancel" }]]
-        }
+        reply_markup: menuMarkup
       });
     } else if (data === "cancel") {
       ctx.session.step = 'MAIN_MENU';
       const menuMarkup = await createMainMenu(ctx, env);
-      await safeEditMessageText(ctx, "❌ Action cancelled. Select a target type:", {
+      await safeEditMessageText(ctx, "❌ Action cancelled. Select an option from the menu:", {
+        parse_mode: "HTML",
         reply_markup: menuMarkup
       });
-    } else if (data === "change_runner") {
-      ctx.session.step = 'RUNNER_SELECTION';
-      // Instantly show checking status to prevent lag or hang visual
+    } else if (data === "menu_dashboard") {
+      try {
+        const compCount = (await env.DB.prepare("SELECT count(*) as cnt FROM companies").first())?.cnt || 0;
+        const domCount = (await env.DB.prepare("SELECT count(*) as cnt FROM domains").first())?.cnt || 0;
+        const peopleCount = (await env.DB.prepare("SELECT count(*) as cnt FROM people").first())?.cnt || 0;
+        
+        const { results: findings } = await env.DB.prepare("SELECT severity, status FROM findings").all();
+        const crit = findings.filter(f => f.severity?.toLowerCase() === 'critical').length;
+        const high = findings.filter(f => f.severity?.toLowerCase() === 'high').length;
+        const med = findings.filter(f => f.severity?.toLowerCase() === 'medium').length;
+        const low = findings.filter(f => f.severity?.toLowerCase() === 'low').length;
+        const info = findings.filter(f => f.severity?.toLowerCase() === 'info').length;
+        const resolved = findings.filter(f => f.status === 'resolved').length;
+
+        const secretsCount = (await env.DB.prepare("SELECT count(*) as cnt FROM secrets").first())?.cnt || 0;
+        const servicesCount = (await env.DB.prepare("SELECT count(*) as cnt FROM network_services").first())?.cnt || 0;
+        const runningJobs = (await env.DB.prepare("SELECT count(*) as cnt FROM scan_jobs WHERE status IN ('pending', 'running')").first())?.cnt || 0;
+        
+        const cutoff = Math.floor(Date.now() / 1000) - 60;
+        const onlineRunners = (await env.DB.prepare("SELECT count(*) as cnt FROM runners WHERE last_seen >= ?").bind(cutoff).first())?.cnt || 0;
+        const totalRunners = (await env.DB.prepare("SELECT count(*) as cnt FROM runners").first())?.cnt || 0;
+
+        const text =
+          `📊 <b>cHack Intelligence & Management Dashboard</b>\n\n` +
+          `🎯 <b>Targets & Assets:</b>\n` +
+          `• 🏢 Companies / Scopes: <b>${compCount}</b>\n` +
+          `• 🌐 Domains / Subdomains: <b>${domCount}</b>\n` +
+          `• 👥 Contacts & People: <b>${peopleCount}</b>\n\n` +
+          `🛡️ <b>Findings & Vulnerabilities (${findings.length}):</b>\n` +
+          `• 🔴 Critical: <b>${crit}</b>\n` +
+          `• 🟠 High: <b>${high}</b>\n` +
+          `• 🟡 Medium: <b>${med}</b>\n` +
+          `• 🔵 Low: <b>${low}</b>\n` +
+          `• ⚪ Info: <b>${info}</b>\n` +
+          `• ✅ Resolved / Fixed: <b>${resolved}</b>\n\n` +
+          `🔑 <b>Secrets & Leaks:</b> <b>${secretsCount}</b>\n` +
+          `🔌 <b>Network Services & Open Ports:</b> <b>${servicesCount}</b>\n\n` +
+          `⚙️ <b>System & Infrastructure:</b>\n` +
+          `• ⏳ Active / Queued Jobs: <b>${runningJobs}</b>\n` +
+          `• 🖥️ Runners Online: <b>${onlineRunners} / ${totalRunners}</b>`;
+
+        await safeEditMessageText(ctx, text, {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "🔄 Refresh", callback_data: "menu_dashboard" },
+                { text: "🧹 Clear Finished Jobs", callback_data: "action_clean_queue" }
+              ],
+              [
+                { text: "🎯 Targets", callback_data: "view_targets_0" },
+                { text: "🛡️ Triage Findings", callback_data: "menu_findings" }
+              ],
+              [
+                { text: "🔙 Main Menu", callback_data: "main_menu" }
+              ]
+            ]
+          }
+        });
+      } catch (err) {
+        await ctx.reply(`❌ Error loading dashboard: ${escapeHtml(err.message)}`);
+      }
+    } else if (data === "menu_scan") {
+      await safeEditMessageText(ctx, "🚀 <b>Launch Reconnaissance Scan</b>\n\nSelect the type of reconnaissance or scanning operation to execute:", {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🏢 Full Recon (Company / Domain)", callback_data: "target_company" }
+            ],
+            [
+              { text: "🔍 Fast Info-Gathering", callback_data: "launch_infogather" },
+              { text: "🌐 Web Crawl & URLs", callback_data: "launch_web_scan" }
+            ],
+            [
+              { text: "🔌 Network & Port Scan", callback_data: "launch_net_scan" },
+              { text: "👤 Person / OSINT", callback_data: "target_person" }
+            ],
+            [
+              { text: "🔙 Main Menu", callback_data: "main_menu" }
+            ]
+          ]
+        }
+      });
+    } else if (data === "target_domain") {
+      ctx.session.step = 'DOMAIN_INPUT';
+      await safeEditMessageText(ctx, "🌐 <b>Target: Domain</b>\n\nPlease send me the target domain name (e.g. <code>example.com</code>):", {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "cancel" }]] }
+      });
+    } else if (data === "target_person") {
+      ctx.session.step = 'PERSON_INPUT';
+      await safeEditMessageText(ctx, "🔍 <b>Target: Person / Lead</b>\n\nPlease send the person's name (e.g. <code>Cheth Ober</code>), username (<code>@che...</code>), or phone (<code>+1555...</code>):", {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "cancel" }]] }
+      });
+    } else if (data === "target_company") {
+      ctx.session.step = 'COMPANY_INPUT';
+      await safeEditMessageText(ctx, "🏢 <b>Target: Company / Scope</b>\n\nPlease send me the company name or primary domain (e.g. <code>CHTH Corp</code> or <code>chth.xyz</code>):", {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "cancel" }]] }
+      });
+    } else if (data === "launch_infogather") {
+      ctx.session.step = 'INFOGATHER_INPUT';
+      await safeEditMessageText(ctx, "🔍 <b>Launch Fast Info-Gathering</b>\n\nPlease send the domain to gather subdomains and probe live HTTP hosts (e.g. <code>target.com</code>):", {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "cancel" }]] }
+      });
+    } else if (data === "launch_web_scan") {
+      ctx.session.step = 'WEB_INPUT';
+      await safeEditMessageText(ctx, "🌐 <b>Launch Web Crawl & Recon</b>\n\nPlease send the target URL or domain to crawl and discover endpoints (e.g. <code>target.com</code>):", {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "cancel" }]] }
+      });
+    } else if (data === "launch_net_scan") {
+      ctx.session.step = 'NET_INPUT';
+      await safeEditMessageText(ctx, "🔌 <b>Launch Network & Port Scan</b>\n\nPlease send the target IP, domain, or CIDR range (e.g. <code>192.168.1.1</code> or <code>target.com</code>):", {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: "cancel" }]] }
+      });
+    }
+
+    // ----------------------------------------------------
+    // Targets & Companies Management
+    // ----------------------------------------------------
+    else if (data.startsWith("view_targets")) {
+      const parts = data.split("_");
+      const page = Number(parts[2] || 0);
+      const offset = page * 8;
+
+      const { results: companies } = await env.DB.prepare("SELECT * FROM companies ORDER BY created_at DESC LIMIT 8 OFFSET ?").bind(offset).all();
+      const count = (await env.DB.prepare("SELECT count(*) as cnt FROM companies").first())?.cnt || 0;
+      const totalPages = Math.ceil(count / 8) || 1;
+
+      if (!companies.length && page === 0) {
+        return await safeEditMessageText(ctx, "🎯 <b>Targets</b>\n\nNo target companies in database. Add one below:", {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "➕ Add Target Company", callback_data: "target_company" }],
+              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+            ]
+          }
+        });
+      }
+
+      const keyboard = [];
+      for (const c of companies) {
+        const dCount = (await env.DB.prepare("SELECT count(*) as cnt FROM domains WHERE company_id = ?").bind(c.id).first())?.cnt || 0;
+        keyboard.push([{ text: `🏢 ${c.name} (${dCount} domains)`, callback_data: `view_company_${c.id}` }]);
+      }
+
+      keyboard.push([{ text: "➕ Add Target Company", callback_data: "target_company" }]);
+      
+      const navRow = [];
+      if (page > 0) navRow.push({ text: "◀️ Prev", callback_data: `view_targets_${page - 1}` });
+      if (page + 1 < totalPages) navRow.push({ text: "Next ➡️", callback_data: `view_targets_${page + 1}` });
+      if (navRow.length > 0) keyboard.push(navRow);
+      keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+
+      await safeEditMessageText(ctx, `🎯 <b>Target Companies</b> (Page ${page + 1}/${totalPages})\n\nSelect a company to view details, manage domains, or trigger scans:`, {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: keyboard }
+      });
+    } else if (data.startsWith("view_company_") && !data.includes("domains")) {
+      const companyId = data.replace("view_company_", "");
+      const comp = await env.DB.prepare("SELECT * FROM companies WHERE id = ?").bind(companyId).first();
+      if (!comp) {
+        return await safeEditMessageText(ctx, "❌ Company not found.", {
+          reply_markup: { inline_keyboard: [[{ text: "🔙 Back to Targets", callback_data: "view_targets_0" }]] }
+        });
+      }
+
+      const domCount = (await env.DB.prepare("SELECT count(*) as cnt FROM domains WHERE company_id = ?").bind(companyId).first())?.cnt || 0;
+      const peopleCount = (await env.DB.prepare("SELECT count(*) as cnt FROM people WHERE company_id = ?").bind(companyId).first())?.cnt || 0;
+      const findingsCount = (await env.DB.prepare("SELECT count(*) as cnt FROM findings WHERE company_id = ?").bind(companyId).first())?.cnt || 0;
+      
+      const compData = parseJson(comp.data);
+      const phase = compData.phase || 'N/A';
+
+      const text =
+        `🏢 <b>Company: ${escapeHtml(comp.name)}</b>\n\n` +
+        `• <b>ID:</b> <code>${comp.id}</code>\n` +
+        `• <b>Slug:</b> <code>${comp.slug || 'N/A'}</code>\n` +
+        `• <b>Recon Phase:</b> <code>${phase}</code>\n` +
+        `• <b>Domains:</b> <b>${domCount}</b>\n` +
+        `• <b>People:</b> <b>${peopleCount}</b>\n` +
+        `• <b>Findings:</b> <b>${findingsCount}</b>\n` +
+        `• <b>Created:</b> <code>${comp.created_at}</code>`;
+
+      await safeEditMessageText(ctx, text, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: `🌐 Domains (${domCount})`, callback_data: `view_company_domains_${companyId}_0` },
+              { text: "➕ Add Domain", callback_data: `prep_add_dom_${companyId}` }
+            ],
+            [
+              { text: "🚀 Full Recon Scan", callback_data: `scan_company_action_${companyId}` },
+              { text: "🗑️ Delete Scope", callback_data: `confirm_del_comp_${companyId}` }
+            ],
+            [
+              { text: "🔙 Back to Targets", callback_data: "view_targets_0" }
+            ]
+          ]
+        }
+      });
+    } else if (data.startsWith("prep_add_dom_")) {
+      const companyId = data.replace("prep_add_dom_", "");
+      ctx.session.step = 'ADD_DOMAIN_INPUT';
+      ctx.session.target_company_id = companyId;
+      await safeEditMessageText(ctx, "➕ <b>Add Domain to Company</b>\n\nPlease send the host / domain name to add (e.g. <code>api.example.com</code>):", {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "🔙 Cancel", callback_data: `view_company_${companyId}` }]] }
+      });
+    } else if (data.startsWith("confirm_del_comp_")) {
+      const companyId = data.replace("confirm_del_comp_", "");
+      const comp = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(companyId).first();
+      const compName = comp ? comp.name : "Company";
+      await safeEditMessageText(ctx, `⚠️ <b>Delete Company: ${escapeHtml(compName)}</b>\n\nAre you sure you want to permanently delete this company and all associated domains, services, and findings?`, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🗑️ Yes, Delete Everything", callback_data: `do_del_comp_${companyId}` }
+            ],
+            [
+              { text: "🔙 Cancel", callback_data: `view_company_${companyId}` }
+            ]
+          ]
+        }
+      });
+    } else if (data.startsWith("do_del_comp_")) {
+      const companyId = data.replace("do_del_comp_", "");
+      await env.DB.prepare("DELETE FROM companies WHERE id = ?").bind(companyId).run();
+      await safeEditMessageText(ctx, "✅ Company and associated records successfully deleted.", {
+        reply_markup: { inline_keyboard: [[{ text: "🔙 Back to Targets", callback_data: "view_targets_0" }]] }
+      });
+    } else if (data.startsWith("scan_company_action_")) {
+      const companyId = data.replace("scan_company_action_", "");
+      const comp = await env.DB.prepare("SELECT name, slug FROM companies WHERE id = ?").bind(companyId).first();
+      if (!comp) return;
+      const runner = ctx.session?.selected_runner || 'default';
+      const jobId = await triggerScan(ctx, 'company', comp.name, runner);
+      await safeEditMessageText(ctx, `🚀 <b>Full Recon Scan Queued for ${escapeHtml(comp.name)}</b>\n\n• <b>Runner:</b> <code>${runner}</code>\n• <b>Job ID:</b> <code>${jobId}</code>`, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📜 View Live Job", callback_data: `manage_job:${jobId}` }],
+            [{ text: "🔙 Back to Company", callback_data: `view_company_${companyId}` }]
+          ]
+        }
+      });
+    }
+
+    // ----------------------------------------------------
+    // Domains Browsing & Operations
+    // ----------------------------------------------------
+    else if (data.startsWith("view_company_domains_")) {
+      const parts = data.split("_");
+      const companyId = parts[3];
+      const page = Number(parts[4] || 0);
+      const offset = page * 8;
+
+      const comp = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(companyId).first();
+      const compName = comp ? comp.name : "Company";
+
+      const { results: domains } = await env.DB.prepare("SELECT * FROM domains WHERE company_id = ? ORDER BY created_at DESC LIMIT 8 OFFSET ?").bind(companyId, offset).all();
+      const count = (await env.DB.prepare("SELECT count(*) as cnt FROM domains WHERE company_id = ?").bind(companyId).first())?.cnt || 0;
+      const totalPages = Math.ceil(count / 8) || 1;
+
+      if (!domains.length && page === 0) {
+        return await safeEditMessageText(ctx, `🌐 <b>Domains for ${escapeHtml(compName)}</b>\n\nNo domains discovered yet.`, {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "➕ Add Domain", callback_data: `prep_add_dom_${companyId}` }],
+              [{ text: "🔙 Back to Company", callback_data: `view_company_${companyId}` }]
+            ]
+          }
+        });
+      }
+
+      const keyboard = [];
+      domains.forEach(d => {
+        const domData = parseJson(d.data);
+        const code = domData.status_code;
+        let badge = "⚪";
+        if (code >= 200 && code < 300) badge = "🟢";
+        else if (code >= 300 && code < 400) badge = "🔵";
+        else if (code >= 400 && code < 500) badge = "🔴";
+        keyboard.push([{ text: `${badge} ${d.host}`, callback_data: `view_domain_${d.id}` }]);
+      });
+
+      keyboard.push([{ text: "➕ Add Domain", callback_data: `prep_add_dom_${companyId}` }]);
+
+      const navRow = [];
+      if (page > 0) navRow.push({ text: "◀️ Prev", callback_data: `view_company_domains_${companyId}_${page - 1}` });
+      if (page + 1 < totalPages) navRow.push({ text: "Next ➡️", callback_data: `view_company_domains_${companyId}_${page + 1}` });
+      if (navRow.length > 0) keyboard.push(navRow);
+      keyboard.push([{ text: "🔙 Back to Company", callback_data: `view_company_${companyId}` }]);
+
+      await safeEditMessageText(ctx, `🌐 <b>Domains for ${escapeHtml(compName)}</b> (Page ${page + 1}/${totalPages})\n\nSelect a domain to inspect or scan:`, {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: keyboard }
+      });
+    } else if (data.startsWith("view_domain_")) {
+      const domainId = data.replace("view_domain_", "");
+      const dom = await env.DB.prepare("SELECT * FROM domains WHERE id = ?").bind(domainId).first();
+      if (!dom) {
+        return await safeEditMessageText(ctx, "❌ Domain not found.", {
+          reply_markup: { inline_keyboard: [[{ text: "🔙 Back to Targets", callback_data: "view_targets_0" }]] }
+        });
+      }
+
+      const comp = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(dom.company_id).first();
+      const domData = parseJson(dom.data);
+      const title = domData.title || 'N/A';
+      const webserver = domData.webserver || 'N/A';
+      const status_code = domData.status_code || 'N/A';
+      const tech = (domData.tech || []).join(', ') || 'None';
+
+      const vulnCount = (await env.DB.prepare("SELECT count(*) as cnt FROM findings WHERE domain_id = ?").bind(domainId).first())?.cnt || 0;
+      const secretsCount = (await env.DB.prepare("SELECT count(*) as cnt FROM secrets WHERE domain_id = ?").bind(domainId).first())?.cnt || 0;
+      const servicesCount = (await env.DB.prepare("SELECT count(*) as cnt FROM network_services WHERE domain_id = ?").bind(domainId).first())?.cnt || 0;
+
+      const text =
+        `🌐 <b>Domain: ${escapeHtml(dom.host)}</b>\n\n` +
+        `• <b>Company:</b> ${comp ? escapeHtml(comp.name) : 'N/A'}\n` +
+        `• <b>Canonical URL:</b> <code>${escapeHtml(dom.canonical_url || `http://${dom.host}`)}</code>\n` +
+        `• <b>Status Code:</b> <code>${status_code}</code>\n` +
+        `• <b>Title:</b> ${escapeHtml(title)}\n` +
+        `• <b>Web Server:</b> <code>${escapeHtml(webserver)}</code>\n` +
+        `• <b>Technologies:</b> <code>${escapeHtml(tech)}</code>\n\n` +
+        `🛡️ <b>Findings:</b> ${vulnCount} | 🔑 <b>Secrets:</b> ${secretsCount} | 🔌 <b>Ports:</b> ${servicesCount}`;
+
+      await safeEditMessageText(ctx, text, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🚀 Recon", callback_data: `scan_dom_recon_${domainId}` },
+              { text: "🔍 Info-Gather", callback_data: `scan_dom_info_${domainId}` }
+            ],
+            [
+              { text: "🌐 Web Crawl", callback_data: `scan_dom_web_${domainId}` },
+              { text: "🔌 Port Scan", callback_data: `scan_dom_net_${domainId}` }
+            ],
+            [
+              { text: `🛡️ Findings (${vulnCount})`, callback_data: `view_dom_vulns_${domainId}_0` },
+              { text: `🔑 Secrets (${secretsCount})`, callback_data: `view_dom_secrets_${domainId}_0` }
+            ],
+            [
+              { text: "🗑️ Delete Domain", callback_data: `confirm_del_dom_${domainId}` },
+              { text: "🔙 Back", callback_data: `view_company_domains_${dom.company_id}_0` }
+            ]
+          ]
+        }
+      });
+    } else if (data.startsWith("confirm_del_dom_")) {
+      const domainId = data.replace("confirm_del_dom_", "");
+      const dom = await env.DB.prepare("SELECT host, company_id FROM domains WHERE id = ?").bind(domainId).first();
+      if (!dom) return;
+      await safeEditMessageText(ctx, `⚠️ <b>Delete Domain: ${escapeHtml(dom.host)}</b>\n\nAre you sure you want to remove this domain and its associated endpoints/findings?`, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🗑️ Yes, Delete", callback_data: `do_del_dom_${domainId}` }],
+            [{ text: "🔙 Cancel", callback_data: `view_domain_${domainId}` }]
+          ]
+        }
+      });
+    } else if (data.startsWith("do_del_dom_")) {
+      const domainId = data.replace("do_del_dom_", "");
+      const dom = await env.DB.prepare("SELECT company_id FROM domains WHERE id = ?").bind(domainId).first();
+      await env.DB.prepare("DELETE FROM domains WHERE id = ?").bind(domainId).run();
+      const returnCompId = dom ? dom.company_id : null;
+      await safeEditMessageText(ctx, "✅ Domain successfully deleted.", {
+        reply_markup: {
+          inline_keyboard: [
+            returnCompId
+              ? [{ text: "🔙 Back to Company Domains", callback_data: `view_company_domains_${returnCompId}_0` }]
+              : [{ text: "🔙 Back to Targets", callback_data: "view_targets_0" }]
+          ]
+        }
+      });
+    } else if (data.startsWith("scan_dom_")) {
+      const parts = data.split("_");
+      const scanType = parts[2]; // recon, info, web, net
+      const domainId = parts[3];
+      const dom = await env.DB.prepare("SELECT host FROM domains WHERE id = ?").bind(domainId).first();
+      if (!dom) return;
+      const runner = ctx.session?.selected_runner || 'default';
+
+      let typeKey = 'domain';
+      if (scanType === 'info') typeKey = 'infogather';
+      else if (scanType === 'web') typeKey = 'web';
+      else if (scanType === 'net') typeKey = 'network';
+
+      const jobId = await triggerScan(ctx, typeKey, dom.host, runner);
+      await safeEditMessageText(ctx, `🚀 <b>Scan Queued for ${escapeHtml(dom.host)}</b>\n\n• <b>Type:</b> <code>${scanType.toUpperCase()}</code>\n• <b>Runner:</b> <code>${runner}</code>\n• <b>Job ID:</b> <code>${jobId}</code>`, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📜 View Live Job", callback_data: `manage_job:${jobId}` }],
+            [{ text: "🔙 Back to Domain", callback_data: `view_domain_${domainId}` }]
+          ]
+        }
+      });
+    }
+
+    // ----------------------------------------------------
+    // Contacts (People) Management
+    // ----------------------------------------------------
+    else if (data.startsWith("view_contacts")) {
+      const parts = data.split("_");
+      const page = Number(parts[2] || 0);
+      const offset = page * 8;
+
+      const { results: people } = await env.DB.prepare("SELECT * FROM people ORDER BY created_at DESC LIMIT 8 OFFSET ?").bind(offset).all();
+      const count = (await env.DB.prepare("SELECT count(*) as cnt FROM people").first())?.cnt || 0;
+      const totalPages = Math.ceil(count / 8) || 1;
+
+      if (!people.length && page === 0) {
+        return await safeEditMessageText(ctx, "👥 <b>Contacts & People</b>\n\nNo contacts found in database. Add one below:", {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "➕ Add New Person", callback_data: "target_person" }],
+              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+            ]
+          }
+        });
+      }
+
+      const keyboard = [];
+      for (const p of people) {
+        const name = `${p.given_name || ''} ${p.family_name || ''}`.trim() || 'Unnamed';
+        keyboard.push([{ text: `👤 ${name}`, callback_data: `view_contact_${p.id}` }]);
+      }
+
+      keyboard.push([{ text: "➕ Add New Person", callback_data: "target_person" }]);
+
+      const navRow = [];
+      if (page > 0) navRow.push({ text: "◀️ Prev", callback_data: `view_contacts_${page - 1}` });
+      if (page + 1 < totalPages) navRow.push({ text: "Next ➡️", callback_data: `view_contacts_${page + 1}` });
+      if (navRow.length > 0) keyboard.push(navRow);
+      keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+
+      await safeEditMessageText(ctx, `👥 <b>Contacts & People</b> (Page ${page + 1}/${totalPages})\n\nSelect a contact to inspect details, launch OSINT search, or remove:`, {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: keyboard }
+      });
+    } else if (data.startsWith("view_contact_")) {
+      const contactId = data.replace("view_contact_", "");
+      const person = await env.DB.prepare("SELECT * FROM people WHERE id = ?").bind(contactId).first();
+      if (!person) {
+        return await safeEditMessageText(ctx, "❌ Contact not found.", {
+          reply_markup: { inline_keyboard: [[{ text: "🔙 Back to Contacts", callback_data: "view_contacts_0" }]] }
+        });
+      }
+      
+      const emails = parseJson(person.emails).join(', ') || "None";
+      const phones = parseJson(person.phones).join(', ') || "None";
+      const company = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(person.company_id).first();
+      const name = `${person.given_name || ''} ${person.family_name || ''}`.trim() || 'Unnamed';
+      const username = parseJson(person.data).username || "No Username";
+
+      const text =
+        `👤 <b>Contact: ${escapeHtml(name)}</b>\n\n` +
+        `• <b>ID:</b> <code>${person.id}</code>\n` +
+        `• <b>Username:</b> <code>${escapeHtml(username)}</code>\n` +
+        `• <b>Company:</b> ${company ? escapeHtml(company.name) : 'N/A'}\n` +
+        `• <b>Emails:</b> <code>${escapeHtml(emails)}</code>\n` +
+        `• <b>Phones:</b> <code>${escapeHtml(phones)}</code>\n` +
+        `• <b>Notes:</b> ${escapeHtml(person.notes || 'None')}\n` +
+        `• <b>Created At:</b> <code>${person.created_at}</code>`;
+
+      await safeEditMessageText(ctx, text, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🚀 OSINT Scan Person", callback_data: `scan_person_action_${person.id}` },
+              { text: "🗑️ Delete Contact", callback_data: `confirm_del_person_${person.id}` }
+            ],
+            [
+              { text: "🔙 Back to Contacts", callback_data: "view_contacts_0" }
+            ]
+          ]
+        }
+      });
+    } else if (data.startsWith("confirm_del_person_")) {
+      const contactId = data.replace("confirm_del_person_", "");
+      const person = await env.DB.prepare("SELECT given_name, family_name FROM people WHERE id = ?").bind(contactId).first();
+      const name = person ? `${person.given_name} ${person.family_name || ''}`.trim() : 'Contact';
+      await safeEditMessageText(ctx, `⚠️ <b>Delete Contact: ${escapeHtml(name)}</b>\n\nAre you sure you want to remove this contact from the database?`, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🗑️ Yes, Delete", callback_data: `do_del_person_${contactId}` }],
+            [{ text: "🔙 Cancel", callback_data: `view_contact_${contactId}` }]
+          ]
+        }
+      });
+    } else if (data.startsWith("do_del_person_")) {
+      const contactId = data.replace("do_del_person_", "");
+      await env.DB.prepare("DELETE FROM people WHERE id = ?").bind(contactId).run();
+      await safeEditMessageText(ctx, "✅ Contact successfully deleted.", {
+        reply_markup: { inline_keyboard: [[{ text: "🔙 Back to Contacts", callback_data: "view_contacts_0" }]] }
+      });
+    } else if (data.startsWith("scan_person_action_")) {
+      const contactId = data.replace("scan_person_action_", "");
+      const person = await env.DB.prepare("SELECT given_name, family_name FROM people WHERE id = ?").bind(contactId).first();
+      if (!person) return;
+      const fullName = `${person.given_name} ${person.family_name || ''}`.trim();
+      const runner = ctx.session?.selected_runner || 'default';
+      const jobId = await triggerScan(ctx, 'person', fullName, runner);
+      await safeEditMessageText(ctx, `🚀 <b>OSINT Scan Queued for ${escapeHtml(fullName)}</b>\n\n• <b>Runner:</b> <code>${runner}</code>\n• <b>Job ID:</b> <code>${jobId}</code>`, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📜 View Live Job", callback_data: `manage_job:${jobId}` }],
+            [{ text: "🔙 Back to Contact", callback_data: `view_contact_${contactId}` }]
+          ]
+        }
+      });
+    }
+
+    // ----------------------------------------------------
+    // Scan Queue & Job Control
+    // ----------------------------------------------------
+    else if (data === "view_new_domains" || data === "menu_queue") {
+      const { results: jobs } = await env.DB.prepare(
+        "SELECT * FROM scan_jobs ORDER BY created_at DESC LIMIT 10"
+      ).all();
+      
+      if (!jobs.length) {
+        return await safeEditMessageText(
+          ctx,
+          "📜 <b>Scan Queue</b>\n\nNo scan jobs currently in the queue.", 
+          {
+            parse_mode: "HTML",
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "🚀 Launch Scan", callback_data: "menu_scan" }],
+                [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+              ]
+            }
+          }
+        );
+      }
+      
+      const keyboard = [];
+      jobs.forEach(job => {
+        let badge = "⏳";
+        if (job.status === 'running') badge = "🔄";
+        else if (job.status === 'completed') badge = "✅";
+        else if (job.status === 'failed') badge = "🛑";
+        keyboard.push([{ text: `${badge} ${job.domain} (${job.runner || 'default'})`, callback_data: `manage_job:${job.id}` }]);
+      });
+
+      keyboard.push([
+        { text: "🔄 Refresh", callback_data: "view_new_domains" },
+        { text: "🧹 Clean Finished", callback_data: "action_clean_queue" }
+      ]);
+      keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+
       await safeEditMessageText(
         ctx,
-        "⚙️ <b>Select Active Runner</b>\n\n🔄 Checking for active scanner runners...",
-        { parse_mode: "HTML" }
-      ).catch(() => {});
+        `📜 <b>Scan Jobs Queue (${jobs.length})</b>\n\nClick any job to view live logs, stop execution, or re-run:`,
+        {
+          parse_mode: "HTML",
+          reply_markup: { inline_keyboard: keyboard }
+        }
+      );
+    } else if (data.startsWith("manage_job:")) {
+      const jobId = data.split(":")[1];
+      const job = await env.DB.prepare("SELECT * FROM scan_jobs WHERE id = ?").bind(jobId).first();
+      if (!job) {
+        return await safeEditMessageText(ctx, "❌ Job not found.", {
+          reply_markup: { inline_keyboard: [[{ text: "🔙 Back to Queue", callback_data: "view_new_domains" }]] }
+        });
+      }
 
+      let statusBadge = "⏳ Pending";
+      if (job.status === 'running') statusBadge = "🔄 Running";
+      else if (job.status === 'completed') statusBadge = "✅ Completed";
+      else if (job.status === 'failed') statusBadge = "🛑 Stopped / Failed";
+
+      const rawStdout = job.stdout || '';
+      const stdoutSnippet = rawStdout.length > 1200 ? '...' + rawStdout.substring(rawStdout.length - 1200) : rawStdout || 'No output recorded yet.';
+
+      const text =
+        `📜 <b>Scan Job Details:</b>\n\n` +
+        `• <b>Target:</b> <code>${escapeHtml(job.domain)}</code>\n` +
+        `• <b>Status:</b> ${statusBadge}\n` +
+        `• <b>Runner:</b> <code>${escapeHtml(job.runner || 'default')}</code>\n` +
+        `• <b>Command:</b> <code>${escapeHtml(job.command)}</code>\n` +
+        `• <b>Created:</b> <code>${job.created_at}</code>\n` +
+        `• <b>Updated:</b> <code>${job.updated_at || job.created_at}</code>\n\n` +
+        `<b>Live Output Logs:</b>\n<pre>${escapeHtml(stdoutSnippet)}</pre>`;
+
+      const actionsRow = [];
+      if (job.status === 'running' || job.status === 'pending') {
+        actionsRow.push({ text: "🛑 Stop Scan", callback_data: `job_stop:${job.id}` });
+      } else {
+        actionsRow.push({ text: "🔁 Re-run Scan", callback_data: `job_restart:${job.id}` });
+      }
+      actionsRow.push({ text: "🗑️ Delete Job", callback_data: `job_delete:${job.id}` });
+
+      await safeEditMessageText(ctx, text, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🔄 Refresh Logs", callback_data: `manage_job:${job.id}` }],
+            actionsRow,
+            [{ text: "🔙 Back to Queue", callback_data: "view_new_domains" }]
+          ]
+        }
+      });
+    } else if (data.startsWith("job_stop:")) {
+      const jobId = data.split(":")[1];
+      await env.DB.prepare("UPDATE scan_jobs SET status = 'failed', stdout = stdout || '\n[CANCELLED BY USER]', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").bind(jobId).run();
+      await ctx.answerCallbackQuery({ text: "🛑 Scan stopped.", show_alert: false });
+      ctx.callbackQuery.data = `manage_job:${jobId}`;
+      return bot.handleUpdate(ctx.update);
+    } else if (data.startsWith("job_restart:")) {
+      const jobId = data.split(":")[1];
+      await env.DB.prepare("UPDATE scan_jobs SET status = 'pending', stdout = '', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").bind(jobId).run();
+      await ctx.answerCallbackQuery({ text: "🔁 Scan job re-queued.", show_alert: false });
+      ctx.callbackQuery.data = `manage_job:${jobId}`;
+      return bot.handleUpdate(ctx.update);
+    } else if (data.startsWith("job_delete:")) {
+      const jobId = data.split(":")[1];
+      await env.DB.prepare("DELETE FROM scan_jobs WHERE id = ?").bind(jobId).run();
+      await ctx.answerCallbackQuery({ text: "🗑️ Job deleted.", show_alert: false });
+      ctx.callbackQuery.data = "view_new_domains";
+      return bot.handleUpdate(ctx.update);
+    } else if (data === "action_clean_queue") {
+      await env.DB.prepare("DELETE FROM scan_jobs WHERE status IN ('completed', 'failed')").run();
+      await ctx.answerCallbackQuery({ text: "🧹 Cleaned up finished scan jobs.", show_alert: true });
+      ctx.callbackQuery.data = "view_new_domains";
+      return bot.handleUpdate(ctx.update);
+    }
+
+    // ----------------------------------------------------
+    // Findings & Vulnerability Triage
+    // ----------------------------------------------------
+    else if (data === "menu_findings" || data.startsWith("menu_findings_")) {
+      const parts = data.split("_");
+      const severityFilter = parts[2] || "all";
+      const page = Number(parts[3] || 0);
+      const offset = page * 6;
+
+      let query = `
+        SELECT f.*, d.host FROM findings f
+        JOIN domains d ON f.domain_id = d.id
+        WHERE 1=1
+      `;
+      const binds = [];
+      if (severityFilter !== "all") {
+        query += " AND lower(f.severity) = lower(?)";
+        binds.push(severityFilter);
+      }
+      query += " ORDER BY CASE f.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END, f.created_at DESC LIMIT 6 OFFSET ?";
+      binds.push(offset);
+
+      const { results: findings } = await env.DB.prepare(query).bind(...binds).all();
+
+      let countQuery = "SELECT count(*) as cnt FROM findings";
+      let countBinds = [];
+      if (severityFilter !== "all") {
+        countQuery += " WHERE lower(severity) = lower(?)";
+        countBinds.push(severityFilter);
+      }
+      const count = (await env.DB.prepare(countQuery).bind(...countBinds).first())?.cnt || 0;
+      const totalPages = Math.ceil(count / 6) || 1;
+
+      const keyboard = [
+        [
+          { text: "🔴 Crit", callback_data: "menu_findings_critical_0" },
+          { text: "🟠 High", callback_data: "menu_findings_high_0" },
+          { text: "🟡 Med", callback_data: "menu_findings_medium_0" },
+          { text: "🔵 Low", callback_data: "menu_findings_low_0" },
+          { text: "📋 All", callback_data: "menu_findings_all_0" }
+        ]
+      ];
+
+      const emojiMap = { critical: '🔴', high: '🟠', medium: '🟡', low: '🔵', info: '⚪' };
+      findings.forEach(f => {
+        const em = emojiMap[f.severity.toLowerCase()] || '⚪';
+        let stBadge = f.status === 'resolved' ? '✅' : (f.status === 'false_positive' ? '🚫' : '');
+        keyboard.push([{
+          text: `${em} ${f.title.substring(0, 32)} ${stBadge}`,
+          callback_data: `view_finding:${f.id}:${severityFilter}:${page}`
+        }]);
+      });
+
+      const navRow = [];
+      if (page > 0) navRow.push({ text: "◀️ Prev", callback_data: `menu_findings_${severityFilter}_${page - 1}` });
+      if (page + 1 < totalPages) navRow.push({ text: "Next ➡️", callback_data: `menu_findings_${severityFilter}_${page + 1}` });
+      if (navRow.length > 0) keyboard.push(navRow);
+
+      keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+
+      const filterTitle = severityFilter.toUpperCase();
+      await safeEditMessageText(ctx, `🛡️ <b>Vulnerabilities Triage [${filterTitle}]</b> (${count} findings, Page ${page + 1}/${totalPages})\n\nSelect a vulnerability finding to inspect evidence or update triage status:`, {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: keyboard }
+      });
+    } else if (data.startsWith("view_finding:")) {
+      const parts = data.split(":");
+      const findingId = parts[1];
+      const lastSev = parts[2] || "all";
+      const lastPage = parts[3] || "0";
+
+      const finding = await env.DB.prepare(`
+        SELECT f.*, d.host FROM findings f
+        JOIN domains d ON f.domain_id = d.id
+        WHERE f.id = ?
+      `).bind(findingId).first();
+
+      if (!finding) {
+        return await safeEditMessageText(ctx, "❌ Finding not found.", {
+          reply_markup: { inline_keyboard: [[{ text: "🔙 Back", callback_data: `menu_findings_${lastSev}_${lastPage}` }]] }
+        });
+      }
+
+      const emojiMap = { critical: '🔴', high: '🟠', medium: '🟡', low: '🔵', info: '⚪' };
+      const em = emojiMap[finding.severity.toLowerCase()] || '⚪';
+
+      let statusBadge = "🟡 Open";
+      if (finding.status === 'resolved') statusBadge = "✅ Resolved";
+      else if (finding.status === 'false_positive') statusBadge = "🚫 False Positive";
+
+      const poc = finding.poc || finding.evidence || 'No PoC / Evidence provided.';
+
+      const text =
+        `🛡️ <b>Finding: ${escapeHtml(finding.title)}</b>\n\n` +
+        `• <b>Severity:</b> ${em} <code>${escapeHtml(finding.severity.toUpperCase())}</code>\n` +
+        `• <b>Status:</b> <b>${statusBadge}</b>\n` +
+        `• <b>Type:</b> <code>${escapeHtml(finding.vuln_type)}</code>\n` +
+        `• <b>Tool:</b> <code>${escapeHtml(finding.tool)}</code>\n` +
+        `• <b>Target URL / Host:</b> <code>${escapeHtml(finding.url || finding.host)}</code>\n` +
+        (finding.cve ? `• <b>CVE:</b> <code>${escapeHtml(finding.cve)}</code>\n` : '') +
+        `• <b>Created:</b> <code>${finding.created_at}</code>\n\n` +
+        `<b>Proof of Concept / Evidence:</b>\n<pre>${escapeHtml(poc.substring(0, 800))}</pre>`;
+
+      await safeEditMessageText(ctx, text, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "✅ Resolve", callback_data: `set_finding_st:${finding.id}:resolved:${lastSev}:${lastPage}` },
+              { text: "🚫 False Positive", callback_data: `set_finding_st:${finding.id}:false_positive:${lastSev}:${lastPage}` },
+              { text: "🔄 Reopen", callback_data: `set_finding_st:${finding.id}:open:${lastSev}:${lastPage}` }
+            ],
+            [
+              { text: "🗑️ Delete Finding", callback_data: `del_finding:${finding.id}:${lastSev}:${lastPage}` },
+              { text: "🔙 Back to Findings", callback_data: `menu_findings_${lastSev}_${lastPage}` }
+            ]
+          ]
+        }
+      });
+    } else if (data.startsWith("set_finding_st:")) {
+      const parts = data.split(":");
+      const findingId = parts[1];
+      const newStatus = parts[2];
+      const lastSev = parts[3] || "all";
+      const lastPage = parts[4] || "0";
+
+      await env.DB.prepare("UPDATE findings SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").bind(newStatus, findingId).run();
+      await ctx.answerCallbackQuery({ text: `Status updated to ${newStatus}`, show_alert: false });
+      ctx.callbackQuery.data = `view_finding:${findingId}:${lastSev}:${lastPage}`;
+      return bot.handleUpdate(ctx.update);
+    } else if (data.startsWith("del_finding:")) {
+      const parts = data.split(":");
+      const findingId = parts[1];
+      const lastSev = parts[2] || "all";
+      const lastPage = parts[3] || "0";
+
+      await env.DB.prepare("DELETE FROM findings WHERE id = ?").bind(findingId).run();
+      await ctx.answerCallbackQuery({ text: "🗑️ Finding deleted.", show_alert: false });
+      ctx.callbackQuery.data = `menu_findings_${lastSev}_${lastPage}`;
+      return bot.handleUpdate(ctx.update);
+    }
+
+    // ----------------------------------------------------
+    // Secrets Browser
+    // ----------------------------------------------------
+    else if (data.startsWith("menu_secrets_")) {
+      const page = Number(data.replace("menu_secrets_", "") || 0);
+      const offset = page * 6;
+
+      const { results: secrets } = await env.DB.prepare(`
+        SELECT s.*, d.host FROM secrets s
+        JOIN domains d ON s.domain_id = d.id
+        ORDER BY s.created_at DESC LIMIT 6 OFFSET ?
+      `).bind(offset).all();
+
+      const count = (await env.DB.prepare("SELECT count(*) as cnt FROM secrets").first())?.cnt || 0;
+      const totalPages = Math.ceil(count / 6) || 1;
+
+      if (!secrets.length && page === 0) {
+        return await safeEditMessageText(ctx, "🔑 <b>Discovered Secrets</b>\n\nNo leaked secrets found in database.", {
+          parse_mode: "HTML",
+          reply_markup: { inline_keyboard: [[{ text: "🔙 Main Menu", callback_data: "main_menu" }]] }
+        });
+      }
+
+      const keyboard = [];
+      secrets.forEach(s => {
+        keyboard.push([{ text: `🔑 ${s.rule_name} (${s.secret_type})`, callback_data: `view_secret:${s.id}:${page}` }]);
+      });
+
+      const navRow = [];
+      if (page > 0) navRow.push({ text: "◀️ Prev", callback_data: `menu_secrets_${page - 1}` });
+      if (page + 1 < totalPages) navRow.push({ text: "Next ➡️", callback_data: `menu_secrets_${page + 1}` });
+      if (navRow.length > 0) keyboard.push(navRow);
+      keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+
+      await safeEditMessageText(ctx, `🔑 <b>Discovered Secrets (${count})</b> (Page ${page + 1}/${totalPages})\n\nSelect a secret to view match snippet and source file:`, {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: keyboard }
+      });
+    } else if (data.startsWith("view_secret:")) {
+      const parts = data.split(":");
+      const secretId = parts[1];
+      const page = parts[2] || "0";
+
+      const secret = await env.DB.prepare(`
+        SELECT s.*, d.host FROM secrets s
+        JOIN domains d ON s.domain_id = d.id
+        WHERE s.id = ?
+      `).bind(secretId).first();
+
+      if (!secret) {
+        return await safeEditMessageText(ctx, "❌ Secret not found.", {
+          reply_markup: { inline_keyboard: [[{ text: "🔙 Back", callback_data: `menu_secrets_${page}` }]] }
+        });
+      }
+
+      const text =
+        `🔑 <b>Secret: ${escapeHtml(secret.rule_name)}</b>\n\n` +
+        `• <b>Type:</b> <code>${escapeHtml(secret.secret_type)}</code>\n` +
+        `• <b>Severity:</b> <code>${escapeHtml(secret.severity.toUpperCase())}</code>\n` +
+        `• <b>Host:</b> <code>${escapeHtml(secret.host)}</code>\n` +
+        `• <b>File / Endpoint:</b> <code>${escapeHtml(secret.file_url || secret.host)}</code>\n` +
+        `• <b>Discovered:</b> <code>${secret.created_at}</code>\n\n` +
+        `<b>Match Snippet:</b>\n<pre>${escapeHtml(secret.match_snippet)}</pre>`;
+
+      await safeEditMessageText(ctx, text, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🗑️ Delete Secret", callback_data: `del_secret:${secret.id}:${page}` },
+              { text: "🔙 Back to Secrets", callback_data: `menu_secrets_${page}` }
+            ]
+          ]
+        }
+      });
+    } else if (data.startsWith("del_secret:")) {
+      const parts = data.split(":");
+      const secretId = parts[1];
+      const page = parts[2] || "0";
+
+      await env.DB.prepare("DELETE FROM secrets WHERE id = ?").bind(secretId).run();
+      await ctx.answerCallbackQuery({ text: "🗑️ Secret deleted.", show_alert: false });
+      ctx.callbackQuery.data = `menu_secrets_${page}`;
+      return bot.handleUpdate(ctx.update);
+    }
+
+    // ----------------------------------------------------
+    // Services & Open Ports Browser
+    // ----------------------------------------------------
+    else if (data.startsWith("menu_services_")) {
+      const page = Number(data.replace("menu_services_", "") || 0);
+      const offset = page * 8;
+
+      const { results: services } = await env.DB.prepare(`
+        SELECT ns.*, d.host FROM network_services ns
+        JOIN domains d ON ns.domain_id = d.id
+        ORDER BY ns.port ASC LIMIT 8 OFFSET ?
+      `).bind(offset).all();
+
+      const count = (await env.DB.prepare("SELECT count(*) as cnt FROM network_services").first())?.cnt || 0;
+      const totalPages = Math.ceil(count / 8) || 1;
+
+      if (!services.length && page === 0) {
+        return await safeEditMessageText(ctx, "🔌 <b>Network Services & Open Ports</b>\n\nNo open ports found in database.", {
+          parse_mode: "HTML",
+          reply_markup: { inline_keyboard: [[{ text: "🔙 Main Menu", callback_data: "main_menu" }]] }
+        });
+      }
+
+      const keyboard = [];
+      services.forEach(s => {
+        keyboard.push([{
+          text: `🔌 ${s.ip}:${s.port} (${s.service || 'unknown'})`,
+          callback_data: `view_service:${s.id}:${page}`
+        }]);
+      });
+
+      const navRow = [];
+      if (page > 0) navRow.push({ text: "◀️ Prev", callback_data: `menu_services_${page - 1}` });
+      if (page + 1 < totalPages) navRow.push({ text: "Next ➡️", callback_data: `menu_services_${page + 1}` });
+      if (navRow.length > 0) keyboard.push(navRow);
+      keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+
+      await safeEditMessageText(ctx, `🔌 <b>Network Services (${count})</b> (Page ${page + 1}/${totalPages})\n\nSelect a service to inspect port details:`, {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: keyboard }
+      });
+    } else if (data.startsWith("view_service:")) {
+      const parts = data.split(":");
+      const serviceId = parts[1];
+      const page = parts[2] || "0";
+
+      const service = await env.DB.prepare(`
+        SELECT ns.*, d.host FROM network_services ns
+        JOIN domains d ON ns.domain_id = d.id
+        WHERE ns.id = ?
+      `).bind(serviceId).first();
+
+      if (!service) {
+        return await safeEditMessageText(ctx, "❌ Service not found.", {
+          reply_markup: { inline_keyboard: [[{ text: "🔙 Back", callback_data: `menu_services_${page}` }]] }
+        });
+      }
+
+      const text =
+        `🔌 <b>Service: ${escapeHtml(service.ip)}:${service.port}</b>\n\n` +
+        `• <b>Protocol:</b> <code>${escapeHtml(service.protocol || 'tcp')}</code>\n` +
+        `• <b>Service Name:</b> <code>${escapeHtml(service.service || 'unknown')}</code>\n` +
+        `• <b>Product:</b> <code>${escapeHtml(service.product || 'N/A')}</code>\n` +
+        `• <b>Version:</b> <code>${escapeHtml(service.version || 'N/A')}</code>\n` +
+        `• <b>Host:</b> <code>${escapeHtml(service.host)}</code>\n` +
+        `• <b>Discovered:</b> <code>${service.created_at}</code>\n\n` +
+        (service.banner ? `<b>Banner:</b>\n<pre>${escapeHtml(service.banner.substring(0, 500))}</pre>` : '');
+
+      await safeEditMessageText(ctx, text, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🗑️ Delete Service", callback_data: `del_service:${service.id}:${page}` },
+              { text: "🔙 Back to Services", callback_data: `menu_services_${page}` }
+            ]
+          ]
+        }
+      });
+    } else if (data.startsWith("del_service:")) {
+      const parts = data.split(":");
+      const serviceId = parts[1];
+      const page = parts[2] || "0";
+
+      await env.DB.prepare("DELETE FROM network_services WHERE id = ?").bind(serviceId).run();
+      await ctx.answerCallbackQuery({ text: "🗑️ Service deleted.", show_alert: false });
+      ctx.callbackQuery.data = `menu_services_${page}`;
+      return bot.handleUpdate(ctx.update);
+    }
+
+    // ----------------------------------------------------
+    // Runners Management
+    // ----------------------------------------------------
+    else if (data === "change_runner") {
+      ctx.session.step = 'RUNNER_SELECTION';
       const runnerMarkup = await createRunnerKeyboard();
       await safeEditMessageText(
         ctx,
         "⚙️ <b>Runners Management</b>\n\n" +
-        "Choose a runner to select it as active or manage (rename/remove) it (🟢 indicates active in the last 60 seconds, 🔴 indicates inactive):",
+        "Select a runner to set it as active or manage its settings (🟢 indicates online in the last 60s, 🔴 indicates offline):",
         {
           parse_mode: "HTML",
           reply_markup: runnerMarkup
         }
       );
-    } else if (data === "no_active_runners") {
-      await ctx.answerCallbackQuery({
-        text: "No runners are currently connected. Please start runner.js on your VPS.",
-        show_alert: true
-      });
     } else if (data.startsWith("select_runner:")) {
       const runner = data.split(":").pop();
       ctx.session.selected_runner = runner;
       ctx.session.step = 'MAIN_MENU';
-      await ctx.editMessageText(`✅ Active runner updated to: <code>${runner}</code>`, {
-        parse_mode: "HTML"
-      });
+      await ctx.answerCallbackQuery({ text: `Active runner set to ${runner}`, show_alert: false });
       const menuMarkup = await createMainMenu(ctx, env);
-      await ctx.reply("Select a target type to scan:", {
+      await safeEditMessageText(ctx, `✅ <b>Active runner updated to:</b> <code>${escapeHtml(runner)}</code>\n\nSelect an option below:`, {
+        parse_mode: "HTML",
         reply_markup: menuMarkup
       });
     } else if (data.startsWith("manage_runner:")) {
@@ -1294,7 +3192,7 @@ const getBot = (env) => {
 
         if (!runner) {
           return await ctx.answerCallbackQuery({
-            text: "Runner not found. It might have been deleted.",
+            text: "Runner not found.",
             show_alert: true
           });
         }
@@ -1306,10 +3204,10 @@ const getBot = (env) => {
         const flag = getFlagEmoji(runner.country);
 
         const detailsText = 
-          `⚙️ <b>Manage Runner:</b> <code>${runner.name}</code>\n\n` +
+          `⚙️ <b>Manage Runner:</b> <code>${escapeHtml(runner.name)}</code>\n\n` +
           `• <b>Status:</b> ${statusStr}\n` +
-          `• <b>IP Address:</b> <code>${runner.ip || 'N/A'}</code>\n` +
-          `• <b>Country:</b> ${flag} ${runner.country || 'N/A'}\n` +
+          `• <b>IP Address:</b> <code>${escapeHtml(runner.ip || 'N/A')}</code>\n` +
+          `• <b>Country:</b> ${flag} ${escapeHtml(runner.country || 'N/A')}\n` +
           `• <b>Last Seen:</b> <code>${lastSeenStr}</code>\n\n` +
           `Select an option below:`;
 
@@ -1328,16 +3226,12 @@ const getBot = (env) => {
         });
       } catch (err) {
         console.error("D1 error in manage_runner:", err.message);
-        await ctx.answerCallbackQuery({
-          text: `Error loading runner details: ${err.message}`,
-          show_alert: true
-        });
       }
     } else if (data.startsWith("prep_rename:")) {
       const runnerName = data.split(":").pop();
       ctx.session.step = 'RENAME_RUNNER';
       ctx.session.target_runner = runnerName;
-      await safeEditMessageText(ctx, `✏️ <b>Rename Runner:</b> <code>${runnerName}</code>\n\nPlease send the new name for this runner:`, {
+      await safeEditMessageText(ctx, `✏️ <b>Rename Runner:</b> <code>${escapeHtml(runnerName)}</code>\n\nPlease send the new name for this runner:`, {
         parse_mode: "HTML",
         reply_markup: {
           inline_keyboard: [[{ text: "🔙 Cancel", callback_data: `manage_runner:${runnerName}` }]]
@@ -1347,13 +3241,11 @@ const getBot = (env) => {
       const runnerName = data.split(":").pop();
       try {
         await env.DB.prepare("DELETE FROM runners WHERE name = ?").bind(runnerName).run();
-        
-        // If the removed runner was the currently selected runner, fallback to default
         if (ctx.session.selected_runner === runnerName) {
           ctx.session.selected_runner = 'default';
         }
 
-        await safeEditMessageText(ctx, `❌ Runner <code>${runnerName}</code> has been removed from the database.`, {
+        await safeEditMessageText(ctx, `❌ Runner <code>${escapeHtml(runnerName)}</code> has been removed from the database.`, {
           parse_mode: "HTML",
           reply_markup: {
             inline_keyboard: [[{ text: "🔙 Go to Runners", callback_data: "change_runner" }]]
@@ -1361,242 +3253,13 @@ const getBot = (env) => {
         });
       } catch (err) {
         console.error("D1 error in remove_runner:", err.message);
-        await ctx.answerCallbackQuery({
-          text: `Error removing runner: ${err.message}`,
-          show_alert: true
-        });
       }
-    } else if (data === "view_new_domains") {
-      const { results: jobs } = await env.DB.prepare(
-        "SELECT * FROM scan_jobs WHERE status IN ('pending', 'running') ORDER BY created_at DESC"
-      ).all();
-      
-      if (!jobs.length) {
-        return await safeEditMessageText(
-          ctx,
-          "📜 <b>Ongoing Scans</b>\n\nNo ongoing scan jobs at the moment.", 
-          {
-            parse_mode: "HTML",
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: "🔄 Refresh", callback_data: "view_new_domains" }],
-                [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
-              ]
-            }
-          }
-        );
-      }
-      
-      const lines = [];
-      for (const job of jobs) {
-        let phase = '1';
-        if (job.status === 'pending') {
-          phase = '1 (Pending)';
-        } else {
-          const stdout = job.stdout || '';
-          if (stdout.includes('Phase 5') || stdout.includes('Vulnerability Scan') || stdout.includes('Finalizing Scan')) {
-            phase = '5';
-          } else if (stdout.includes('Phase 4') || stdout.includes('URL Discovery') || stdout.includes('Crawler findings') || stdout.includes('Katana')) {
-            phase = '4';
-          } else if (stdout.includes('Phase 3') || stdout.includes('Port Scan') || stdout.includes('Port Scan findings')) {
-            phase = '3';
-          } else if (stdout.includes('Phase 2') || stdout.includes('HTTPX Scan') || stdout.includes('HTTPX findings')) {
-            phase = '2';
-          } else {
-            try {
-              let company = null;
-              const domRow = await env.DB.prepare(
-                "SELECT company_id FROM domains WHERE lower(host) = lower(?) LIMIT 1"
-              ).bind(job.domain).first();
-              if (domRow) {
-                company = await env.DB.prepare(
-                  "SELECT data FROM companies WHERE id = ?"
-                ).bind(domRow.company_id).first();
-              } else {
-                company = await env.DB.prepare(
-                  "SELECT data FROM companies WHERE lower(name) = lower(?) OR lower(slug) = lower(?) LIMIT 1"
-                ).bind(job.domain, job.domain).first();
-              }
-              if (company && company.data) {
-                const compData = typeof company.data === 'string' ? JSON.parse(company.data) : company.data;
-                if (compData && compData.phase) {
-                  phase = compData.phase;
-                }
-              }
-            } catch (e) {}
-          }
-        }
-        
-        const runner = job.runner || 'default';
-        lines.push(`🎯 <b>${job.domain}</b> | ⚙️ <code>${runner}</code> | ⏳ Phase: <code>${phase}</code>`);
-      }
-      
-      await safeEditMessageText(
-        ctx,
-        `📜 <b>Ongoing Scans</b>\n\n${lines.join('\n')}`,
-        {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "🔄 Refresh", callback_data: "view_new_domains" }],
-              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
-            ]
-          }
-        }
-      );
-    } else if (data.startsWith("new_domains_page_")) {
-      const page = Number(data.split("_").pop());
-      const offset = page * 10;
-      const { results: domains } = await env.DB.prepare("SELECT * FROM domains ORDER BY created_at DESC LIMIT 10 OFFSET ?").bind(offset).all();
-      const lines = domains.map(d => formatDomainLine(d));
-      
-      const navRow = [];
-      if (page > 0) navRow.push({ text: "◀️ Previous", callback_data: `new_domains_page_${page - 1}` });
-      if (domains.length === 10) navRow.push({ text: "Next ➡️", callback_data: `new_domains_page_${page + 1}` });
-
-      await ctx.editMessageText(
-        `🆕 <b>Newly Discovered Domains</b> (Page ${page + 1})\n\n${lines.join('\n')}`,
-        {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [
-              navRow,
-              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
-            ]
-          }
-        }
-      );
-    } else if (data === "view_targets") {
-      const { results: companies } = await env.DB.prepare("SELECT * FROM companies LIMIT 10").all();
-      if (!companies.length) {
-        return await ctx.editMessageText("🎯 <b>Targets</b>\n\nNo companies found in the database.", {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [[{ text: "🔙 Main Menu", callback_data: "main_menu" }]]
-          }
-        });
-      }
-      const keyboard = companies.map(c => [{ text: c.name, callback_data: `view_company_domains_${c.id}_0` }]);
-      keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
-      await ctx.editMessageText("🎯 <b>Targets (Companies)</b>\n\nSelect a company to view its domains:", {
-        parse_mode: "HTML",
-        reply_markup: { inline_keyboard: keyboard }
-      });
-    } else if (data.startsWith("view_company_domains_")) {
-      const parts = data.split("_");
-      const company_id = parts[3];
-      const page = Number(parts[4] || 0);
-      const offset = page * 10;
-
-      const comp = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(company_id).first();
-      const { results: domains } = await env.DB.prepare("SELECT * FROM domains WHERE company_id = ? ORDER BY created_at DESC LIMIT 10 OFFSET ?").bind(company_id, offset).all();
-      
-      const comp_name = comp ? comp.name : "Unknown";
-      const lines = domains.map(d => formatDomainLine(d));
-
-      const navRow = [];
-      if (page > 0) navRow.push({ text: "◀️ Previous", callback_data: `view_company_domains_${company_id}_${page - 1}` });
-      if (domains.length === 10) navRow.push({ text: "Next ➡️", callback_data: `view_company_domains_${company_id}_${page + 1}` });
-
-      const keyboard = [
-        navRow,
-        [{ text: "🔙 Back to Targets", callback_data: "view_targets" }],
-        [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
-      ].filter(r => r.length > 0);
-
-      await ctx.editMessageText(
-        `🏢 <b>Company: ${comp_name} Domains</b> (Page ${page + 1})\n\n${lines.join('\n') || 'None'}`,
-        {
-          parse_mode: "HTML",
-          reply_markup: { inline_keyboard: keyboard }
-        }
-      );
-    } else if (data === "view_contacts") {
-      const { results: people } = await env.DB.prepare("SELECT * FROM people LIMIT 10").all();
-      if (!people.length) {
-        return await ctx.editMessageText("👤 <b>Contacts</b>\n\nNo contacts found in the database.", {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [[{ text: "🔙 Main Menu", callback_data: "main_menu" }]]
-          }
-        });
-      }
-      const keyboard = people.map(p => {
-        const name = `${p.given_name} ${p.family_name || ''}`.trim();
-        return [{ text: name, callback_data: `view_contact_${p.id}` }];
-      });
-      keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
-      await ctx.editMessageText("👤 <b>Contacts</b>\n\nSelect a contact to view details:", {
-        parse_mode: "HTML",
-        reply_markup: { inline_keyboard: keyboard }
-      });
-    } else if (data.startsWith("contacts_page_")) {
-      const page = Number(data.split("_").pop());
-      const offset = page * 10;
-      const { results: people } = await env.DB.prepare("SELECT * FROM people LIMIT 10 OFFSET ?").bind(offset).all();
-      
-      const keyboard = people.map(p => {
-        const name = `${p.given_name} ${p.family_name || ''}`.trim();
-        return [{ text: name, callback_data: `view_contact_${p.id}` }];
-      });
-      
-      const navRow = [];
-      if (page > 0) navRow.push({ text: "◀️ Previous", callback_data: `contacts_page_${page - 1}` });
-      if (people.length === 10) navRow.push({ text: "Next ➡️", callback_data: `contacts_page_${page + 1}` });
-
-      keyboard.push(navRow);
-      keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
-
-      await ctx.editMessageText(`👤 <b>Contacts</b> (Page ${page + 1})\n\nSelect a contact to view details:`, {
-        parse_mode: "HTML",
-        reply_markup: { inline_keyboard: keyboard }
-      });
-    } else if (data.startsWith("view_contact_")) {
-      const contactId = data.split("_").pop();
-      const person = await env.DB.prepare("SELECT * FROM people WHERE id = ?").bind(contactId).first();
-      if (!person) {
-        return await ctx.editMessageText("❌ Contact not found.", {
-          reply_markup: {
-            inline_keyboard: [[{ text: "🔙 Back to Contacts", callback_data: "view_contacts" }]]
-          }
-        });
-      }
-      
-      const emails = parseJson(person.emails).join(', ') || "None";
-      const phones = parseJson(person.phones).join(', ') || "None";
-      const company = await env.DB.prepare("SELECT name FROM companies WHERE id = ?").bind(person.company_id).first();
-      const name = `${person.given_name} ${person.family_name || ''}`.trim();
-      const username = parseJson(person.data).username || "No Username";
-
-      await ctx.editMessageText(
-        `👤 <b>Contact: ${name}</b>\n\n` +
-        `• <b>ID:</b> <code>${person.id}</code>\n` +
-        `• <b>Username:</b> <code>${username}</code>\n` +
-        `• <b>Company:</b> ${company ? company.name : 'N/A'}\n` +
-        `• <b>Emails:</b> ${emails}\n` +
-        `• <b>Phones:</b> ${phones}\n` +
-        `• <b>Notes:</b> ${person.notes || 'None'}\n` +
-        `• <b>Created At:</b> <code>${person.created_at}</code>`,
-        {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "🔙 Back to Contacts", callback_data: "view_contacts" }],
-              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
-            ]
-          }
-        }
-      );
-    } else if (data === "main_menu") {
-      ctx.session.step = 'MAIN_MENU';
-      const menuMarkup = await createMainMenu(ctx, env);
-      await safeEditMessageText(ctx, "hey, good 2 c u back", {
-        reply_markup: menuMarkup
-      });
     }
   });
 
-  // Bot incoming message routing based on state steps
+  // ----------------------------------------------------
+  // Bot Text Messages (Input State Router)
+  // ----------------------------------------------------
   bot.on("message:text", async (ctx) => {
     await registerUser(ctx);
     const text = ctx.message.text.trim();
@@ -1610,56 +3273,152 @@ const getBot = (env) => {
     const runner = ctx.session.selected_runner;
 
     if (step === 'DOMAIN_INPUT') {
-      // Validate domain
       const isDomain = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(text);
       if (!isDomain) {
-        return await ctx.reply("❌ Invalid domain format. Try again or type /start to reset.");
+        return await ctx.reply("❌ Invalid domain format. Try again or type /menu to reset.");
       }
-      await triggerScan(ctx, 'domain', text, runner);
+      const jobId = await triggerScan(ctx, 'domain', text, runner);
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
-        `🚀 <b>Starting recon scan...</b>\n\n` +
+        `🚀 <b>Full Recon Scan Queued!</b>\n\n` +
+        `• <b>Target:</b> <code>${escapeHtml(text)}</code>\n` +
         `• <b>Runner:</b> <code>${runner}</code>\n` +
-        `• <b>Command:</b> <code>./cHack.sh -d ${text}</code>`,
+        `• <b>Job ID:</b> <code>${jobId}</code>`,
         {
-          parse_mode: "HTML"
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "📜 View Live Job", callback_data: `manage_job:${jobId}` }],
+              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+            ]
+          }
         }
       );
-      const menuMarkup = await createMainMenu(ctx, env);
-      await ctx.reply("Select another target type to scan:", { reply_markup: menuMarkup });
     } 
     else if (step === 'PERSON_INPUT') {
-      await triggerScan(ctx, 'person', text, runner);
+      const jobId = await triggerScan(ctx, 'person', text, runner);
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
-        `🚀 <b>Starting recon scan...</b>\n\n` +
+        `🔍 <b>Person OSINT Scan Queued!</b>\n\n` +
+        `• <b>Target:</b> <code>${escapeHtml(text)}</code>\n` +
         `• <b>Runner:</b> <code>${runner}</code>\n` +
-        `• <b>Command:</b> <code>./cHack.sh -p "${text}"</code>`,
+        `• <b>Job ID:</b> <code>${jobId}</code>`,
         {
-          parse_mode: "HTML"
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "📜 View Live Job", callback_data: `manage_job:${jobId}` }],
+              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+            ]
+          }
         }
       );
-      const menuMarkup = await createMainMenu(ctx, env);
-      await ctx.reply("Select another target type to scan:", { reply_markup: menuMarkup });
     } 
     else if (step === 'COMPANY_INPUT') {
       const isDomain = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(text);
       const targetType = isDomain ? 'domain' : 'company';
-      await triggerScan(ctx, targetType, text, runner);
+      const jobId = await triggerScan(ctx, targetType, text, runner);
       ctx.session.step = 'MAIN_MENU';
       
-      let cmdStr = isDomain ? `./cHack.sh -d ${text}` : `./cHack.sh -c "${text}"`;
       await ctx.reply(
-        `🚀 <b>Starting recon scan...</b>\n\n` +
+        `🏢 <b>Company Recon Scan Queued!</b>\n\n` +
+        `• <b>Target:</b> <code>${escapeHtml(text)}</code>\n` +
         `• <b>Runner:</b> <code>${runner}</code>\n` +
-        `• <b>Command:</b> <code>${cmdStr}</code>`,
+        `• <b>Job ID:</b> <code>${jobId}</code>`,
         {
-          parse_mode: "HTML"
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "📜 View Live Job", callback_data: `manage_job:${jobId}` }],
+              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+            ]
+          }
         }
       );
-      const menuMarkup = await createMainMenu(ctx, env);
-      await ctx.reply("Select another target type to scan:", { reply_markup: menuMarkup });
-    } 
+    }
+    else if (step === 'INFOGATHER_INPUT') {
+      const jobId = await triggerScan(ctx, 'infogather', text, runner);
+      ctx.session.step = 'MAIN_MENU';
+      await ctx.reply(
+        `🔍 <b>Info-Gathering Scan Queued!</b>\n\n` +
+        `• <b>Target:</b> <code>${escapeHtml(text)}</code>\n` +
+        `• <b>Runner:</b> <code>${runner}</code>\n` +
+        `• <b>Job ID:</b> <code>${jobId}</code>`,
+        {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "📜 View Live Job", callback_data: `manage_job:${jobId}` }],
+              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+            ]
+          }
+        }
+      );
+    }
+    else if (step === 'WEB_INPUT') {
+      const jobId = await triggerScan(ctx, 'web', text, runner);
+      ctx.session.step = 'MAIN_MENU';
+      await ctx.reply(
+        `🌐 <b>Web Recon & Crawl Queued!</b>\n\n` +
+        `• <b>Target:</b> <code>${escapeHtml(text)}</code>\n` +
+        `• <b>Runner:</b> <code>${runner}</code>\n` +
+        `• <b>Job ID:</b> <code>${jobId}</code>`,
+        {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "📜 View Live Job", callback_data: `manage_job:${jobId}` }],
+              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+            ]
+          }
+        }
+      );
+    }
+    else if (step === 'NET_INPUT') {
+      const jobId = await triggerScan(ctx, 'network', text, runner);
+      ctx.session.step = 'MAIN_MENU';
+      await ctx.reply(
+        `🔌 <b>Network & Port Scan Queued!</b>\n\n` +
+        `• <b>Target:</b> <code>${escapeHtml(text)}</code>\n` +
+        `• <b>Runner:</b> <code>${runner}</code>\n` +
+        `• <b>Job ID:</b> <code>${jobId}</code>`,
+        {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "📜 View Live Job", callback_data: `manage_job:${jobId}` }],
+              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+            ]
+          }
+        }
+      );
+    }
+    else if (step === 'ADD_DOMAIN_INPUT') {
+      const companyId = ctx.session.target_company_id;
+      const host = text.toLowerCase().trim();
+      const isDomain = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(host);
+      if (!isDomain) {
+        return await ctx.reply("❌ Invalid domain format. Please send a valid domain (e.g. <code>api.example.com</code>):", { parse_mode: "HTML" });
+      }
+
+      const id = crypto.randomUUID();
+      await env.DB.prepare(
+        "INSERT INTO domains (id, company_id, host, canonical_url, data) VALUES (?, ?, ?, ?, '{}') ON CONFLICT(company_id, lower(host)) DO NOTHING"
+      ).bind(id, companyId, host, `http://${host}`).run();
+
+      ctx.session.step = 'MAIN_MENU';
+      ctx.session.target_company_id = null;
+
+      await ctx.reply(`✅ Domain <code>${escapeHtml(host)}</code> added to company!`, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🌐 View Company Domains", callback_data: `view_company_domains_${companyId}_0` }],
+            [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+          ]
+        }
+      });
+    }
     else if (step === 'RENAME_RUNNER') {
       const oldRunnerName = ctx.session.target_runner;
       const newRunnerName = text.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9_-]/g, '');
@@ -1668,19 +3427,14 @@ const getBot = (env) => {
       }
 
       try {
-        // Check if name already exists
         const existing = await env.DB.prepare("SELECT name FROM runners WHERE name = ?").bind(newRunnerName).first();
         if (existing) {
-          return await ctx.reply(`❌ A runner named <code>${newRunnerName}</code> already exists. Please send a different name:`, { parse_mode: "HTML" });
+          return await ctx.reply(`❌ A runner named <code>${escapeHtml(newRunnerName)}</code> already exists. Please send a different name:`, { parse_mode: "HTML" });
         }
 
-        // Update runner name in runners table
         await env.DB.prepare("UPDATE runners SET name = ?, last_seen = strftime('%s', 'now') WHERE name = ?").bind(newRunnerName, oldRunnerName).run();
-
-        // Update pending/running jobs for this runner
         await env.DB.prepare("UPDATE scan_jobs SET runner = ? WHERE runner = ?").bind(newRunnerName, oldRunnerName).run();
 
-        // If the renamed runner was the selected one in the user's session, update it
         if (ctx.session.selected_runner === oldRunnerName) {
           ctx.session.selected_runner = newRunnerName;
         }
@@ -1688,7 +3442,7 @@ const getBot = (env) => {
         ctx.session.step = 'MAIN_MENU';
         ctx.session.target_runner = null;
 
-        await ctx.reply(`✅ Runner <code>${oldRunnerName}</code> successfully renamed to <code>${newRunnerName}</code>.`, {
+        await ctx.reply(`✅ Runner <code>${escapeHtml(oldRunnerName)}</code> successfully renamed to <code>${escapeHtml(newRunnerName)}</code>.`, {
           parse_mode: "HTML",
           reply_markup: {
             inline_keyboard: [[{ text: "🔙 Go to Runners", callback_data: "change_runner" }]]
@@ -1696,27 +3450,34 @@ const getBot = (env) => {
         });
       } catch (err) {
         console.error("D1 error in rename runner:", err.message);
-        await ctx.reply(`❌ Database error while renaming runner: ${err.message}`);
+        await ctx.reply(`❌ Database error while renaming runner: ${escapeHtml(err.message)}`);
       }
     } 
     else {
-      // Default: check if domain
+      // Default fallback: if a domain is pasted directly, start recon scan
       const isDomain = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(text);
       if (isDomain) {
-        await triggerScan(ctx, 'domain', text, runner);
+        const jobId = await triggerScan(ctx, 'domain', text, runner);
         await ctx.reply(
-          `🚀 <b>Starting recon scan for domain...</b>\n\n` +
+          `🚀 <b>Full Recon Scan Queued!</b>\n\n` +
+          `• <b>Target:</b> <code>${escapeHtml(text)}</code>\n` +
           `• <b>Runner:</b> <code>${runner}</code>\n` +
-          `• <b>Command:</b> <code>./cHack.sh -d ${text}</code>`,
+          `• <b>Job ID:</b> <code>${jobId}</code>`,
           {
-            parse_mode: "HTML"
+            parse_mode: "HTML",
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "📜 View Live Job", callback_data: `manage_job:${jobId}` }],
+                [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+              ]
+            }
           }
         );
-        const menuMarkup = await createMainMenu(ctx, env);
-        await ctx.reply("Select another target type to scan:", { reply_markup: menuMarkup });
       } else {
         const menuMarkup = await createMainMenu(ctx, env);
-        await ctx.reply("To start a scan, select a target type from the menu or send a valid domain:", { reply_markup: menuMarkup });
+        await ctx.reply("To start an operation, choose an option from the menu or send a domain to scan:", {
+          reply_markup: menuMarkup
+        });
       }
     }
   });
@@ -1724,11 +3485,9 @@ const getBot = (env) => {
   // Global grammY error catcher
   bot.catch((err) => {
     const ctx = err.ctx;
-    console.error(`Error while handling update ${ctx.update.update_id}:`);
+    console.error(`Error while handling update ${ctx.update?.update_id}:`);
     const e = err.error;
-    // Suppress "message is not modified" Bad Requests to keep bot UI responsive
     if (e && e.description && e.description.includes("message is not modified")) {
-      console.log("Ignored Telegram API Error: Message is not modified");
       return;
     }
     console.error(e);
@@ -1751,6 +3510,71 @@ app.get('/api/db/migrate', async (c) => {
     // Add ip/country columns to runners table
     await c.env.DB.prepare("ALTER TABLE runners ADD COLUMN ip TEXT").run().catch(() => {});
     await c.env.DB.prepare("ALTER TABLE runners ADD COLUMN country TEXT").run().catch(() => {});
+    
+    // Create new Reconner tables if not exist
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS findings (
+        id TEXT PRIMARY KEY,
+        domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+        company_id TEXT REFERENCES companies(id) ON DELETE CASCADE,
+        tool TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        vuln_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        url TEXT,
+        description TEXT,
+        evidence TEXT,
+        poc TEXT,
+        cve TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS endpoints (
+        id TEXT PRIMARY KEY,
+        domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+        url TEXT NOT NULL,
+        method TEXT DEFAULT 'GET',
+        params TEXT DEFAULT '[]',
+        status_code INTEGER,
+        content_type TEXT,
+        source TEXT,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS secrets (
+        id TEXT PRIMARY KEY,
+        domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+        rule_name TEXT NOT NULL,
+        secret_type TEXT NOT NULL,
+        match_snippet TEXT NOT NULL,
+        file_url TEXT,
+        severity TEXT NOT NULL DEFAULT 'high',
+        status TEXT NOT NULL DEFAULT 'open',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS network_services (
+        id TEXT PRIMARY KEY,
+        domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+        ip TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        protocol TEXT DEFAULT 'tcp',
+        service TEXT,
+        product TEXT,
+        version TEXT,
+        banner TEXT,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
     return c.text("D1 Database Migrations applied successfully!");
   } catch (e) {
     return c.text("Migration failed: " + e.message, 500);
