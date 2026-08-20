@@ -802,11 +802,21 @@ const resolvers = {
 
     // Scanner mutations
     updateHttpxResults: async (_, { domain, results }, { env }) => {
-      const statements = [];
+      const domRow = await env.DB.prepare("SELECT company_id FROM domains WHERE lower(host) = lower(?) LIMIT 1").bind(domain).first();
+      const compRow = await env.DB.prepare("SELECT id FROM companies WHERE slug = ? OR lower(name) = lower(?) LIMIT 1").bind(domain, domain).first();
+      const companyId = domRow ? domRow.company_id : (compRow ? compRow.id : null);
+
       for (const result of results) {
         const raw_url = result.url || '';
-        // strip scheme
-        const host = raw_url.replace(/^https?:\/\//, '');
+        const input_host = result.input || '';
+        let host = '';
+        if (input_host) {
+          host = input_host.trim().toLowerCase();
+        } else {
+          host = raw_url.replace(/^https?:\/\//, '').split('/')[0].split(':')[0].trim().toLowerCase();
+        }
+        if (!host) continue;
+
         const patch = JSON.stringify({
           title: result.title || '',
           webserver: result.webserver || '',
@@ -815,19 +825,22 @@ const resolvers = {
           tech: result.tech || [],
           last_scan: new Date().toISOString()
         });
-        
-        statements.push(
-          env.DB.prepare(
+
+        const existing = await env.DB.prepare("SELECT id FROM domains WHERE lower(host) = lower(?)").bind(host).first();
+        if (existing) {
+          await env.DB.prepare(
             `UPDATE domains
              SET data = json_patch(COALESCE(data, '{}'), ?),
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE lower(host) = lower(?)`
-          ).bind(patch, host)
-        );
-      }
-      
-      if (statements.length > 0) {
-        await env.DB.batch(statements);
+          ).bind(patch, host).run();
+        } else if (companyId) {
+          const id = crypto.randomUUID();
+          await env.DB.prepare(
+            `INSERT INTO domains (id, company_id, host, canonical_url, data)
+             VALUES (?, ?, ?, ?, ?)`
+          ).bind(id, companyId, host, raw_url || `https://${host}`, patch).run();
+        }
       }
       return true;
     },
@@ -1265,7 +1278,8 @@ const createMainMenu = async (ctx, env) => {
         { text: "🔌 Services", callback_data: "menu_services_0" }
       ],
       [
-        { text: `⚙️ Runner (${runnerStatusText})`, callback_data: "change_runner" }
+        { text: `⚙️ Runner (${runnerStatusText})`, callback_data: "change_runner" },
+        { text: "⚠️ Reset DB", callback_data: "confirm_reset_db" }
       ]
     ]
   };
@@ -1520,6 +1534,7 @@ const getBot = (env) => {
               { text: "🛡️ Triage Findings", callback_data: "menu_findings" }
             ],
             [
+              { text: "⚠️ Reset Database", callback_data: "confirm_reset_db" },
               { text: "🔙 Main Menu", callback_data: "main_menu" }
             ]
           ]
@@ -2139,12 +2154,46 @@ const getBot = (env) => {
     await ctx.reply(`🛑 Job <code>${escapeHtml(jobId)}</code> marked as stopped/cancelled.`, { parse_mode: "HTML" });
   });
 
+  bot.command(["resetdb", "reset"], async (ctx) => {
+    await registerUser(ctx);
+    await ctx.reply(
+      `⚠️ <b>DANGER: Reset Cloudflare Database</b>\n\n` +
+      `Are you sure you want to permanently delete <b>ALL</b> data in Cloudflare DB?\n\n` +
+      `This will delete:\n` +
+      `• 🏢 Companies & Scopes\n` +
+      `• 🌐 Domains & Subdomains\n` +
+      `• 👥 Contacts & People\n` +
+      `• 🛡️ Vulnerabilities & Findings\n` +
+      `• 🔑 Secrets & Leaks\n` +
+      `• 🔌 Open Services & Ports\n` +
+      `• 🔗 Discovered Endpoints\n` +
+      `• 📜 Scan Jobs Queue & Logs\n` +
+      `• 🖥️ Registered Runners\n` +
+      `• 👤 Users & Sessions\n\n` +
+      `<b>This action is permanent and cannot be undone!</b>`,
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🔴 Yes, Wipe & Reset All Data", callback_data: "do_reset_db" }
+            ],
+            [
+              { text: "🔙 Cancel", callback_data: "main_menu" }
+            ]
+          ]
+        }
+      }
+    );
+  });
+
   bot.command("help", async (ctx) => {
     await ctx.reply(
       `📖 <b>cHack Bot Command & Management Guide</b>\n\n` +
       `<b>Navigation & Dashboard:</b>\n` +
       `• <code>/menu</code> or <code>/start</code> - Open interactive Main Menu\n` +
       `• <code>/dashboard</code> or <code>/stats</code> - System stats & asset counts\n` +
+      `• <code>/resetdb</code> - Wipe & reset Cloudflare DB\n` +
       `• <code>/help</code> - Show this guide\n\n` +
       `<b>Targets & Assets Management:</b>\n` +
       `• <code>/targets</code> - Interactive target companies list\n` +
@@ -2247,6 +2296,7 @@ const getBot = (env) => {
                 { text: "🛡️ Triage Findings", callback_data: "menu_findings" }
               ],
               [
+                { text: "⚠️ Reset Database", callback_data: "confirm_reset_db" },
                 { text: "🔙 Main Menu", callback_data: "main_menu" }
               ]
             ]
@@ -3254,6 +3304,79 @@ const getBot = (env) => {
       } catch (err) {
         console.error("D1 error in remove_runner:", err.message);
       }
+    } else if (data === "confirm_reset_db") {
+      await safeEditMessageText(
+        ctx,
+        `⚠️ <b>DANGER: Reset Cloudflare Database</b>\n\n` +
+        `Are you sure you want to permanently delete <b>ALL</b> data in Cloudflare DB?\n\n` +
+        `This will delete:\n` +
+        `• 🏢 Companies & Scopes\n` +
+        `• 🌐 Domains & Subdomains\n` +
+        `• 👥 Contacts & People\n` +
+        `• 🛡️ Vulnerabilities & Findings\n` +
+        `• 🔑 Secrets & Leaks\n` +
+        `• 🔌 Open Services & Ports\n` +
+        `• 🔗 Discovered Endpoints\n` +
+        `• 📜 Scan Jobs Queue & Logs\n` +
+        `• 🖥️ Registered Runners\n` +
+        `• 👤 Users & Sessions\n\n` +
+        `<b>This action is permanent and cannot be undone!</b>`,
+        {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "🔴 Yes, Wipe & Reset All Data", callback_data: "do_reset_db" }
+              ],
+              [
+                { text: "🔙 Cancel", callback_data: "main_menu" }
+              ]
+            ]
+          }
+        }
+      );
+    } else if (data === "do_reset_db") {
+      try {
+        const tables = [
+          "findings",
+          "secrets",
+          "network_services",
+          "endpoints",
+          "people",
+          "domains",
+          "companies",
+          "scan_jobs",
+          "runners",
+          "sessions",
+          "users"
+        ];
+        const statements = tables.map(t => env.DB.prepare(`DELETE FROM ${t}`));
+        await env.DB.batch(statements);
+
+        ctx.session = {
+          selected_runner: 'default',
+          step: 'MAIN_MENU',
+          user_registered: false
+        };
+        await registerUser(ctx);
+
+        await safeEditMessageText(ctx, "✅ <b>Cloudflare Database Cleared!</b>\n\nAll targets, scan jobs, findings, secrets, services, runners, and sessions have been deleted successfully.", {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "🔙 Main Menu", callback_data: "main_menu" }]
+            ]
+          }
+        });
+      } catch (err) {
+        console.error("D1 reset error:", err.message);
+        await safeEditMessageText(ctx, `❌ Failed to reset database: ${escapeHtml(err.message)}`, {
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [[{ text: "🔙 Main Menu", callback_data: "main_menu" }]]
+          }
+        });
+      }
     }
   });
 
@@ -3578,6 +3701,29 @@ app.get('/api/db/migrate', async (c) => {
     return c.text("D1 Database Migrations applied successfully!");
   } catch (e) {
     return c.text("Migration failed: " + e.message, 500);
+  }
+});
+
+app.post('/api/db/reset', async (c) => {
+  try {
+    const tables = [
+      "findings",
+      "secrets",
+      "network_services",
+      "endpoints",
+      "people",
+      "domains",
+      "companies",
+      "scan_jobs",
+      "runners",
+      "sessions",
+      "users"
+    ];
+    const statements = tables.map(t => c.env.DB.prepare(`DELETE FROM ${t}`));
+    await c.env.DB.batch(statements);
+    return c.json({ success: true, message: "Cloudflare D1 database wiped successfully." });
+  } catch (e) {
+    return c.json({ success: false, error: e.message }, 500);
   }
 });
 

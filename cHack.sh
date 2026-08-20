@@ -437,12 +437,8 @@ db_add_domain() {
 insert_company_and_domains() {
     local domain=$1
     local output_dir="$TARGETS_DIR/$domain"
-    local subdomains_file="$output_dir/subdomains"
-
-    if [ ! -f "$subdomains_file" ]; then
-        log_error "Subdomains file not found: $subdomains_file"
-        return 1
-    fi
+    local httpx_file="$output_dir/httpx.json"
+    local live_hosts_file="$output_dir/live_hosts"
 
     log_info "Checking if company exists for domain: $domain"
     local company_id
@@ -458,14 +454,29 @@ insert_company_and_domains() {
         return 1
     fi
 
-    log_info "Inserting subdomains into domains table..."
+    # Only insert active subdomains that responded with a status code during HTTPX probing
+    local active_subs_file="$output_dir/active_subdomains"
+    if [ -s "$httpx_file" ]; then
+        # Extract unique hosts from httpx.json (prefer input hostname, fallback to url domain)
+        jq -r '(.input // (.url | sub("^https?://"; "") | sub("[:/].*"; "")) // empty)' "$httpx_file" 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -v '^$' | sort -u > "$active_subs_file"
+    elif [ -s "$live_hosts_file" ]; then
+        sed -E 's|^https?://||; s|[:/].*$||' "$live_hosts_file" | tr '[:upper:]' '[:lower:]' | grep -v '^$' | sort -u > "$active_subs_file"
+    else
+        log_info "No active subdomains found responding to HTTP probes. Skipping subdomain DB insertion."
+        return 0
+    fi
+
+    local active_count
+    active_count=$(wc -l < "$active_subs_file" 2>/dev/null || echo 0)
+    log_info "Inserting $active_count active subdomain(s) (returning status code) into domains table..."
+
     while IFS= read -r host; do
         if [ -n "$host" ]; then
             db_add_domain "$company_id" "$host" "https://$host" "{}" >/dev/null
         fi
-    done < "$subdomains_file"
+    done < "$active_subs_file"
 
-    log_info "Successfully processed company $domain (ID: $company_id) and its domains"
+    log_info "Successfully processed company $domain (ID: $company_id) and inserted $active_count active subdomains"
 }
 
 update_httpx_results() {
@@ -992,16 +1003,16 @@ run_info_gathering() {
     mkdir -p "$output_dir"
 
     run_subdomain_enum "$domain"
-    insert_company_and_domains "$domain" &
     
     local sub_count=$(wc -l < "$output_dir/subdomains" 2>/dev/null || echo 0)
-    send_telegram_notification "✅ <b>Phase 1: Subdomain Discovery Done</b> for <code>$domain</code> (<b>$sub_count</b> subdomains)"
+    send_telegram_notification "✅ <b>Phase 1: Subdomain Discovery Done</b> for <code>$domain</code> (<b>$sub_count</b> subdomains discovered)"
 
     run_httpx "$domain"
+    insert_company_and_domains "$domain"
     update_httpx_results "$domain"
 
     local live_count=$(wc -l < "$output_dir/live_hosts" 2>/dev/null || echo 0)
-    send_telegram_notification "✅ <b>Phase 2: Live HTTP Probing Done</b> for <code>$domain</code> (<b>$live_count</b> live hosts)"
+    send_telegram_notification "✅ <b>Phase 2: Live HTTP Probing Done</b> for <code>$domain</code> (<b>$live_count</b> active hosts saved)"
 
     run_naabu "$domain"
     update_port_scan_results "$domain"
@@ -1023,6 +1034,7 @@ run_web_recon() {
 
     run_subdomain_enum "$domain"
     run_httpx "$domain"
+    insert_company_and_domains "$domain"
     update_httpx_results "$domain"
     run_katana "$domain"
     update_endpoints_results "$domain"
@@ -1054,21 +1066,21 @@ recon() {
     if ! run_subdomain_enum "$domain"; then
         log_error "Subdomain enumeration failed"
     fi
-    insert_company_and_domains "$domain" &
     
     local sub_count=$(wc -l < "$output_dir/subdomains" 2>/dev/null || echo 0)
     send_telegram_notification "✅ <b>Phase 1: Subdomain Enumeration Completed</b> for <code>$domain</code>
-• Total subdomains: <b>$sub_count</b>"
+• Total subdomains discovered: <b>$sub_count</b>"
 
     # Phase 2
     if ! run_httpx "$domain"; then
         log_error "HTTPX scan failed"
     fi
+    insert_company_and_domains "$domain"
     update_httpx_results "$domain"
 
     local live_count=$(wc -l < "$output_dir/live_hosts" 2>/dev/null || echo 0)
     send_telegram_notification "✅ <b>Phase 2: Live HTTP Resolution Completed</b> for <code>$domain</code>
-• Live web endpoints: <b>$live_count</b>"
+• Active web endpoints saved: <b>$live_count</b>"
 
     # Phase 3
     if ! run_naabu "$domain"; then

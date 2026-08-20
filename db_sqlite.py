@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import json
 import sqlite3
 import base64
@@ -187,9 +188,22 @@ def execute_graphql(in_file, res_file):
         elif 'updateHttpxResults' in query:
             domain = variables.get('domain')
             results = variables.get('results', []) or []
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM companies WHERE slug = ? OR lower(name) = lower(?) LIMIT 1", (domain, domain))
+            comp_row = cursor.fetchone()
+            company_id = comp_row[0] if comp_row else None
+
             for res in results:
                 raw_url = res.get('url', '')
-                host = raw_url.replace("https://", "").replace("http://", "")
+                input_host = res.get('input', '')
+                if input_host:
+                    host = input_host.strip().lower()
+                else:
+                    host = re.sub(r'^https?://', '', raw_url).split('/')[0].split(':')[0].strip().lower()
+                
+                if not host:
+                    continue
+
                 patch = {
                     "title": res.get("title", ""),
                     "webserver": res.get("webserver", ""),
@@ -198,7 +212,18 @@ def execute_graphql(in_file, res_file):
                     "tech": res.get("tech", []),
                     "last_scan": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
                 }
-                update_domain_data(conn, host, patch)
+
+                cursor.execute("SELECT id FROM domains WHERE lower(host) = lower(?)", (host,))
+                d_row = cursor.fetchone()
+                if d_row:
+                    update_domain_data(conn, host, patch)
+                elif company_id:
+                    dom_id = str(uuid.uuid4())
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO domains (id, company_id, host, canonical_url, data)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (dom_id, company_id, host, raw_url or f"https://{host}", json.dumps(patch)))
+            conn.commit()
         
         elif 'updatePortScanResults' in query:
             domain = variables.get('domain')
@@ -542,9 +567,22 @@ def query_graphql(in_file):
         elif 'updateHttpxResults' in query:
             domain = variables.get('domain')
             results = variables.get('results', []) or []
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM companies WHERE slug = ? OR lower(name) = lower(?) LIMIT 1", (domain, domain))
+            comp_row = cursor.fetchone()
+            company_id = comp_row[0] if comp_row else None
+
             for res in results:
                 raw_url = res.get('url', '')
-                host = raw_url.replace("https://", "").replace("http://", "")
+                input_host = res.get('input', '')
+                if input_host:
+                    host = input_host.strip().lower()
+                else:
+                    host = re.sub(r'^https?://', '', raw_url).split('/')[0].split(':')[0].strip().lower()
+                
+                if not host:
+                    continue
+
                 patch = {
                     "title": res.get("title", ""),
                     "webserver": res.get("webserver", ""),
@@ -553,7 +591,17 @@ def query_graphql(in_file):
                     "tech": res.get("tech", []),
                     "last_scan": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
                 }
-                update_domain_data(conn, host, patch)
+
+                cursor.execute("SELECT id FROM domains WHERE lower(host) = lower(?)", (host,))
+                d_row = cursor.fetchone()
+                if d_row:
+                    update_domain_data(conn, host, patch)
+                elif company_id:
+                    dom_id = str(uuid.uuid4())
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO domains (id, company_id, host, canonical_url, data)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (dom_id, company_id, host, raw_url or f"https://{host}", json.dumps(patch)))
             conn.commit()
             response_data = {"updateHttpxResults": True}
             
