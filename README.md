@@ -1,82 +1,89 @@
-# cHack Recon Platform (Reconner Edition)
+# cHack
 
-A distributed reconnaissance and vulnerability assessment platform featuring a Telegram + GraphQL backend deployed on Cloudflare Workers (D1 SQLite), a local scan runner daemon, and the upgraded `cHack.sh` automated recon pipeline (imported and integrated from Reconner).
-
----
-
-## 🛠️ Main Components
-
-1. **Cloudflare Workers Backend** (`back/`)
-   - GraphQL API (Hono + GraphQL Yoga) with schemas for Targets, Domains, Findings, Secrets, Endpoints, and Network Services.
-   - Interactive Telegram Bot (grammY) with direct commands (`/recon`, `/infogather`, `/web`, `/network`, `/vulns`, `/secrets`, `/ports`, `/report`, `/tools`, `/stop`) and inline menus.
-   - Cloudflare D1 Serverless SQL Database with automated migrations.
-2. **Local Runner Daemon & DB Sync** (`db_sqlite.py` & `cHack.sh`)
-   - Polls the backend for queued scan jobs.
-   - Synchronizes scan metrics, findings, endpoints, and secrets back to Cloudflare D1 and local SQLite.
-3. **Multi-Phase Recon Script** (`cHack.sh` & `js_secrets.py`)
-   - **Phase 1: Subdomain Discovery & Takeover**: `subfinder`, `assetfinder`, `findomain`, `gau`, `alterx`, `subzy`.
-   - **Phase 2: Live HTTP Probing & Visual Recon**: `httpx`, `gowitness`.
-   - **Phase 3: Port & Network Service Audit**: `naabu`, `nmap`.
-   - **Phase 4: Web Crawling & JS Secret Analysis**: `katana`, `hakrawler`, `waymore`, `uro`, `js_secrets.py`.
-   - **Phase 5: Directory & Sensitive Content Fuzzing**: `feroxbuster`, `dirsearch`, backup exposure scans.
-   - **Phase 6: Vulnerability & DAST Scanning**: `nuclei` (v3), `dalfox`, `sqlmap`.
+An automated, multi-phase reconnaissance and vulnerability assessment platform featuring an interactive TUI, CLI automation, and central Telegram bot orchestration.
 
 ---
 
-## 🚀 Usage & Commands
+## ⚡ 1-Liner VPS Install
 
-### Interactive TUI & CLI Workflows (`cHack.sh`)
+Run on any Ubuntu/Debian/Linux VPS:
+
 ```bash
-# Launch Interactive Terminal User Interface (TUI)
-./cHack.sh
-# or explicitly:
-./cHack.sh -i
-./cHack.sh --tui
+git clone https://github.com/chethober/cHack.git && cd cHack && chmod +x install.sh cHack.sh && ./install.sh
+```
 
-# Full Reconnaissance Pipeline (Phases 1-6)
+> **Note**: For GitHub CLI users with SSH/auth configured:
+> ```bash
+> gh repo clone chethober/cHack && cd cHack && chmod +x install.sh cHack.sh && ./install.sh
+> ```
+
+---
+
+## 🚀 Quick Usage
+
+### Interactive TUI
+```bash
+./cHack.sh
+# or
+./cHack.sh -i
+```
+
+### CLI Commands
+```bash
+# Full Recon Pipeline (Phases 1-6)
 ./cHack.sh -d example.com
 
-# Targeted Information Gathering (Phases 1-4)
+# Information Gathering (Subdomains + Live Probing)
 ./cHack.sh --info-gather example.com
 
-# Web Recon & Crawling
+# Web Crawling & JS Secret Analysis
 ./cHack.sh --web example.com
 
-# Port & Network Service Auditing
+# Port & Network Scan
 ./cHack.sh --network 192.168.1.1/24
 
-# Directory & Sensitive File Discovery
+# Directory & Sensitive File Fuzzing
 ./cHack.sh --fuzz example.com
 
-# Vulnerability & DAST Scan (Nuclei)
+# Vulnerability Scanning (Nuclei)
 ./cHack.sh --vuln example.com
 
-# Start Runner Daemon (polls central Cloudflare queue)
+# Start Runner Daemon (Polls Central Queue)
 ./cHack.sh --daemon
 ```
 
-### Telegram Bot Commands
+---
+
+## 🤖 Telegram Bot
+
 | Command | Description |
 | :--- | :--- |
-| `/start` | Open interactive main menu |
-| `/recon <domain>` | Queue full recon scan |
-| `/infogather <domain>` | Queue non-intrusive information gathering |
-| `/web <domain>` | Queue web recon & crawling |
-| `/network <target>` | Queue port & network scan |
-| `/vulns [domain]` | List discovered vulnerabilities grouped by severity |
-| `/secrets [domain]` | List leaked API keys & secrets from JS bundles |
+| `/start` | Open interactive control menu |
+| `/recon <domain>` | Launch full automated recon pipeline |
+| `/infogather <domain>` | Subdomain discovery & live probing |
+| `/web <domain>` | Web crawling & JS secret extraction |
+| `/network <target>` | Port and network service scan |
+| `/vulns [domain]` | List discovered vulnerabilities |
+| `/secrets [domain]` | List leaked API keys & tokens |
 | `/ports [domain]` | List open ports & network services |
 | `/report <domain>` | Generate executive recon summary |
-| `/tools` | List all integrated tools |
-| `/stop <job_id>` | Cancel/stop an active scan job |
+| `/tools` | Check tool health and status |
+| `/stop <job_id>` | Stop an active scan job |
 
 ---
 
-## 📝 Configuration (`.env`)
-```env
-BACKEND_URL=http://localhost:8787
-RUNNER_NAME=VPS-1
-TELEGRAM_BOT_TOKEN=your_bot_token
-ADMIN_IDS=your_admin_id
+## ⚙️ Configuration
+
+Copy template to `.env` and set your credentials:
+
+```bash
+cp .env.example .env
+nano .env
 ```
 
+```env
+BACKEND_URL=https://your-backend.workers.dev
+TELEGRAM_BOT_TOKEN=your_bot_token
+ADMIN_IDS=your_telegram_id
+RUNNER_NAME=VPS-1
+```
