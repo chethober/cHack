@@ -10,13 +10,33 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     source "$SCRIPT_DIR/.env"
 fi
 
+# Ensure GRAPHQL_ENDPOINT defaults to BACKEND_URL/graphql if not explicitly defined
+if [ -z "$GRAPHQL_ENDPOINT" ] && [ -n "$BACKEND_URL" ]; then
+    GRAPHQL_ENDPOINT="${BACKEND_URL%/}/graphql"
+fi
+export BACKEND_URL
+export GRAPHQL_ENDPOINT
+
+# Concurrency & thread settings (can be overridden by env, .env, or -t/--threads)
+THREADS="${THREADS:-50}"
+
 # Ensure extended PATH includes all Go, Python, and local binaries
+if command -v go >/dev/null 2>&1; then
+    _gopath="$(go env GOPATH 2>/dev/null)"
+    [ -n "$_gopath" ] && [ -d "$_gopath/bin" ] && export PATH="$_gopath/bin:$PATH"
+fi
 export PATH="$HOME/go/bin:/usr/local/go/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 
 log_info() {
     local timestamp=$(date '+%H:%M:%S')
     echo -e "\033[0;32m[INFO][$timestamp]\033[0m $1" >&2
     echo "[INFO][$timestamp] $1" >> "$LOG_FILE"
+}
+
+log_warn() {
+    local timestamp=$(date '+%H:%M:%S')
+    echo -e "\033[0;33m[WARN][$timestamp]\033[0m $1" >&2
+    echo "[WARN][$timestamp] $1" >> "$LOG_FILE"
 }
 
 log_error() {
@@ -108,6 +128,12 @@ check_requirements() {
     for tool in "${REQUIRED_GO_TOOLS[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
+        elif [ "$tool" = "httpx" ] && ! httpx -version 2>&1 | grep -qi "projectdiscovery"; then
+            if [ -x "$HOME/go/bin/httpx" ]; then
+                export PATH="$HOME/go/bin:$PATH"
+            else
+                missing_tools+=("httpx")
+            fi
         fi
     done
 
@@ -181,13 +207,11 @@ execute_graphql() {
         variables="{}"
     fi
 
-    if [[ "$GRAPHQL_ENDPOINT" == *"localhost"* || "$GRAPHQL_ENDPOINT" == *"127.0.0.1"* ]] && [[ "$BACKEND_URL" == *"workers.dev"* || ( "$BACKEND_URL" == *"http"* && "$BACKEND_URL" != *"localhost"* && "$BACKEND_URL" != *"127.0.0.1"* ) ]]; then
+    # Auto-resolve GRAPHQL_ENDPOINT from BACKEND_URL if unset or pointing to localhost when remote backend is used
+    if [ -z "$GRAPHQL_ENDPOINT" ] && [ -n "$BACKEND_URL" ]; then
         GRAPHQL_ENDPOINT="${BACKEND_URL%/}/graphql"
-    fi
-
-    if [ -z "$GRAPHQL_ENDPOINT" ]; then
-        log_error "GRAPHQL_ENDPOINT is not configured in .env"
-        return 1
+    elif [[ "$GRAPHQL_ENDPOINT" == *"localhost"* || "$GRAPHQL_ENDPOINT" == *"127.0.0.1"* ]] && [[ -n "$BACKEND_URL" && "$BACKEND_URL" != *"localhost"* && "$BACKEND_URL" != *"127.0.0.1"* ]]; then
+        GRAPHQL_ENDPOINT="${BACKEND_URL%/}/graphql"
     fi
 
     local payload
@@ -199,11 +223,13 @@ execute_graphql() {
     local response
     local success=false
 
-    if response=$(curl -s --connect-timeout 10 -m 15 -X POST "$GRAPHQL_ENDPOINT" \
-        -H "Content-Type: application/json" \
-        -d "$payload" 2>&1); then
-        if ! echo "$response" | jq -e '.errors' >/dev/null 2>&1; then
-            success=true
+    if [ -n "$GRAPHQL_ENDPOINT" ]; then
+        if response=$(curl -s --connect-timeout 10 -m 15 -X POST "$GRAPHQL_ENDPOINT" \
+            -H "Content-Type: application/json" \
+            -d "$payload" 2>&1); then
+            if ! echo "$response" | jq -e '.errors' >/dev/null 2>&1; then
+                success=true
+            fi
         fi
     fi
 
@@ -218,7 +244,7 @@ execute_graphql() {
         echo "$response"
         return 0
     else
-        log_info "Resolving mutation locally via SQLite mirror..."
+        log_info "Resolving mutation/query locally via SQLite mirror..."
         local temp_gql_in
         if temp_gql_in=$(mktemp 2>/dev/null); then
             echo "$payload" > "$temp_gql_in"
@@ -468,13 +494,21 @@ insert_company_and_domains() {
 
     local active_count
     active_count=$(wc -l < "$active_subs_file" 2>/dev/null || echo 0)
-    log_info "Inserting $active_count active subdomain(s) (returning status code) into domains table..."
+    log_info "Inserting $active_count active subdomain(s) into database with parallel workers..."
 
+    local db_workers=10
+    local running=0
     while IFS= read -r host; do
         if [ -n "$host" ]; then
-            db_add_domain "$company_id" "$host" "https://$host" "{}" >/dev/null
+            ( db_add_domain "$company_id" "$host" "https://$host" "{}" >/dev/null 2>&1 ) &
+            running=$((running + 1))
+            if [ $running -ge $db_workers ]; then
+                wait -n 2>/dev/null || wait
+                running=$((running - 1))
+            fi
         fi
     done < "$active_subs_file"
+    wait
 
     log_info "Successfully processed company $domain (ID: $company_id) and inserted $active_count active subdomains"
 }
@@ -588,6 +622,30 @@ update_secrets_results() {
     execute_graphql "$query" "$variables" >/dev/null
 }
 
+update_js_results() {
+    local domain=$1
+    local output_dir="$TARGETS_DIR/$domain"
+    local findings_file="$output_dir/js_findings.json"
+
+    if [ ! -s "$findings_file" ]; then
+        return
+    fi
+
+    log_info "GraphQL: Syncing JS analysis findings & endpoints..."
+    local findings_json
+    local endpoints_json
+    findings_json=$(jq '.secrets // []' "$findings_file" 2>/dev/null || echo "[]")
+    endpoints_json=$(jq '.endpoints // []' "$findings_file" 2>/dev/null || echo "[]")
+
+    local query="mutation UpdateJsResults(\$domain: String!, \$results: [JSON!]!) {
+        updateJsResults(domain: \$domain, results: \$results)
+    }"
+    local variables
+    variables=$(jq -n --arg dom "$domain" --argjson find "$findings_json" --argjson ep "$endpoints_json" \
+        '{domain: $dom, results: [{host: $dom, findings: $find, endpoints: $ep}]}')
+    execute_graphql "$query" "$variables" >/dev/null
+}
+
 update_network_services_results() {
     local domain=$1
     local output_dir="$TARGETS_DIR/$domain"
@@ -620,25 +678,35 @@ run_subdomain_enum() {
     log_phase "Phase 1: Subdomain Enumeration & Takeover Checks"
     log_info "Target domain: $domain"
 
-    # 1. Passive Tools
-    log_info "Running subfinder..."
-    timeout 180 subfinder -d "$domain" -silent -disable-update-check > "$output_dir/subfinder" 2>/dev/null || touch "$output_dir/subfinder"
+    # 1. Passive Tools in Parallel
+    log_info "Running passive subdomain discovery tools in parallel (subfinder, assetfinder, findomain, gau)..."
+    ( timeout 180 subfinder -d "$domain" -silent -t "$THREADS" -disable-update-check > "$output_dir/subfinder" 2>/dev/null || touch "$output_dir/subfinder" ) &
+    local pid_subfinder=$!
 
-    log_info "Running assetfinder..."
-    timeout 120 assetfinder --subs-only "$domain" > "$output_dir/assetfinder" 2>/dev/null || touch "$output_dir/assetfinder"
+    ( timeout 120 assetfinder --subs-only "$domain" > "$output_dir/assetfinder" 2>/dev/null || touch "$output_dir/assetfinder" ) &
+    local pid_assetfinder=$!
 
+    local pid_findomain=""
     if command -v findomain >/dev/null 2>&1; then
-        log_info "Running findomain..."
-        timeout 120 findomain -t "$domain" -q > "$output_dir/findomain" 2>/dev/null || touch "$output_dir/findomain"
+        ( timeout 120 findomain -t "$domain" -q > "$output_dir/findomain" 2>/dev/null || touch "$output_dir/findomain" ) &
+        pid_findomain=$!
     fi
 
+    local pid_gau=""
     if command -v gau >/dev/null 2>&1; then
-        log_info "Running gau passive subdomain extraction..."
-        timeout 60 gau --subs "$domain" 2>/dev/null | grep -Eo "([a-zA-Z0-9_-]+\.)+${domain}" | sort -u > "$output_dir/gau_subs" || touch "$output_dir/gau_subs"
+        ( timeout 60 gau --subs "$domain" --threads 10 2>/dev/null | grep -Eo "([a-zA-Z0-9_-]+\.)+${domain}" | sort -u > "$output_dir/gau_subs" || touch "$output_dir/gau_subs" ) &
+        pid_gau=$!
     fi
+
+    # Synchronize all passive tools
+    wait $pid_subfinder $pid_assetfinder ${pid_findomain:+$pid_findomain} ${pid_gau:+$pid_gau} 2>/dev/null
 
     # Combine passive subdomains
     cat "$output_dir/subfinder" "$output_dir/assetfinder" "$output_dir/findomain" "$output_dir/gau_subs" 2>/dev/null | sed 's/^\*\.//' | tr '[:upper:]' '[:lower:]' | sort -u | grep -E "\.${domain}$|^${domain}$" > "$output_dir/subdomains_raw"
+
+    # Always ensure the apex domain and www subdomain are included for probing
+    printf "%s\nwww.%s\n" "$domain" "$domain" >> "$output_dir/subdomains_raw"
+    sort -u -o "$output_dir/subdomains_raw" "$output_dir/subdomains_raw"
 
     # 2. Active Permutations (Alterx) if available
     if command -v alterx >/dev/null 2>&1 && [ -s "$output_dir/subdomains_raw" ]; then
@@ -692,6 +760,9 @@ run_httpx() {
 
     log_info "Probing $(wc -l < "$output_dir/subdomains") subdomains with httpx..."
 
+    local httpx_err
+    httpx_err=$(mktemp)
+
     timeout 300 httpx -list "$output_dir/subdomains" \
         -silent \
         -nc \
@@ -702,17 +773,31 @@ run_httpx() {
         -json \
         -td \
         -fr \
-        -t 50 \
+        -t "$THREADS" \
         -timeout 6 \
         -retries 1 \
         -disable-update-check \
-        -o "$output_dir/httpx.json" > /dev/null 2>&1
+        -o "$output_dir/httpx.json" 2>"$httpx_err"
+    local exit_code=$?
 
-    if [ ! -s "$output_dir/httpx.json" ]; then
-        log_error "httpx returned no results or failed."
+    if [ $exit_code -ne 0 ] && [ $exit_code -ne 124 ]; then
+        local err_msg
+        err_msg=$(head -n 2 "$httpx_err" 2>/dev/null | tr '\n' ' ')
+        log_error "httpx failed (exit code $exit_code): ${err_msg:-check tool logs}"
+        rm -f "$httpx_err"
         touch "$output_dir/live_hosts"
         touch "$output_dir/ips"
-        return
+        return 1
+    elif [ $exit_code -eq 124 ]; then
+        log_warn "httpx timed out after 300 seconds."
+    fi
+    rm -f "$httpx_err"
+
+    if [ ! -s "$output_dir/httpx.json" ]; then
+        log_info "HTTPX probe completed: 0 live web endpoints responded for $domain."
+        touch "$output_dir/live_hosts"
+        touch "$output_dir/ips"
+        return 0
     fi
 
     # Extract live hosts and IPs
@@ -749,6 +834,8 @@ run_naabu() {
 
     timeout 300 naabu -hL "$output_dir/ips" \
         -silent \
+        -c "$THREADS" \
+        -rate 1000 \
         -top-ports 1000 \
         -json \
         -o "$output_dir/naabu.json" > /dev/null 2>&1 || touch "$output_dir/naabu.json"
@@ -832,24 +919,34 @@ run_katana() {
         return
     fi
 
-    log_info "Crawling $(wc -l < "$output_dir/live_hosts") endpoints (Katana + Gau)..."
+    log_info "Crawling $(wc -l < "$output_dir/live_hosts") endpoints in parallel (Katana + Gau)..."
 
-    # 1. Katana Crawling
-    timeout 300 katana -list "$output_dir/live_hosts" \
-        -silent \
-        -jc 20 \
-        -kf all \
-        -c 40 \
-        -d 3 \
-        -timeout 8 \
-        -retries 1 \
-        -disable-update-check \
-        > "$output_dir/katana_raw" 2>/dev/null || touch "$output_dir/katana_raw"
+    # 1. Katana Crawling & 2. Historical URLs in Parallel
+    (
+        timeout 300 katana -list "$output_dir/live_hosts" \
+            -silent \
+            -jc 20 \
+            -kf all \
+            -c "$THREADS" \
+            -d 3 \
+            -timeout 8 \
+            -retries 1 \
+            -disable-update-check \
+            > "$output_dir/katana_crawl" 2>/dev/null || touch "$output_dir/katana_crawl"
+    ) &
+    local pid_katana=$!
 
-    # 2. Historical URLs (Gau / Waybackurls)
+    local pid_gau=""
     if command -v gau >/dev/null 2>&1; then
-        timeout 60 gau "$domain" --subs --threads 5 2>/dev/null | head -n 1000 >> "$output_dir/katana_raw" || true
+        (
+            timeout 90 gau "$domain" --subs --threads 10 2>/dev/null | head -n 2000 > "$output_dir/gau_urls" || touch "$output_dir/gau_urls"
+        ) &
+        pid_gau=$!
     fi
+
+    wait $pid_katana ${pid_gau:+$pid_gau} 2>/dev/null
+    cat "$output_dir/katana_crawl" "$output_dir/gau_urls" 2>/dev/null > "$output_dir/katana_raw"
+    rm -f "$output_dir/katana_crawl" "$output_dir/gau_urls" 2>/dev/null
 
     # 3. Clean & Deduplicate with uro if available
     if command -v uro >/dev/null 2>&1 && [ -s "$output_dir/katana_raw" ]; then
@@ -862,23 +959,71 @@ run_katana() {
     grep -Ei '\.js(\?.*)?$' "$output_dir/katana_all" | sort -u > "$output_dir/js_links"
     grep -Ei '\?.+=' "$output_dir/katana_all" | sort -u > "$output_dir/params"
 
+    # 4. Manifest Discovery & Inline Script Extraction across Live Hosts
+    if [ -s "$output_dir/live_hosts" ] && [ -f "$SCRIPT_DIR/js_secrets.py" ]; then
+        log_info "Probing live hosts for Next.js/Webpack manifests & inline scripts..."
+        python3 "$SCRIPT_DIR/js_secrets.py" --extract-live "$output_dir/live_hosts" "$output_dir" "$THREADS" 2>/dev/null || true
+        
+        # Re-deduplicate js_links and katana_all after manifest/inline extraction
+        if [ -s "$output_dir/js_links" ]; then
+            sort -u "$output_dir/js_links" -o "$output_dir/js_links"
+        fi
+        if [ -s "$output_dir/katana_all" ]; then
+            if command -v uro >/dev/null 2>&1; then
+                uro -i "$output_dir/katana_all" -o "$output_dir/katana_all.tmp" 2>/dev/null && mv "$output_dir/katana_all.tmp" "$output_dir/katana_all"
+            else
+                sort -u "$output_dir/katana_all" -o "$output_dir/katana_all"
+            fi
+        fi
+    fi
+
     log_info "Crawling extracted $(wc -l < "$output_dir/katana_all" 2>/dev/null || echo 0) URLs, $(wc -l < "$output_dir/js_links" 2>/dev/null || echo 0) JS files, and $(wc -l < "$output_dir/params" 2>/dev/null || echo 0) parameterized endpoints."
 
-    # 4. Deep JS Secret & Endpoint Analysis
+    # 5. Deep JS Secret & Endpoint Analysis (Multi-threaded)
     if [ -s "$output_dir/js_links" ] && [ -f "$SCRIPT_DIR/js_secrets.py" ]; then
-        log_info "Scanning JavaScript bundles for leaked secrets & API keys..."
-        python3 "$SCRIPT_DIR/js_secrets.py" "$output_dir/js_links" "$output_dir/js_findings.json" 2>/dev/null || true
+        log_info "Scanning JavaScript bundles & inline scripts for leaked secrets & API keys (concurrency: $THREADS)..."
+        python3 "$SCRIPT_DIR/js_secrets.py" "$output_dir/js_links" "$output_dir/js_findings.json" "$THREADS" 2>/dev/null || true
         
         if [ -s "$output_dir/js_findings.json" ]; then
             jq '.secrets // []' "$output_dir/js_findings.json" > "$output_dir/all_secrets.json"
-            jq '.endpoints // []' "$output_dir/js_findings.json" > "$output_dir/all_endpoints.json"
+            
+            # Combine JS endpoints and crawled endpoints into unified all_endpoints.json
+            local js_endpoints
+            js_endpoints=$(jq '.endpoints // []' "$output_dir/js_findings.json" 2>/dev/null || echo "[]")
+            if [ -s "$output_dir/katana_all" ]; then
+                local crawl_endpoints
+                crawl_endpoints=$(head -n 2000 "$output_dir/katana_all" | jq -R '{url: ., path: (split("?")[0] | sub("^https?://[^/]+"; "")), source: "crawler"}' 2>/dev/null | jq -s . 2>/dev/null || echo "[]")
+                jq -n --argjson js "$js_endpoints" --argjson crawl "$crawl_endpoints" '$js + $crawl | unique_by(.url)' > "$output_dir/all_endpoints.json" 2>/dev/null || echo "$js_endpoints" > "$output_dir/all_endpoints.json"
+            else
+                echo "$js_endpoints" > "$output_dir/all_endpoints.json"
+            fi
             
             local sec_count=$(jq '. | length' "$output_dir/all_secrets.json" 2>/dev/null || echo 0)
             if [ "$sec_count" -gt 0 ]; then
-                log_info "🚨 Discovered $sec_count secrets in JS files!"
+                log_info "🚨 Discovered $sec_count secrets in JS files & inline scripts!"
                 send_telegram_notification "🔑 <b>High-Signal Secrets Found in JS Analysis</b> for <code>$domain</code>
 • Total Secrets: <b>$sec_count</b>"
             fi
+
+            # Feed discovered JS endpoints back into crawl list for deeper analysis & exposure scanning
+            local ep_count=$(jq '. | length' "$output_dir/all_endpoints.json" 2>/dev/null || echo 0)
+            if [ "$ep_count" -gt 0 ]; then
+                log_info "Feeding $ep_count extracted JS endpoints back into crawl list..."
+                jq -r '.[].url // empty' "$output_dir/all_endpoints.json" 2>/dev/null | grep -Ei '^https?://' >> "$output_dir/katana_all" || true
+                
+                # Re-deduplicate
+                if command -v uro >/dev/null 2>&1; then
+                    uro -i "$output_dir/katana_all" -o "$output_dir/katana_all.tmp" 2>/dev/null && mv "$output_dir/katana_all.tmp" "$output_dir/katana_all"
+                else
+                    sort -u "$output_dir/katana_all" -o "$output_dir/katana_all"
+                fi
+                
+                # Re-extract parameterized endpoints
+                grep -Ei '\?.+=' "$output_dir/katana_all" | sort -u > "$output_dir/params"
+            fi
+
+            # Sync JS findings and endpoints to SQLite DB
+            update_js_results "$domain"
         fi
     fi
 }
@@ -898,36 +1043,53 @@ run_content_discovery() {
 
     mkdir -p "$output_dir/fuzz"
 
-    # Targeted exposure check for top live hosts
-    head -n 5 "$output_dir/live_hosts" | while read -r host_url; do
-        log_info "Scanning exposure on $host_url..."
-        # Check standard sensitive files (.git/HEAD, .env, etc.)
-        for path in "/.env" "/.git/HEAD" "/swagger.json" "/api-docs" "/graphql" "/backup.sql" "/config.php.bak"; do
-            local code
-            code=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "$host_url$path" 2>/dev/null || echo "000")
-            if [ "$code" = "200" ]; then
-                log_info "🚨 Found sensitive file exposure: $host_url$path (HTTP 200)"
-                local f_item=$(jq -n \
-                    --arg title "Exposed Sensitive File: $path" \
-                    --arg url "$host_url$path" \
-                    --arg tool "exposure_scanner" \
-                    --arg sev "high" \
-                    --arg vt "exposure" \
-                    --arg desc "Sensitive configuration or backup file accessible publicly" \
-                    '{title: $title, url: $url, tool: $tool, severity: $sev, vuln_type: $vt, description: $desc}')
-                
-                # Append to findings file
-                local cur_findings="[]"
-                if [ -f "$output_dir/exposure_findings.json" ]; then
-                    cur_findings=$(cat "$output_dir/exposure_findings.json")
-                fi
-                echo "$cur_findings" | jq --argjson item "$f_item" '. += [$item]' > "$output_dir/exposure_findings.json"
+    local sensitive_paths="/.env,/.git/HEAD,/swagger.json,/api-docs,/graphql,/backup.sql,/config.php.bak"
+    local live_count=$(wc -l < "$output_dir/live_hosts" 2>/dev/null || echo 0)
+    log_info "Scanning exposure across $live_count live host(s) in parallel with httpx (threads: $THREADS)..."
 
-                send_telegram_notification "⚠️ <b>Sensitive File Exposure Found!</b>
-• URL: <code>$host_url$path</code> (HTTP 200)"
-            fi
-        done
-    done
+    local exposure_raw="$output_dir/fuzz/httpx_exposure.json"
+    timeout 120 httpx -list "$output_dir/live_hosts" \
+        -path "$sensitive_paths" \
+        -mc 200 \
+        -silent \
+        -nc \
+        -t "$THREADS" \
+        -timeout 5 \
+        -json \
+        -disable-update-check \
+        -o "$exposure_raw" >/dev/null 2>&1 || true
+
+    local cur_findings="[]"
+    if [ -s "$output_dir/exposure_findings.json" ]; then
+        cur_findings=$(cat "$output_dir/exposure_findings.json")
+    fi
+
+    if [ -s "$exposure_raw" ]; then
+        while read -r line; do
+            [ -z "$line" ] && continue
+            local exp_url=$(echo "$line" | jq -r '.url // empty')
+            [ -z "$exp_url" ] && continue
+
+            local path_matched=$(echo "$exp_url" | sed -E 's|^https?://[^/]+||')
+            log_info "🚨 Found sensitive file exposure: $exp_url (HTTP 200)"
+
+            local f_item=$(jq -n \
+                --arg title "Exposed Sensitive File: $path_matched" \
+                --arg url "$exp_url" \
+                --arg tool "exposure_scanner" \
+                --arg sev "high" \
+                --arg vt "exposure" \
+                --arg desc "Sensitive configuration or backup file accessible publicly" \
+                '{title: $title, url: $url, tool: $tool, severity: $sev, vuln_type: $vt, description: $desc}')
+
+            cur_findings=$(echo "$cur_findings" | jq --argjson item "$f_item" '. += [$item]')
+
+            send_telegram_notification "⚠️ <b>Sensitive File Exposure Found!</b>
+• URL: <code>$exp_url</code> (HTTP 200)"
+        done < "$exposure_raw"
+    fi
+
+    echo "$cur_findings" > "$output_dir/exposure_findings.json"
 }
 
 # ==============================================================================
@@ -950,6 +1112,8 @@ run_nuclei() {
     timeout 600 nuclei -list "$output_dir/live_hosts" \
         -silent \
         -disable-update-check \
+        -c "$THREADS" \
+        -bulk-size "$THREADS" \
         -tags cve,exposure,misconfiguration,takeover,default-login,oast \
         -severity critical,high,medium,low \
         -json-export "$output_dir/nuclei.json" > /dev/null 2>&1 || touch "$output_dir/nuclei.json"
@@ -1014,13 +1178,24 @@ run_info_gathering() {
     local live_count=$(wc -l < "$output_dir/live_hosts" 2>/dev/null || echo 0)
     send_telegram_notification "✅ <b>Phase 2: Live HTTP Probing Done</b> for <code>$domain</code> (<b>$live_count</b> active hosts saved)"
 
-    run_naabu "$domain"
-    update_port_scan_results "$domain"
-    update_network_services_results "$domain"
+    # Execute Phase 3 and Phase 4 concurrently in parallel
+    log_info "⚡ Running Phase 3 (Port Scanning) and Phase 4 (Deep Web Crawling & JS Analysis) in parallel..."
+    (
+        run_naabu "$domain"
+        update_port_scan_results "$domain"
+        update_network_services_results "$domain"
+    ) &
+    local pid_phase3=$!
 
-    run_katana "$domain"
-    update_endpoints_results "$domain"
-    update_secrets_results "$domain"
+    (
+        run_katana "$domain"
+        update_endpoints_results "$domain"
+        update_secrets_results "$domain"
+        update_js_results "$domain"
+    ) &
+    local pid_phase4=$!
+
+    wait $pid_phase3 $pid_phase4 2>/dev/null
 
     local duration=$(( $(date +%s) - start_time ))
     log_phase "Information Gathering Workflow Completed in $duration seconds."
@@ -1039,6 +1214,8 @@ run_web_recon() {
     run_katana "$domain"
     update_endpoints_results "$domain"
     update_secrets_results "$domain"
+    update_js_results "$domain"
+    run_content_discovery "$domain"
     run_nuclei "$domain"
     update_findings_results "$domain"
 }
@@ -1082,23 +1259,33 @@ recon() {
     send_telegram_notification "✅ <b>Phase 2: Live HTTP Resolution Completed</b> for <code>$domain</code>
 • Active web endpoints saved: <b>$live_count</b>"
 
-    # Phase 3
-    if ! run_naabu "$domain"; then
-        log_error "Port scanning failed"
-    fi
-    update_port_scan_results "$domain"
-    update_network_services_results "$domain"
-
-    local port_count=$(wc -l < "$output_dir/ports" 2>/dev/null || echo 0)
-    send_telegram_notification "✅ <b>Phase 3: Port Scan Completed</b> for <code>$domain</code>
+    # Execute Phase 3 (Port Scanning) and Phase 4 (Web Crawling & JS Analysis) in parallel
+    log_info "⚡ Running Phase 3 (Port Scanning) and Phase 4 (Web Crawling & JS Secret Analysis) in parallel..."
+    (
+        if run_naabu "$domain"; then
+            update_port_scan_results "$domain"
+            update_network_services_results "$domain"
+            local port_count=$(wc -l < "$output_dir/ports" 2>/dev/null || echo 0)
+            send_telegram_notification "✅ <b>Phase 3: Port Scan Completed</b> for <code>$domain</code>
 • Open ports: <b>$port_count</b>"
+        else
+            log_error "Port scanning failed"
+        fi
+    ) &
+    local pid_phase3=$!
 
-    # Phase 4
-    if ! run_katana "$domain"; then
-        log_error "Katana crawling failed"
-    fi
-    update_endpoints_results "$domain"
-    update_secrets_results "$domain"
+    (
+        if run_katana "$domain"; then
+            update_endpoints_results "$domain"
+            update_secrets_results "$domain"
+            update_js_results "$domain"
+        else
+            log_error "Katana crawling failed"
+        fi
+    ) &
+    local pid_phase4=$!
+
+    wait $pid_phase3 $pid_phase4 2>/dev/null
 
     # Phase 5
     run_content_discovery "$domain"
@@ -1117,6 +1304,44 @@ recon() {
     send_telegram_notification "🏁 <b>Full Recon Completed</b> for <code>$domain</code>
 • Duration: <b>$duration</b>s
 • All findings, endpoints, and secrets synchronized."
+}
+
+# ==========================================
+# Target Data Synchronization (Cloudflare D1 & SQLite)
+# ==========================================
+
+sync_target_data() {
+    local domain=$1
+    local output_dir="$TARGETS_DIR/$domain"
+    if [ ! -d "$output_dir" ]; then
+        log_warn "Target directory does not exist: $output_dir"
+        return 1
+    fi
+
+    log_phase "Syncing target '$domain' to Cloudflare D1 & local SQLite..."
+    insert_company_and_domains "$domain"
+    update_httpx_results "$domain"
+    update_port_scan_results "$domain"
+    update_network_services_results "$domain"
+    update_endpoints_results "$domain"
+    update_secrets_results "$domain"
+    update_js_results "$domain"
+    update_findings_results "$domain"
+    log_info "Synchronization completed for '$domain'."
+}
+
+sync_all_targets() {
+    log_phase "Synchronizing all targets in $TARGETS_DIR..."
+    local count=0
+    for t_dir in "$TARGETS_DIR"/*; do
+        if [ -d "$t_dir" ]; then
+            local dom
+            dom=$(basename "$t_dir")
+            sync_target_data "$dom"
+            ((count++))
+        fi
+    done
+    log_info "Completed synchronization for $count target(s)."
 }
 
 # ==========================================
@@ -1164,34 +1389,80 @@ tui_input() {
 }
 
 read_menu_key() {
+    local __ret_var="$1"
     local key=""
-    local input_src="/dev/stdin"
-    if [ -t 0 ] && [ -r /dev/tty ]; then
-        input_src="/dev/tty"
+    local res=""
+    local input_fd=""
+
+    if [ ! -t 0 ] && [ -t 1 ] && [ -c /dev/tty ] && [ -r /dev/tty ]; then
+        input_fd="/dev/tty"
     fi
 
-    if ! IFS= read -rsn1 key < "$input_src" 2>/dev/null; then
-        echo "EOF"
-        return 1
+    if [ -n "$input_fd" ]; then
+        if ! IFS= read -rsn1 key < "$input_fd" 2>/dev/null; then
+            res="EOF"
+        fi
+    else
+        if ! IFS= read -rsn1 key 2>/dev/null; then
+            res="EOF"
+        fi
     fi
 
-    if [[ "$key" == $'\x1b' ]]; then
-        local key2=""
-        read -rsn2 -t 0.08 key2 < "$input_src" 2>/dev/null
-        key+="$key2"
+    if [ -z "$res" ]; then
+        if [[ "$key" == $'\x1b' ]]; then
+            local key2=""
+            if [ -n "$input_fd" ]; then
+                read -rsn2 -t 0.04 key2 < "$input_fd" 2>/dev/null
+            else
+                read -rsn2 -t 0.04 key2 2>/dev/null
+            fi
+            key+="$key2"
+
+            if [[ "$key2" =~ ^\[[0-9] ]]; then
+                local extra=""
+                if [ -n "$input_fd" ]; then
+                    read -rsn1 -t 0.01 extra < "$input_fd" 2>/dev/null
+                else
+                    read -rsn1 -t 0.01 extra 2>/dev/null
+                fi
+                key+="$extra"
+            fi
+        fi
+
+        case "$key" in
+            $'\x1b[A'|$'\x1bOA') res="UP" ;;
+            $'\x1b[B'|$'\x1bOB') res="DOWN" ;;
+            $'\x1b[C'|$'\x1bOC') res="RIGHT" ;;
+            $'\x1b[D'|$'\x1bOD') res="LEFT" ;;
+            ""|$'\x0a') res="ENTER" ;;
+            $'\x20') res="SPACE" ;;
+            $'\x7f'|$'\x08') res="BACKSPACE" ;;
+            $'\x1b') res="ESC" ;;
+            *) res="$key" ;;
+        esac
     fi
 
-    case "$key" in
-        $'\x1b[A'|$'\x1bOA') echo "UP" ;;
-        $'\x1b[B'|$'\x1bOB') echo "DOWN" ;;
-        $'\x1b[C'|$'\x1bOC') echo "RIGHT" ;;
-        $'\x1b[D'|$'\x1bOD') echo "LEFT" ;;
-        ""|$'\x0a') echo "ENTER" ;;
-        $'\x20') echo "SPACE" ;;
-        $'\x7f'|$'\x08') echo "BACKSPACE" ;;
-        *) echo "$key" ;;
-    esac
+    if [ -n "$__ret_var" ]; then
+        printf -v "$__ret_var" "%s" "$res"
+    else
+        echo "$res"
+    fi
     return 0
+}
+
+_DB_SUMMARY_CACHE=""
+_DB_SUMMARY_CACHE_TIME=0
+
+get_cached_db_summary() {
+    local now
+    now=$(date +%s)
+    if [ -n "$_DB_SUMMARY_CACHE" ] && [ $((now - _DB_SUMMARY_CACHE_TIME)) -lt 4 ]; then
+        printf "%s" "$_DB_SUMMARY_CACHE"
+        return 0
+    fi
+    _DB_SUMMARY_CACHE=$(python3 "$SCRIPT_DIR/db_sqlite.py" summary 2>/dev/null)
+    _DB_SUMMARY_CACHE_TIME=$now
+    printf "%s" "$_DB_SUMMARY_CACHE"
 }
 
 tui_select_menu() {
@@ -1222,10 +1493,18 @@ tui_select_menu() {
     tput civis 2>/dev/null
     trap 'tput cnorm 2>/dev/null' RETURN INT TERM
 
+    local need_full_draw=1
+
     while true; do
-        $header_func
-        echo -e "  ${TUI_DIM}Use ${TUI_BOLD}[↑/↓]${TUI_RESET}${TUI_DIM} or ${TUI_BOLD}[j/k]${TUI_RESET}${TUI_DIM} to navigate, ${TUI_BOLD}[Enter]${TUI_RESET}${TUI_DIM} to select, ${TUI_BOLD}[0-9]${TUI_RESET}${TUI_DIM} for shortcuts, ${TUI_BOLD}[q]${TUI_RESET}${TUI_DIM} to exit.${TUI_RESET}"
-        echo ""
+        if [ $need_full_draw -eq 1 ]; then
+            $header_func
+            echo -e "  ${TUI_DIM}Use ${TUI_BOLD}[↑/↓]${TUI_RESET}${TUI_DIM} or ${TUI_BOLD}[j/k]${TUI_RESET}${TUI_DIM} to navigate, ${TUI_BOLD}[Enter]${TUI_RESET}${TUI_DIM} to select, ${TUI_BOLD}[0-9]${TUI_RESET}${TUI_DIM} for shortcuts, ${TUI_BOLD}[q]${TUI_RESET}${TUI_DIM} to exit.${TUI_RESET}"
+            echo ""
+            need_full_draw=0
+        else
+            # Reposition cursor back up across all menu items and trailing blank line
+            printf "\033[%dA" "$((count + 1))"
+        fi
 
         for ((i=0; i<count; i++)); do
             local k="${_keys[i]}"
@@ -1234,15 +1513,15 @@ tui_select_menu() {
             local dsc="${_descs[i]}"
 
             if [ $i -eq $selected ]; then
-                printf "  ${TUI_CYAN}${TUI_BOLD}❯ [%2s] %b %-30b ${TUI_RESET}${TUI_CYAN}%s${TUI_RESET}\n" "$k" "$ic" "${TUI_BOLD}${tit}${TUI_RESET}" "$dsc"
+                printf "\r\033[2K  ${TUI_CYAN}${TUI_BOLD}❯ [%2s] %b %-30b ${TUI_RESET}${TUI_CYAN}%s${TUI_RESET}\n" "$k" "$ic" "${TUI_BOLD}${tit}${TUI_RESET}" "$dsc"
             else
-                printf "    ${TUI_DIM}[%2s]${TUI_RESET} %b %-30b ${TUI_DIM}%s${TUI_RESET}\n" "$k" "$ic" "${TUI_WHITE}${tit}${TUI_RESET}" "$dsc"
+                printf "\r\033[2K    ${TUI_DIM}[%2s]${TUI_RESET} %b %-30b ${TUI_DIM}%s${TUI_RESET}\n" "$k" "$ic" "${TUI_WHITE}${tit}${TUI_RESET}" "$dsc"
             fi
         done
-        echo ""
+        printf "\r\033[2K\n"
 
-        local k_in
-        k_in=$(read_menu_key)
+        local k_in=""
+        read_menu_key k_in
         if [ "$k_in" = "EOF" ]; then
             SELECTED_CHOICE="0"
             SELECTED_INDEX=$((count - 1))
@@ -1265,11 +1544,14 @@ tui_select_menu() {
                 SELECTED_INDEX=$selected
                 return 0
                 ;;
-            q|Q)
+            q|Q|ESC)
                 tput cnorm 2>/dev/null
                 SELECTED_CHOICE="0"
                 SELECTED_INDEX=$((count - 1))
                 return 0
+                ;;
+            r|R|$'\x0c')
+                need_full_draw=1
                 ;;
             *)
                 # Direct key match
@@ -1309,14 +1591,12 @@ EOF
     local runner_disp="${TUI_YELLOW}${RUNNER_NAME:-Default}${TUI_RESET}"
 
     local db_stats
-    db_stats=$(python3 "$SCRIPT_DIR/db_sqlite.py" summary 2>/dev/null)
+    db_stats=$(get_cached_db_summary)
     local dom_count="0"
     local comp_count="0"
     local job_count="0"
     if [ -n "$db_stats" ]; then
-        dom_count=$(echo "$db_stats" | jq -r '.domains // 0' 2>/dev/null || echo "0")
-        comp_count=$(echo "$db_stats" | jq -r '.companies // 0' 2>/dev/null || echo "0")
-        job_count=$(echo "$db_stats" | jq -r '.jobs // 0' 2>/dev/null || echo "0")
+        read -r dom_count comp_count job_count < <(echo "$db_stats" | jq -r '[.domains // 0, .companies // 0, .jobs // 0] | @tsv' 2>/dev/null || echo "0 0 0")
     fi
 
     echo -e "  ${TUI_BOLD}Runner:${TUI_RESET} $runner_disp  ${TUI_BOLD}|  Backend:${TUI_RESET} $be_status"
@@ -1399,8 +1679,8 @@ tui_tool_diagnostics() {
 }
 
 tui_db_explorer() {
-    local db_keys=("1" "2" "3" "4" "5" "6" "7" "0")
-    local db_icons=("🏢" "📋" "🔑" "🛡️ " "🔌" "📜" "🔄" "⬅️ ")
+    local db_keys=("1" "2" "3" "4" "5" "6" "7" "8" "0")
+    local db_icons=("🏢" "📋" "🔑" "🛡️ " "🔌" "📜" "☁️ " "🔄" "⬅️ ")
     local db_titles=(
         "List Targets & Companies"
         "Generate Domain Report"
@@ -1408,7 +1688,8 @@ tui_db_explorer() {
         "View Discovered Vulnerabilities"
         "View Open Ports & Services"
         "View Recent Scan Jobs & Logs"
-        "Initialize / Reset Database"
+        "Sync Targets to Cloudflare & SQLite"
+        "Initialize / Reset SQLite Database"
         "Back to Main Menu"
     )
     local db_descs=(
@@ -1418,6 +1699,7 @@ tui_db_explorer() {
         "List Nuclei findings for a domain"
         "List network audit findings"
         "Inspect background runner jobs and stdout"
+        "Sync on-disk targets to Cloudflare D1 & local SQLite"
         "Re-run schema.sql on local SQLite"
         ""
     )
@@ -1428,17 +1710,11 @@ tui_db_explorer() {
         echo ""
 
         local stats_json
-        stats_json=$(python3 "$SCRIPT_DIR/db_sqlite.py" summary 2>/dev/null)
+        stats_json=$(get_cached_db_summary)
 
         if [ -n "$stats_json" ]; then
             local comp_cnt dom_cnt find_cnt sec_cnt srv_cnt end_cnt job_cnt
-            comp_cnt=$(echo "$stats_json" | jq -r '.companies // 0' 2>/dev/null || echo "0")
-            dom_cnt=$(echo "$stats_json" | jq -r '.domains // 0' 2>/dev/null || echo "0")
-            find_cnt=$(echo "$stats_json" | jq -r '.findings // 0' 2>/dev/null || echo "0")
-            sec_cnt=$(echo "$stats_json" | jq -r '.secrets // 0' 2>/dev/null || echo "0")
-            srv_cnt=$(echo "$stats_json" | jq -r '.services // 0' 2>/dev/null || echo "0")
-            end_cnt=$(echo "$stats_json" | jq -r '.endpoints // 0' 2>/dev/null || echo "0")
-            job_cnt=$(echo "$stats_json" | jq -r '.jobs // 0' 2>/dev/null || echo "0")
+            read -r comp_cnt dom_cnt find_cnt sec_cnt srv_cnt end_cnt job_cnt < <(echo "$stats_json" | jq -r '[.companies // 0, .domains // 0, .findings // 0, .secrets // 0, .services // 0, .endpoints // 0, .jobs // 0] | @tsv' 2>/dev/null || echo "0 0 0 0 0 0 0")
 
             echo -e "  ${TUI_BOLD}Overview Metrics:${TUI_RESET}"
             echo -e "    🏢 Companies/Targets: ${TUI_CYAN}$comp_cnt${TUI_RESET}   🌐 Subdomains: ${TUI_CYAN}$dom_cnt${TUI_RESET}   🛡️  Findings: ${TUI_CYAN}$find_cnt${TUI_RESET}"
@@ -1522,6 +1798,21 @@ tui_db_explorer() {
                 tui_pause
                 ;;
             7)
+                tui_banner
+                tui_section_header "Synchronize Targets to Cloudflare & SQLite"
+                echo ""
+                echo -e "  This will parse on-disk scan data from ${TUI_CYAN}$TARGETS_DIR${TUI_RESET} and sync to Cloudflare D1 & SQLite."
+                echo ""
+                local sync_mode
+                tui_input "Sync all targets or a specific domain? (all/<domain>)" "all" "sync_mode"
+                if [ "$sync_mode" = "all" ] || [ -z "$sync_mode" ]; then
+                    sync_all_targets
+                else
+                    sync_target_data "$sync_mode"
+                fi
+                tui_pause
+                ;;
+            8)
                 tui_banner
                 tui_section_header "Initialize SQLite Database"
                 local confirm_init
@@ -1871,8 +2162,11 @@ show_usage() {
     echo "  --network TARGET          Run network & port scan on IP / CIDR / domain"
     echo "  --fuzz DOMAIN             Run content & backup file discovery"
     echo "  --vuln DOMAIN             Run Nuclei & DAST vulnerability scanning"
+    echo "  -t, --threads NUM         Set concurrency / worker threads (default: 50)"
     echo ""
     echo "Target & Entity Management:"
+    echo "  --sync DOMAIN             Sync on-disk scan data to Cloudflare D1 & local SQLite"
+    echo "  --sync-all                Sync all targets from disk to Cloudflare D1 & SQLite"
     echo "  -p, --person NAME         Add a person target (GraphQL API)"
     echo "  -c, --company NAME        Add a company target (GraphQL API)"
     echo "  -u, --user USERNAME       Add a new user (GraphQL API)"
@@ -1978,6 +2272,8 @@ main() {
     local LAST_NAME=""
     local FORCE_TUI=false
     local FORCE_DAEMON=false
+    local SYNC_TARGET=""
+    local SYNC_ALL=false
     SENDER_ID=""
 
     while [[ $# -gt 0 ]]; do
@@ -1995,10 +2291,24 @@ main() {
                 DOMAIN="$2"
                 shift 2
                 ;;
+            -t|--threads)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                THREADS="$2"
+                shift 2
+                ;;
             --info-gather)
                 if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
                 INFO_GATHER="$2"
                 shift 2
+                ;;
+            --sync)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                SYNC_TARGET="$2"
+                shift 2
+                ;;
+            --sync-all)
+                SYNC_ALL=true
+                shift
                 ;;
             --web)
                 if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
@@ -2076,6 +2386,16 @@ main() {
     if ! check_requirements; then
         log_error "Requirement checks failed. Exiting."
         exit 1
+    fi
+
+    # Target Sync Workflows
+    if [ -n "$SYNC_TARGET" ]; then
+        sync_target_data "$SYNC_TARGET"
+        exit 0
+    fi
+    if [ "$SYNC_ALL" = true ]; then
+        sync_all_targets
+        exit 0
     fi
 
     # Explicit TUI Request

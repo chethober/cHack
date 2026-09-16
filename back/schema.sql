@@ -1,5 +1,4 @@
--- SQLite schema for Cloudflare D1
--- Ported from db.sql (Postgres)
+-- SQLite schema for Cloudflare D1 and local SQLite (local.db)
 
 -- Users table
 CREATE TABLE IF NOT EXISTS users (
