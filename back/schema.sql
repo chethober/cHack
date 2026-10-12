@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS users (
   number_id INTEGER UNIQUE, -- bigint is INTEGER in SQLite
   first_name TEXT,
   last_name TEXT,
+  role TEXT NOT NULL DEFAULT 'member', -- global role: admin, member, viewer
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -152,3 +153,151 @@ CREATE TABLE IF NOT EXISTS network_services (
 CREATE INDEX IF NOT EXISTS idx_net_services_domain_id ON network_services(domain_id);
 CREATE INDEX IF NOT EXISTS idx_net_services_ip_port ON network_services(ip, port);
 
+
+-- =====================================================================
+-- Team workflows: API tokens, campaigns, target groups, job templates,
+-- and per-target playbooks. Multi-user access is enforced through
+-- users.role (global) and campaign_members.role (per-engagement).
+-- =====================================================================
+
+-- API tokens: programmatic auth for the GraphQL API and VPS runners.
+-- The raw token is shown once at creation; only its SHA-256 hash is stored.
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id TEXT PRIMARY KEY,
+  user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE, -- sha-256 hex of the raw token
+  role TEXT NOT NULL DEFAULT 'member', -- admin, member, viewer, runner
+  revoked INTEGER NOT NULL DEFAULT 0,
+  last_used_at TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
+
+-- Campaigns: a client engagement or acquisition/prospect workflow that
+-- groups targets, playbooks, and findings under one authorized scope.
+CREATE TABLE IF NOT EXISTS campaigns (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  slug TEXT UNIQUE,
+  owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  company_id TEXT REFERENCES companies(id) ON DELETE SET NULL, -- optional client linkage
+  kind TEXT NOT NULL DEFAULT 'engagement', -- engagement, acquisition
+  status TEXT NOT NULL DEFAULT 'prospect', -- prospect, active, paused, won, lost, closed
+  authorized INTEGER NOT NULL DEFAULT 0, -- scope authorization gate (1 = signed/in-scope)
+  scope TEXT DEFAULT '{}', -- JSON: in-scope / out-of-scope rules, auth reference
+  description TEXT,
+  data TEXT DEFAULT '{}',
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_campaigns_owner ON campaigns(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_campaigns_company ON campaigns(company_id);
+CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);
+
+-- Per-campaign membership and role (lead, member, viewer).
+CREATE TABLE IF NOT EXISTS campaign_members (
+  campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL DEFAULT 'member', -- lead, member, viewer
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (campaign_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_campaign_members_user ON campaign_members(user_id);
+
+-- Shared target groups: reusable, team-visible sets of domains.
+CREATE TABLE IF NOT EXISTS target_groups (
+  id TEXT PRIMARY KEY,
+  campaign_id TEXT REFERENCES campaigns(id) ON DELETE CASCADE, -- nullable: global/shared group
+  name TEXT NOT NULL,
+  owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  visibility TEXT NOT NULL DEFAULT 'team', -- private, team, campaign
+  description TEXT,
+  data TEXT DEFAULT '{}',
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_target_groups_campaign ON target_groups(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_target_groups_owner ON target_groups(owner_user_id);
+
+-- Membership of a domain in a target group.
+CREATE TABLE IF NOT EXISTS target_group_members (
+  group_id TEXT NOT NULL REFERENCES target_groups(id) ON DELETE CASCADE,
+  domain_id TEXT NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+  added_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (group_id, domain_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tg_members_domain ON target_group_members(domain_id);
+
+-- Job templates: parameterized scan_jobs definitions.
+-- command_template supports {{target}} and {{sender}} placeholders.
+CREATE TABLE IF NOT EXISTS job_templates (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  slug TEXT UNIQUE,
+  owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  visibility TEXT NOT NULL DEFAULT 'team', -- private, team
+  command_template TEXT NOT NULL, -- e.g. "-d {{target}} --web --sender-id {{sender}}"
+  phases TEXT DEFAULT '[]', -- JSON array of phase identifiers
+  default_flags TEXT DEFAULT '{}', -- JSON
+  runner TEXT DEFAULT 'default',
+  description TEXT,
+  data TEXT DEFAULT '{}',
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_templates_owner ON job_templates(owner_user_id);
+
+-- Playbooks: ordered sequences of job-template / phase steps.
+CREATE TABLE IF NOT EXISTS playbooks (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  slug TEXT UNIQUE,
+  campaign_id TEXT REFERENCES campaigns(id) ON DELETE SET NULL,
+  owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  visibility TEXT NOT NULL DEFAULT 'team', -- private, team, campaign
+  description TEXT,
+  data TEXT DEFAULT '{}',
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_playbooks_campaign ON playbooks(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_playbooks_owner ON playbooks(owner_user_id);
+
+-- Ordered steps within a playbook. Each step is either a job template
+-- (template_id) or a raw phase identifier (phase).
+CREATE TABLE IF NOT EXISTS playbook_steps (
+  id TEXT PRIMARY KEY,
+  playbook_id TEXT NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+  step_order INTEGER NOT NULL,
+  template_id TEXT REFERENCES job_templates(id) ON DELETE SET NULL,
+  phase TEXT, -- alternative to template_id, e.g. "recon", "web", "network"
+  params TEXT DEFAULT '{}', -- JSON step-level overrides
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  UNIQUE (playbook_id, step_order)
+);
+
+CREATE INDEX IF NOT EXISTS idx_playbook_steps_playbook ON playbook_steps(playbook_id);
+
+-- Per-target playbooks: bind a playbook to a specific domain or target group.
+CREATE TABLE IF NOT EXISTS target_playbooks (
+  id TEXT PRIMARY KEY,
+  playbook_id TEXT NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+  domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+  group_id TEXT REFERENCES target_groups(id) ON DELETE CASCADE,
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_target_playbooks_playbook ON target_playbooks(playbook_id);
+CREATE INDEX IF NOT EXISTS idx_target_playbooks_domain ON target_playbooks(domain_id);
+CREATE INDEX IF NOT EXISTS idx_target_playbooks_group ON target_playbooks(group_id);

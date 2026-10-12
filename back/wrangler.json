@@ -15,6 +15,7 @@
   ],
   "vars": {
     "GRAPHQL_ENDPOINT": "https://your-worker.workers.dev/graphql",
-    "RUNNERS": "VPS-1,VPS-2"
+    "RUNNERS": "VPS-1,VPS-2",
+    "AUTH_ENFORCED": "false"
   }
 }

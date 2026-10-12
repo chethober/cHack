@@ -21,6 +21,7 @@ cHack chains the best-in-class ProjectDiscovery / recon tooling into a single, r
 - **Central datastore** — per-runner SQLite synced to Cloudflare D1 for a single source of truth.
 - **Self-provisioning** — missing Go tools are auto-installed and periodically updated.
 - **Live job tracking** — stream logs, status, and executive summaries straight to Telegram.
+- **Team workflows** — campaigns, shared target groups, job templates, and per-target playbooks, with API-token auth and roles for multi-user operation.
 
 ---
 
@@ -141,6 +142,63 @@ Once the Worker is deployed and a runner daemon is online, control everything fr
 | `/report <domain>` | Generate an executive recon summary |
 | `/tools` | Check tool health and status |
 | `/stop <job_id>` | Stop an active scan job |
+
+---
+
+## 👥 Team Workflows
+
+For client engagements and acquisition pipelines, cHack models shared work on top
+of the existing company/domain data. All four pieces live in the central D1 database
+(and sync to each runner's local SQLite via `back/schema.sql`):
+
+| Concept | What it is |
+| :--- | :--- |
+| **Campaigns** | A client *engagement* or *acquisition* workflow grouping targets, playbooks and findings under one authorized scope. Has a status (`prospect → active → won/lost/closed`) and an `authorized` gate. |
+| **Shared target groups** | Reusable, team-visible sets of domains you can scan as one unit. |
+| **Job templates** | Parameterized scan definitions whose `command_template` expands `{{target}}` / `{{sender}}` into a real `cHack.sh` invocation. |
+| **Per-target playbooks** | Ordered sequences of template/phase steps, optionally bound to a specific domain or group. Running one expands into one queued job per step per target. |
+
+> 🔒 **Authorization gate.** A playbook attached to a campaign refuses to launch
+> until that campaign is explicitly marked `authorized` — a deliberate guard that
+> keeps scans inside a scope you've confirmed you're allowed to test.
+
+### From Telegram
+
+```
+/campaigns                         # list campaigns
+/newcampaign Acme Pentest | engagement
+/groups                            # list shared target groups
+/templates                         # list job templates
+/playbooks                         # list playbooks
+/runplaybook <slug> <target>       # expand a playbook into queued jobs
+```
+
+### From the GraphQL API
+
+The Worker's `/graphql` endpoint exposes full CRUD for `campaigns`, `targetGroups`,
+`jobTemplates` and `playbooks`, plus `runTemplate` / `runPlaybook` mutations that
+queue jobs the runners pick up. See `back/src/index.js` for the schema.
+
+### Multi-user access & roles
+
+Programmatic access is authenticated with **API tokens** (SHA-256 hashed at rest;
+the plaintext is shown only once at creation). Roles rank `admin > member > viewer`,
+with a dedicated `runner` role for result-push. Per-campaign membership adds
+`lead / member / viewer` on top.
+
+Enforcement is **off by default** so existing single-operator deployments keep
+working. To turn it on:
+
+```bash
+# 1. While still unenforced (bootstrap), mint an admin token via the API:
+#    mutation { createApiToken(name:"me", role:"admin"){ token } }
+# 2. Flip the Worker binding and redeploy:
+cd back && wrangler deploy   # with AUTH_ENFORCED="true"
+```
+
+Thereafter, team-workflow mutations require `Authorization: Bearer <token>`.
+Optionally set a `RUNNER_TOKEN` secret on the Worker and the matching value in each
+runner's `.env` to reject unregistered runners from the job queue.
 
 ---
 
