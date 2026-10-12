@@ -15,7 +15,7 @@ cHack chains the best-in-class ProjectDiscovery / recon tooling into a single, r
 
 - **Six-phase recon pipeline** — fully automated from a single domain to a vulnerability report.
 - **Three ways to drive it** — interactive TUI, direct CLI flags, or a Telegram bot.
-- **Distributed runners** — point many VPS runners at one central queue; jobs are load-shared.
+- **Distributed runners** — point many VPS runners at one central queue; the scheduler auto-balances by capacity, routes by region, honors per-job priority, retries failures with jittered backoff, and reclaims jobs stranded on offline nodes.
 - **Parallel execution** — port scanning and web crawling run concurrently; tunable worker threads (`-t`).
 - **JS secret mining** — dedicated scanner (`js_secrets.py`) with entropy checks, vendor filtering, false-positive suppression, tiered classification (confirmed-live / candidate / informational), and optional **active verification** that pings each provider's read-only API to confirm which credentials are actually live.
 - **Central datastore** — per-runner SQLite synced to Cloudflare D1 for a single source of truth.
@@ -44,6 +44,18 @@ cHack is a distributed system with three cooperating parts:
   `--daemon` that polls the central queue, executes jobs, and streams results back.
 - **`db_sqlite.py`** — each runner's local SQLite store and the sync layer to D1.
 - **`js_secrets.py`** — JavaScript secret/credential scanner used by the web-recon phase.
+
+### Runner orchestration
+
+The central queue (`back/`, Cloudflare D1) schedules work across every connected runner:
+
+- **Auto-balance** — each runner pulls only while it has a free slot (`?slots=N`, default 1), so new work flows to idle nodes instead of piling onto busy ones.
+- **Region-aware** — a job may pin a region (ISO country, e.g. `US`); it only runs on a runner in that region, and region-local jobs are preferred over unpinned ones.
+- **Priority** — higher-`priority` jobs (e.g. high-value targets) are dispatched ahead of the rest; ties break by age.
+- **Retries with jitter** — a failed job is requeued up to `max_attempts` (default 3) with exponential backoff plus jitter (`30s · 2^attempt`, capped at 30 min).
+- **Health checks & reclaim** — runners heartbeat continuously (even mid-job); a runner silent past ~3 min is treated as offline and its in-flight jobs are requeued (or failed once attempts run out). Claims are atomic, so two runners never execute the same job.
+
+> **Upgrading an existing deployment:** these add columns to `scan_jobs`. After deploying the Worker, hit `GET /api/db/migrate` once to apply the (idempotent) schema changes.
 
 ---
 

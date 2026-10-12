@@ -58,12 +58,23 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
   id TEXT PRIMARY KEY,
   command TEXT NOT NULL,
   domain TEXT NOT NULL,
-  runner TEXT DEFAULT 'default', -- target runner (e.g. VPS-US)
+  runner TEXT DEFAULT 'default', -- target runner name, or 'default' for any runner
+  region TEXT,                   -- preferred runner region (ISO country, e.g. 'US'); NULL = any region
+  priority INTEGER NOT NULL DEFAULT 0, -- higher runs first (e.g. 10 for high-value targets)
   status TEXT NOT NULL DEFAULT 'pending', -- pending, running, completed, failed
   stdout TEXT DEFAULT '',
+  attempts INTEGER NOT NULL DEFAULT 0,     -- how many times this job has been dispatched
+  max_attempts INTEGER NOT NULL DEFAULT 3, -- give up (mark failed) after this many attempts
+  next_eligible_at INTEGER NOT NULL DEFAULT 0, -- Unix ts; job is not dispatchable before this (retry backoff)
+  assigned_runner TEXT,          -- runner currently holding the job (for stale-lease reclaim)
+  started_at INTEGER,            -- Unix ts the current run was dispatched (lease start)
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Dispatch ordering: pending jobs, highest priority then oldest first.
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_dispatch
+  ON scan_jobs(status, priority DESC, created_at ASC);
 
 -- Sessions table (persists Telegram bot state)
 CREATE TABLE IF NOT EXISTS sessions (
