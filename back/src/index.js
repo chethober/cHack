@@ -1204,6 +1204,62 @@ const yoga = createYoga({
 });
 
 // ----------------------------------------------------
+// Continuous Attack-Surface Monitoring helpers
+// ----------------------------------------------------
+
+// Parse a human cadence ("30m", "6h", "2d", or a bare number of minutes)
+// into minutes. Returns null if unparseable.
+const parseInterval = (raw) => {
+  if (!raw) return null;
+  const m = String(raw).trim().toLowerCase().match(/^(\d+)\s*(m|min|h|hr|hour|d|day)?s?$/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!n || n <= 0) return null;
+  const unit = m[2] || 'm';
+  if (unit.startsWith('d')) return n * 1440;
+  if (unit.startsWith('h')) return n * 60;
+  return n; // minutes
+};
+
+const formatInterval = (minutes) => {
+  if (minutes % 1440 === 0) return `${minutes / 1440}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+};
+
+// Classify a monitor target: IP/CIDR -> network, FQDN -> domain, else company.
+const inferTargetType = (target) => {
+  const t = (target || '').trim();
+  if (/^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(t)) return 'network';
+  if (/\/\d{1,2}$/.test(t)) return 'network';
+  if (/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(t)) return 'domain';
+  return 'company';
+};
+
+// Registrable base (eTLD+1 approximation by last two labels). Note: does not
+// special-case multi-part TLDs such as co.uk.
+const registrableBase = (host) => {
+  const parts = (host || '').toLowerCase().split('.').filter(Boolean);
+  if (parts.length <= 2) return parts.join('.');
+  return parts.slice(-2).join('.');
+};
+
+// Build the cHack.sh CLI command string for a monitored scan. Mirrors the
+// interactive triggerScan() command format and always carries --sender-id so
+// the runner can route drift alerts back to the monitor owner.
+const buildMonitorCommand = (monitor, target) => {
+  const t = target || monitor.target;
+  const sender = monitor.owner_chat_id;
+  switch (monitor.scan_type) {
+    case 'recon':   return `-d ${t} --sender-id ${sender}`;
+    case 'web':     return `--web ${t} --sender-id ${sender}`;
+    case 'network': return `--network ${t} --sender-id ${sender}`;
+    case 'infogather':
+    default:        return `--info-gather ${t} --sender-id ${sender}`;
+  }
+};
+
+// ----------------------------------------------------
 // Telegram Bot Component (grammY)
 // ----------------------------------------------------
 let botInstance = null;
@@ -1965,6 +2021,118 @@ const getBot = (env) => {
     );
   });
 
+  // ----------------------------------------------------
+  // Continuous monitoring commands
+  // ----------------------------------------------------
+  bot.command("monitor", async (ctx) => {
+    await registerUser(ctx);
+    const raw = (ctx.match || "").trim();
+    if (!raw) {
+      return await ctx.reply(
+        "🛰️ <b>Schedule continuous monitoring</b>\n\n" +
+        "Usage: <code>/monitor &lt;target&gt; [interval] [scan_type]</code>\n\n" +
+        "• <b>target</b> — domain, company name, or IP/CIDR\n" +
+        "• <b>interval</b> — e.g. <code>30m</code>, <code>6h</code>, <code>1d</code> (default <code>1d</code>)\n" +
+        "• <b>scan_type</b> — <code>recon</code> | <code>infogather</code> | <code>web</code> | <code>network</code>\n\n" +
+        "Example: <code>/monitor example.com 12h infogather</code>",
+        { parse_mode: "HTML" }
+      );
+    }
+
+    const tokens = raw.split(/\s+/);
+    const target = tokens.shift();
+    const validScans = ["recon", "infogather", "web", "network"];
+    const targetType = inferTargetType(target);
+    let intervalMinutes = 1440;
+    let scanType = targetType === "network" ? "network" : "infogather";
+
+    for (const tok of tokens) {
+      if (validScans.includes(tok.toLowerCase())) {
+        scanType = tok.toLowerCase();
+      } else {
+        const parsed = parseInterval(tok);
+        if (parsed) intervalMinutes = parsed;
+      }
+    }
+
+    const id = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
+    const runner = ctx.session?.selected_runner || "default";
+    try {
+      await env.DB.prepare(
+        "INSERT INTO monitors (id, owner_chat_id, target_type, target, scan_type, runner, interval_minutes, enabled, next_run_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)"
+      ).bind(id, ctx.from.id, targetType, target, scanType, runner, intervalMinutes, nowIso).run();
+    } catch (err) {
+      return await ctx.reply(
+        "❌ Could not create monitor. Run <code>/api/db/migrate</code> once if this is a fresh deployment.\n\n" +
+        `<code>${escapeHtml(err.message || String(err))}</code>`,
+        { parse_mode: "HTML" }
+      );
+    }
+
+    await ctx.reply(
+      "🛰️ <b>Monitor Created</b>\n\n" +
+      `• <b>Target:</b> <code>${escapeHtml(target)}</code> (${targetType})\n` +
+      `• <b>Scan:</b> <code>${scanType}</code>\n` +
+      `• <b>Every:</b> <code>${formatInterval(intervalMinutes)}</code>\n` +
+      `• <b>Runner:</b> <code>${runner}</code>\n` +
+      `• <b>ID:</b> <code>${id}</code>\n\n` +
+      "First run is queued for the next scheduler tick. You'll be alerted on drift — " +
+      "new subdomains, ports, TLS certs or cloud assets.",
+      { parse_mode: "HTML" }
+    );
+  });
+
+  bot.command("monitors", async (ctx) => {
+    await registerUser(ctx);
+    let results = [];
+    try {
+      const res = await env.DB.prepare(
+        "SELECT * FROM monitors WHERE owner_chat_id = ? ORDER BY created_at DESC"
+      ).bind(ctx.from.id).all();
+      results = res.results || [];
+    } catch (err) {
+      return await ctx.reply("❌ Could not read monitors: " + escapeHtml(err.message || String(err)), { parse_mode: "HTML" });
+    }
+
+    if (results.length === 0) {
+      return await ctx.reply(
+        "🛰️ No active monitors.\n\nCreate one with <code>/monitor &lt;target&gt; [interval]</code>.",
+        { parse_mode: "HTML" }
+      );
+    }
+
+    let msg = `🛰️ <b>Your Monitors (${results.length})</b>\n`;
+    for (const m of results) {
+      const state = m.enabled ? "🟢" : "⏸️";
+      msg += `\n${state} <code>${escapeHtml(m.target)}</code> · ${m.scan_type} · every ${formatInterval(m.interval_minutes)}\n`;
+      msg += `   next: ${m.next_run_at ? escapeHtml(String(m.next_run_at).replace('T', ' ').slice(0, 16)) : 'pending'} · id: <code>${m.id}</code>\n`;
+    }
+    msg += "\nManage: <code>/unmonitor &lt;id&gt;</code>";
+    await ctx.reply(msg, { parse_mode: "HTML" });
+  });
+
+  bot.command("unmonitor", async (ctx) => {
+    await registerUser(ctx);
+    const id = (ctx.match || "").trim();
+    if (!id) {
+      return await ctx.reply("❌ Usage: <code>/unmonitor &lt;id&gt;</code> (see <code>/monitors</code>)", { parse_mode: "HTML" });
+    }
+    try {
+      const r = await env.DB.prepare(
+        "DELETE FROM monitors WHERE id = ? AND owner_chat_id = ?"
+      ).bind(id, ctx.from.id).run();
+      const removed = r.meta?.changes || r.meta?.rows_written || 0;
+      if (!removed) {
+        return await ctx.reply("⚠️ No monitor with that ID belongs to you.", { parse_mode: "HTML" });
+      }
+    } catch (err) {
+      return await ctx.reply("❌ Could not remove monitor: " + escapeHtml(err.message || String(err)), { parse_mode: "HTML" });
+    }
+    await ctx.reply(`🗑️ Monitor <code>${escapeHtml(id)}</code> removed.`, { parse_mode: "HTML" });
+  });
+
   bot.command("vulns", async (ctx) => {
     const args = ctx.match?.trim()?.split(/\s+/) || [];
     const domain = args[0] || null;
@@ -2215,7 +2383,11 @@ const getBot = (env) => {
       `• <code>/vulns [domain] [severity]</code> - Search vulnerabilities\n` +
       `• <code>/secrets [domain]</code> - Search discovered secrets\n` +
       `• <code>/ports [domain]</code> - Search open services\n` +
-      `• <code>/report &lt;domain&gt;</code> - Executive summary report`,
+      `• <code>/report &lt;domain&gt;</code> - Executive summary report\n\n` +
+      `<b>Continuous Monitoring:</b>\n` +
+      `• <code>/monitor &lt;target&gt; [interval] [type]</code> - Schedule recurring scans\n` +
+      `• <code>/monitors</code> - List your active monitors\n` +
+      `• <code>/unmonitor &lt;id&gt;</code> - Remove a monitor`,
       { parse_mode: "HTML" }
     );
   });
@@ -3698,6 +3870,26 @@ app.get('/api/db/migrate', async (c) => {
       )
     `).run().catch(() => {});
 
+    // Continuous attack-surface monitoring: recurring scan schedules
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS monitors (
+        id TEXT PRIMARY KEY,
+        owner_chat_id INTEGER NOT NULL,
+        target_type TEXT NOT NULL DEFAULT 'domain',
+        target TEXT NOT NULL,
+        scan_type TEXT NOT NULL DEFAULT 'infogather',
+        runner TEXT NOT NULL DEFAULT 'default',
+        interval_minutes INTEGER NOT NULL DEFAULT 1440,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        last_run_at TEXT,
+        next_run_at TEXT,
+        last_job_id TEXT,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_monitors_due ON monitors(enabled, next_run_at)").run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_monitors_owner ON monitors(owner_chat_id)").run().catch(() => {});
+
     return c.text("D1 Database Migrations applied successfully!");
   } catch (e) {
     return c.text("Migration failed: " + e.message, 500);
@@ -3792,4 +3984,86 @@ app.post('/api/runner/status', async (c) => {
   return c.json({ success: true });
 });
 
-export default app;
+// ----------------------------------------------------
+// Scheduled (Cron Trigger): dispatch due monitors
+// ----------------------------------------------------
+// Runs on the Worker cron schedule (see wrangler.json). Finds monitors whose
+// next_run_at has elapsed, enqueues scan jobs into the shared runner queue,
+// and rolls their schedule forward. Company monitors fan out to one scan per
+// distinct registrable domain known for that company.
+const scheduled = async (event, env, ctx) => {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  let due = [];
+  try {
+    const res = await env.DB.prepare(
+      "SELECT * FROM monitors WHERE enabled = 1 AND (next_run_at IS NULL OR next_run_at <= ?) ORDER BY next_run_at ASC LIMIT 50"
+    ).bind(nowIso).all();
+    due = res.results || [];
+  } catch (err) {
+    console.error("scheduled: monitor query failed:", err.message);
+    return;
+  }
+
+  if (due.length === 0) return;
+
+  let bot = null;
+  try { bot = getBot(env); } catch { /* alerts are best-effort */ }
+
+  for (const m of due) {
+    try {
+      // Resolve the concrete scan targets for this monitor.
+      let targets = [m.target];
+      if (m.target_type === "company") {
+        try {
+          const dres = await env.DB.prepare(
+            "SELECT d.host FROM domains d " +
+            "JOIN companies c ON d.company_id = c.id " +
+            "WHERE lower(c.slug) = lower(?) OR lower(c.name) = lower(?)"
+          ).bind(m.target, m.target).all();
+          const bases = new Set();
+          for (const row of (dres.results || [])) {
+            if (row.host) bases.add(registrableBase(row.host));
+          }
+          if (bases.size > 0) targets = Array.from(bases);
+        } catch (err) {
+          console.error("scheduled: company expansion failed:", err.message);
+        }
+      }
+
+      const jobIds = [];
+      for (const t of targets) {
+        const command = buildMonitorCommand(m, t);
+        const jobId = crypto.randomUUID();
+        await env.DB.prepare(
+          "INSERT INTO scan_jobs (id, command, domain, runner, status) VALUES (?, ?, ?, ?, 'pending')"
+        ).bind(jobId, command, t, m.runner || "default").run();
+        jobIds.push(jobId);
+      }
+
+      const nextIso = new Date(nowMs + (m.interval_minutes || 1440) * 60000).toISOString();
+      await env.DB.prepare(
+        "UPDATE monitors SET last_run_at = ?, next_run_at = ?, last_job_id = ? WHERE id = ?"
+      ).bind(nowIso, nextIso, jobIds[0] || null, m.id).run();
+
+      if (bot) {
+        const scope = targets.length > 1 ? ` (${targets.length} domains)` : "";
+        await bot.api.sendMessage(
+          m.owner_chat_id,
+          `🛰️ <b>Scheduled scan queued</b> for <code>${escapeHtml(m.target)}</code>${scope}\n` +
+          `• Scan: <code>${m.scan_type}</code>\n` +
+          `• Next run: ${nextIso.replace("T", " ").slice(0, 16)}`,
+          { parse_mode: "HTML" }
+        ).catch(() => {});
+      }
+    } catch (err) {
+      console.error(`scheduled: failed to dispatch monitor ${m.id}:`, err.message);
+    }
+  }
+};
+
+export default {
+  fetch: app.fetch,
+  scheduled,
+};

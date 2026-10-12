@@ -1079,6 +1079,412 @@ def get_db_summary():
     conn.close()
     return summary
 
+# ======================================================================
+# Continuous Attack-Surface Monitoring — Drift Detection
+# ======================================================================
+#
+# After a (re)scan completes, detect_drift() compares the current attack
+# surface of a target against a rolling, runner-local baseline stored in
+# `surface_assets`. Newly appeared assets are recorded in `drift_events`
+# and, when a Telegram chat id is supplied, pushed as an alert.
+#
+# Four asset kinds are tracked:
+#   subdomain   — hosts synced into the local `domains` table
+#   port        — ip:port pairs from `network_services`
+#   tls_cert    — certificates seen in Certificate Transparency (crt.sh)
+#   cloud_asset — subdomains CNAME-pointing at known cloud providers
+#
+# The first time a kind is seen for a target it only seeds the baseline
+# (no alert); subsequent runs alert on genuinely new assets.
+
+# Ordered (most-specific first) CNAME substring -> cloud provider map.
+_CLOUD_CNAME_PROVIDERS = [
+    ("blob.core.windows.net", "Azure Blob Storage"),
+    ("azurewebsites.net", "Azure App Service"),
+    ("trafficmanager.net", "Azure Traffic Manager"),
+    ("azureedge.net", "Azure CDN"),
+    ("cloudapp.azure.com", "Azure"),
+    ("cloudapp.net", "Azure"),
+    ("s3-website", "AWS S3 Website"),
+    ("s3.amazonaws.com", "AWS S3"),
+    ("elb.amazonaws.com", "AWS ELB"),
+    ("cloudfront.net", "AWS CloudFront"),
+    ("amazonaws.com", "AWS"),
+    ("storage.googleapis.com", "GCP Cloud Storage"),
+    ("appspot.com", "GCP App Engine"),
+    ("run.app", "GCP Cloud Run"),
+    ("ghs.google", "Google"),
+    ("googleusercontent.com", "Google"),
+    ("herokudns.com", "Heroku"),
+    ("herokuapp.com", "Heroku"),
+    ("github.io", "GitHub Pages"),
+    ("pages.dev", "Cloudflare Pages"),
+    ("workers.dev", "Cloudflare Workers"),
+    ("cloudflare.net", "Cloudflare"),
+    ("netlify.app", "Netlify"),
+    ("netlify.com", "Netlify"),
+    ("vercel.app", "Vercel"),
+    ("vercel-dns.com", "Vercel"),
+    ("fastly.net", "Fastly"),
+    ("fastlylb.net", "Fastly"),
+    ("digitaloceanspaces.com", "DigitalOcean Spaces"),
+    ("ondigitalocean.app", "DigitalOcean"),
+    ("readthedocs.io", "ReadTheDocs"),
+]
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+
+
+def _normalize_target(target):
+    t = (target or "").strip().lower()
+    t = re.sub(r'^[a-z]+://', '', t)   # strip scheme
+    t = t.rstrip('/')
+    # Strip a URL path but preserve a CIDR suffix (/<digits> at end).
+    t = re.sub(r'/(?!\d+$).*$', '', t)
+    return t
+
+
+def _looks_like_domain(target):
+    return bool(re.match(r'^[a-z0-9.-]+\.[a-z]{2,}$', target or ''))
+
+
+def _resolve_company_id(conn, target):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT c.id FROM companies c
+        LEFT JOIN domains d ON d.company_id = c.id
+        WHERE lower(c.slug) = ? OR lower(c.name) = ? OR lower(d.host) = ?
+        LIMIT 1
+        """,
+        (target, target, target),
+    )
+    row = cur.fetchone()
+    return row['id'] if row else None
+
+
+def _collect_subdomains(conn, target):
+    """Return {host: meta} for every host under the target's company."""
+    assets = {}
+    company_id = _resolve_company_id(conn, target)
+    cur = conn.cursor()
+    if company_id:
+        cur.execute("SELECT host, canonical_url FROM domains WHERE company_id = ?", (company_id,))
+    else:
+        cur.execute("SELECT host, canonical_url FROM domains WHERE lower(host) = ?", (target,))
+    for r in cur.fetchall():
+        host = (r['host'] or '').strip().lower()
+        if host:
+            assets[host] = {"canonical_url": r['canonical_url']}
+    return assets
+
+
+def _collect_ports(conn, target):
+    """Return {'ip:port': meta} for the target (by company, host, or IP)."""
+    assets = {}
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT ns.ip, ns.port, ns.protocol, ns.service, ns.product, ns.version
+        FROM network_services ns
+        JOIN domains d ON ns.domain_id = d.id
+        LEFT JOIN companies c ON d.company_id = c.id
+        WHERE lower(d.host) = ? OR lower(c.slug) = ? OR lower(c.name) = ? OR ns.ip = ?
+        """,
+        (target, target, target, target),
+    )
+    for r in cur.fetchall():
+        ip = (r['ip'] or '').strip()
+        port = r['port']
+        if not ip or port is None:
+            continue
+        key = f"{ip}:{port}"
+        assets[key] = {
+            "ip": ip,
+            "port": port,
+            "protocol": r['protocol'],
+            "service": r['service'],
+            "product": r['product'],
+            "version": r['version'],
+        }
+    return assets
+
+
+def _collect_tls_certs(target):
+    """Best-effort Certificate Transparency lookup via crt.sh. {serial: meta}."""
+    if not _looks_like_domain(target):
+        return {}
+    import urllib.request
+    import urllib.parse
+
+    assets = {}
+    url = "https://crt.sh/?q=" + urllib.parse.quote("%." + target) + "&output=json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "cHack-monitor"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        entries = json.loads(raw)
+    except Exception:
+        return {}
+
+    for e in entries[:800]:
+        try:
+            serial = (e.get("serial_number") or "").strip()
+            key = serial or f"crtsh-{e.get('id')}"
+            if not key or key in assets:
+                continue
+            names = (e.get("name_value") or "").replace("\n", ",")
+            assets[key] = {
+                "cn": e.get("common_name") or "",
+                "sans": names[:300],
+                "not_after": e.get("not_after") or "",
+                "issuer": (e.get("issuer_name") or "")[:120],
+            }
+        except Exception:
+            continue
+    return assets
+
+
+def _doh_cname(host):
+    """Resolve the CNAME target for host via DNS-over-HTTPS. Returns str or ''."""
+    import urllib.request
+    import urllib.parse
+
+    url = "https://dns.google/resolve?name=" + urllib.parse.quote(host) + "&type=CNAME"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "cHack-monitor"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return ""
+    for ans in (data.get("Answer") or []):
+        if ans.get("type") == 5:  # CNAME
+            return (ans.get("data") or "").rstrip(".").lower()
+    return ""
+
+
+def _classify_cloud(cname):
+    if not cname:
+        return None
+    for needle, provider in _CLOUD_CNAME_PROVIDERS:
+        if needle in cname:
+            return provider
+    return None
+
+
+def _collect_cloud_assets(hosts):
+    """Classify hosts whose CNAME points at a known cloud provider.
+
+    Returns {'host -> provider': meta}. Best-effort; disabled when
+    CHACK_DRIFT_CLOUD=0. Capped to keep DoH volume bounded.
+    """
+    if os.environ.get("CHACK_DRIFT_CLOUD", "1") == "0":
+        return {}
+    hosts = sorted(hosts)[:200]
+    if not hosts:
+        return {}
+
+    assets = {}
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            cnames = list(pool.map(_doh_cname, hosts))
+    except Exception:
+        cnames = [_doh_cname(h) for h in hosts]
+
+    for host, cname in zip(hosts, cnames):
+        provider = _classify_cloud(cname)
+        if provider:
+            assets[f"{host} -> {provider}"] = {"host": host, "cname": cname, "provider": provider}
+    return assets
+
+
+def _send_telegram(chat_id, html):
+    """Best-effort Telegram push. Token read from TELEGRAM_BOT_TOKEN env."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token or not chat_id:
+        return False
+    import urllib.request
+    import urllib.parse
+
+    payload = urllib.parse.urlencode({
+        "chat_id": str(chat_id),
+        "text": html,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=payload)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+        return True
+    except Exception:
+        return False
+
+
+def _esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _diff_kind(conn, target, scan_type, kind, current):
+    """Diff `current` {key: meta} against the baseline for (target, kind).
+
+    Returns (new_items, is_baseline). Updates surface_assets and
+    drift_events. On a baseline (first time this kind is seen for the
+    target) nothing is reported as new.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) AS n FROM surface_assets WHERE target = ? AND asset_kind = ?",
+        (target, kind),
+    )
+    had_baseline = cur.fetchone()['n'] > 0
+
+    # Existing keys for this (target, kind)
+    cur.execute(
+        "SELECT asset_key FROM surface_assets WHERE target = ? AND asset_kind = ?",
+        (target, kind),
+    )
+    known = {r['asset_key'] for r in cur.fetchall()}
+
+    now = _now_iso()
+    new_items = []
+    for key, meta in current.items():
+        meta_json = json.dumps(meta, default=str)
+        if key in known:
+            cur.execute(
+                "UPDATE surface_assets SET last_seen = ?, asset_meta = ? "
+                "WHERE target = ? AND asset_kind = ? AND asset_key = ?",
+                (now, meta_json, target, kind, key),
+            )
+            continue
+        # Insert into inventory
+        cur.execute(
+            "INSERT OR IGNORE INTO surface_assets "
+            "(id, target, asset_kind, asset_key, asset_meta, first_seen, last_seen) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), target, kind, key, meta_json, now, now),
+        )
+        if had_baseline:
+            new_items.append((key, meta))
+            cur.execute(
+                "INSERT INTO drift_events "
+                "(id, target, scan_type, asset_kind, change_type, asset_key, asset_meta, alerted, detected_at) "
+                "VALUES (?, ?, ?, ?, 'new', ?, ?, 0, ?)",
+                (str(uuid.uuid4()), target, scan_type, kind, key, meta_json, now),
+            )
+    return new_items, (not had_baseline)
+
+
+def _format_drift_alert(target, scan_type, buckets):
+    labels = {
+        "subdomain": ("🌐", "New subdomains"),
+        "port": ("🔌", "Newly exposed ports"),
+        "tls_cert": ("📜", "New TLS certificates"),
+        "cloud_asset": ("☁️", "New cloud assets"),
+    }
+    lines = [
+        "🛰️ <b>Attack Surface Drift Detected</b>",
+        f"Target: <code>{_esc(target)}</code> · scan: <code>{_esc(scan_type)}</code>",
+    ]
+    for kind in ("subdomain", "port", "tls_cert", "cloud_asset"):
+        items = buckets.get(kind) or []
+        if not items:
+            continue
+        icon, label = labels[kind]
+        lines.append(f"\n{icon} <b>{label} ({len(items)})</b>")
+        for key, meta in items[:15]:
+            if kind == "port":
+                svc = meta.get("service") or ""
+                lines.append(f"• <code>{_esc(key)}</code>" + (f" ({_esc(svc)})" if svc else ""))
+            elif kind == "tls_cert":
+                cn = meta.get("cn") or (meta.get("sans") or "").split(",")[0]
+                exp = meta.get("not_after") or ""
+                extra = f" (exp {_esc(exp[:10])})" if exp else ""
+                lines.append(f"• {_esc(cn) or _esc(key)}{extra}")
+            else:
+                lines.append(f"• <code>{_esc(key)}</code>")
+        if len(items) > 15:
+            lines.append(f"  …and {len(items) - 15} more")
+    return "\n".join(lines)
+
+
+def detect_drift(target, scan_type="scan", sender_id=None):
+    """Compare current attack surface to the baseline and alert on drift.
+
+    Returns a summary dict. Alerts via Telegram when sender_id is set and
+    genuine (non-baseline) drift is found.
+    """
+    norm = _normalize_target(target)
+    conn = get_db()
+    # Ensure monitoring tables exist even on older databases.
+    try:
+        init_tables = conn.cursor()
+        init_tables.executescript(
+            "CREATE TABLE IF NOT EXISTS surface_assets (id TEXT PRIMARY KEY, target TEXT NOT NULL, "
+            "asset_kind TEXT NOT NULL, asset_key TEXT NOT NULL, asset_meta TEXT DEFAULT '{}', "
+            "first_seen TEXT, last_seen TEXT);"
+            "CREATE UNIQUE INDEX IF NOT EXISTS surface_assets_uq ON surface_assets(target, asset_kind, asset_key);"
+            "CREATE TABLE IF NOT EXISTS drift_events (id TEXT PRIMARY KEY, target TEXT NOT NULL, "
+            "scan_type TEXT, asset_kind TEXT NOT NULL, change_type TEXT NOT NULL DEFAULT 'new', "
+            "asset_key TEXT NOT NULL, asset_meta TEXT DEFAULT '{}', alerted INTEGER NOT NULL DEFAULT 0, "
+            "detected_at TEXT);"
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+    subdomains = _collect_subdomains(conn, norm)
+    ports = _collect_ports(conn, norm)
+    certs = _collect_tls_certs(norm)
+    cloud = _collect_cloud_assets(set(subdomains.keys()))
+
+    buckets = {}
+    baseline_kinds = []
+    for kind, current in (
+        ("subdomain", subdomains),
+        ("port", ports),
+        ("tls_cert", certs),
+        ("cloud_asset", cloud),
+    ):
+        if not current:
+            continue  # nothing collected this run → never a removal, skip
+        new_items, is_baseline = _diff_kind(conn, norm, scan_type, kind, current)
+        if is_baseline:
+            baseline_kinds.append(kind)
+        if new_items:
+            buckets[kind] = new_items
+
+    conn.commit()
+
+    total_new = sum(len(v) for v in buckets.values())
+    alerted = False
+    if sender_id and total_new > 0:
+        msg = _format_drift_alert(norm, scan_type, buckets)
+        if _send_telegram(sender_id, msg):
+            alerted = True
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE drift_events SET alerted = 1 WHERE target = ? AND alerted = 0",
+                (norm,),
+            )
+            conn.commit()
+    conn.close()
+
+    summary = {
+        "target": norm,
+        "scan_type": scan_type,
+        "baseline_seeded": baseline_kinds,
+        "new": {k: len(v) for k, v in buckets.items()},
+        "total_new": total_new,
+        "alerted": alerted,
+    }
+    return summary
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: db_sqlite.py <command> [args...]")
@@ -1155,6 +1561,13 @@ def main():
             print("Usage: db_sqlite.py report <domain_or_slug>")
             sys.exit(1)
         print(json.dumps(generate_report(sys.argv[2]), indent=2))
+    elif cmd == 'drift':
+        if len(sys.argv) < 3:
+            print("Usage: db_sqlite.py drift <target> [scan_type] [sender_id]")
+            sys.exit(1)
+        scan_type = sys.argv[3] if len(sys.argv) > 3 else 'scan'
+        sender_id = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+        print(json.dumps(detect_drift(sys.argv[2], scan_type, sender_id), indent=2))
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)

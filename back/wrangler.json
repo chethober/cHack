@@ -13,6 +13,11 @@
       "database_id": "1d51b6f5-f361-4df2-a4c5-c49a3845d696"
     }
   ],
+  "triggers": {
+    "crons": [
+      "*/15 * * * *"
+    ]
+  },
   "vars": {
     "GRAPHQL_ENDPOINT": "https://your-worker.workers.dev/graphql",
     "RUNNERS": "VPS-1,VPS-2"
