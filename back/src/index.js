@@ -1391,7 +1391,9 @@ const getBot = (env) => {
   };
 
   // Queue scan helper
-  const triggerScan = async (ctx, type, value, runner = 'default') => {
+  const triggerScan = async (ctx, type, value, runner = 'default', opts = {}) => {
+    const priority = Number.isFinite(opts.priority) ? opts.priority : 0;
+    const region = opts.region || null;
     const userId = ctx.from?.id || 0;
     let command = "";
     if (type === 'domain') {
@@ -1415,8 +1417,8 @@ const getBot = (env) => {
     
     const id = crypto.randomUUID();
     await env.DB.prepare(
-      "INSERT INTO scan_jobs (id, command, domain, runner, status) VALUES (?, ?, ?, ?, 'pending')"
-    ).bind(id, command, value, runner).run();
+      "INSERT INTO scan_jobs (id, command, domain, runner, region, priority, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')"
+    ).bind(id, command, value, runner, region, priority).run();
     return id;
   };
 
@@ -3633,7 +3635,19 @@ app.get('/api/db/migrate', async (c) => {
     // Add ip/country columns to runners table
     await c.env.DB.prepare("ALTER TABLE runners ADD COLUMN ip TEXT").run().catch(() => {});
     await c.env.DB.prepare("ALTER TABLE runners ADD COLUMN country TEXT").run().catch(() => {});
-    
+
+    // Runner orchestration columns on scan_jobs (idempotent; each fails harmlessly if present)
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN region TEXT").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN next_eligible_at INTEGER NOT NULL DEFAULT 0").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN assigned_runner TEXT").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN started_at INTEGER").run().catch(() => {});
+    await c.env.DB.prepare(
+      "CREATE INDEX IF NOT EXISTS idx_scan_jobs_dispatch ON scan_jobs(status, priority DESC, created_at ASC)"
+    ).run().catch(() => {});
+
     // Create new Reconner tables if not exist
     await c.env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS findings (
@@ -3746,9 +3760,61 @@ app.post('/webhook', async (c) => {
 });
 
 // Runner APIs (Background Scan Executer)
+
+// --- Orchestration tunables -------------------------------------------------
+// A runner that has not sent next-job/heartbeat within this window is treated as
+// offline; its in-flight jobs become eligible for reclaim.
+const RUNNER_STALE_SECS = 180;
+// Hard ceiling on a single run regardless of heartbeats — a wedged job past this
+// lease is reclaimed so it cannot occupy a slot forever. Set well above a normal
+// full-pipeline scan so a legitimately long job is never double-dispatched.
+const JOB_LEASE_SECS = 21600; // 6h
+// Retry backoff: delay = min(cap, base * 2^attempts), plus up to +50% jitter.
+const RETRY_BASE_SECS = 30;
+const RETRY_CAP_SECS = 1800;
+
+// Seconds to wait before a failed/reclaimed job may run again, with jitter so a
+// fleet-wide outage doesn't requeue everything into one synchronized wave.
+function retryDelaySecs(attempts) {
+  const base = Math.min(RETRY_CAP_SECS, RETRY_BASE_SECS * Math.pow(2, Math.max(0, attempts)));
+  return Math.round(base + Math.random() * base * 0.5);
+}
+
+// Requeue (or fail) jobs stranded on a runner that has gone offline or blown its
+// lease. Runs opportunistically on each poll; cheap and idempotent.
+async function reclaimStaleJobs(env, nowSecs) {
+  const runnerCutoff = nowSecs - RUNNER_STALE_SECS;
+  const leaseCutoff = nowSecs - JOB_LEASE_SECS;
+  // Condition: the job is running, but its holder is unknown/offline, or the
+  // lease has expired outright.
+  const staleWhere =
+    "status = 'running' AND (" +
+    "  (started_at IS NOT NULL AND started_at < ?) " +
+    "  OR assigned_runner IS NULL " +
+    "  OR assigned_runner NOT IN (SELECT name FROM runners WHERE last_seen >= ?)" +
+    ")";
+
+  // Out of attempts -> give up.
+  await env.DB.prepare(
+    "UPDATE scan_jobs SET status = 'failed', assigned_runner = NULL, " +
+    "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') " +
+    "WHERE attempts >= max_attempts AND " + staleWhere
+  ).bind(leaseCutoff, runnerCutoff).run().catch(() => {});
+
+  // Still has attempts left -> back to the queue after a jittered backoff.
+  await env.DB.prepare(
+    "UPDATE scan_jobs SET status = 'pending', assigned_runner = NULL, started_at = NULL, " +
+    "next_eligible_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') " +
+    "WHERE attempts < max_attempts AND " + staleWhere
+  ).bind(nowSecs + retryDelaySecs(1), leaseCutoff, runnerCutoff).run().catch(() => {});
+}
+
 app.get('/api/runner/next-job', async (c) => {
   const runner = c.req.query('runner') || 'default';
-  
+  // How many jobs this runner may hold at once (auto-balance: don't pile work on
+  // a node that is already busy — let idle nodes pick it up instead).
+  const slots = Math.max(1, parseInt(c.req.query('slots') || '1', 10) || 1);
+
   // Register runner heartbeat (Unix timestamp in seconds)
   const nowSecs = Math.floor(Date.now() / 1000);
   const ip = c.req.header('CF-Connecting-IP') || c.req.header('x-real-ip') || '127.0.0.1';
@@ -3759,21 +3825,65 @@ app.get('/api/runner/next-job', async (c) => {
     "ON CONFLICT(name) DO UPDATE SET ip = excluded.ip, country = excluded.country, last_seen = excluded.last_seen"
   ).bind(runner, ip, country, nowSecs).run();
 
-  // Fetch next pending job for this runner or default
-  const job = await c.env.DB.prepare(
-    "SELECT * FROM scan_jobs WHERE status = 'pending' AND (runner = ? OR runner = 'default' OR runner IS NULL OR runner = '') ORDER BY created_at ASC LIMIT 1"
+  // Recover work stranded on offline runners before handing out anything new.
+  await reclaimStaleJobs(c.env, nowSecs);
+
+  // Load balancing: refuse a new job if this runner is already at capacity.
+  const load = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM scan_jobs WHERE status = 'running' AND assigned_runner = ?"
   ).bind(runner).first();
-  
+  if (load && load.n >= slots) {
+    return c.json({ job: null, reason: 'at_capacity' });
+  }
+
+  // Pick the next dispatchable job:
+  //  - eligible now (retry backoff elapsed),
+  //  - addressed to this runner or unpinned,
+  //  - region matches this runner's country or is unpinned,
+  //  - ordered by priority, then region-locality, then age.
+  const job = await c.env.DB.prepare(
+    "SELECT * FROM scan_jobs WHERE status = 'pending' " +
+    "AND next_eligible_at <= ? " +
+    "AND (runner = ? OR runner = 'default' OR runner IS NULL OR runner = '') " +
+    "AND (region IS NULL OR region = '' OR region = ?) " +
+    "ORDER BY priority DESC, CASE WHEN region = ? THEN 0 ELSE 1 END, created_at ASC LIMIT 1"
+  ).bind(nowSecs, runner, country, country).first();
+
   if (!job) {
     return c.json({ job: null });
   }
 
-  // Mark as running
-  await c.env.DB.prepare(
-    "UPDATE scan_jobs SET status = 'running', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
-  ).bind(job.id).run();
+  // Atomic claim: only succeeds if the row is still pending, so two runners
+  // racing for the same job cannot both win it.
+  const claim = await c.env.DB.prepare(
+    "UPDATE scan_jobs SET status = 'running', assigned_runner = ?, started_at = ?, " +
+    "attempts = attempts + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') " +
+    "WHERE id = ? AND status = 'pending'"
+  ).bind(runner, nowSecs, job.id).run();
 
+  if (!claim.meta || claim.meta.changes !== 1) {
+    // Lost the race; the runner will poll again shortly.
+    return c.json({ job: null, reason: 'contended' });
+  }
+
+  job.status = 'running';
+  job.assigned_runner = runner;
+  job.attempts = (job.attempts || 0) + 1;
   return c.json({ job });
+});
+
+// Lightweight keepalive so a runner busy on a long job stays "online" and its
+// in-flight work is not wrongly reclaimed. Also refreshes the running job's lease.
+app.get('/api/runner/heartbeat', async (c) => {
+  const runner = c.req.query('runner') || 'default';
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('x-real-ip') || '127.0.0.1';
+  const country = c.req.header('cf-ipcountry') || 'US';
+  await c.env.DB.prepare(
+    "INSERT INTO runners (name, ip, country, last_seen) VALUES (?, ?, ?, ?) " +
+    "ON CONFLICT(name) DO UPDATE SET ip = excluded.ip, country = excluded.country, last_seen = excluded.last_seen"
+  ).bind(runner, ip, country, nowSecs).run();
+  return c.json({ success: true, ts: nowSecs });
 });
 
 app.post('/api/runner/log', async (c) => {
@@ -3786,8 +3896,27 @@ app.post('/api/runner/log', async (c) => {
 
 app.post('/api/runner/status', async (c) => {
   const { id, status } = await c.req.json();
+  const nowSecs = Math.floor(Date.now() / 1000);
+
+  // On failure, retry with jittered backoff until max_attempts is exhausted.
+  if (status === 'failed') {
+    const job = await c.env.DB.prepare(
+      "SELECT attempts, max_attempts FROM scan_jobs WHERE id = ?"
+    ).bind(id).first();
+
+    if (job && job.attempts < job.max_attempts) {
+      await c.env.DB.prepare(
+        "UPDATE scan_jobs SET status = 'pending', assigned_runner = NULL, started_at = NULL, " +
+        "next_eligible_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
+      ).bind(nowSecs + retryDelaySecs(job.attempts), id).run();
+      return c.json({ success: true, requeued: true, attempts: job.attempts, max_attempts: job.max_attempts });
+    }
+  }
+
+  // Terminal state (completed, or failed with no attempts left): release the lease.
   await c.env.DB.prepare(
-    "UPDATE scan_jobs SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
+    "UPDATE scan_jobs SET status = ?, assigned_runner = NULL, " +
+    "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
   ).bind(status, id).run();
   return c.json({ success: true });
 });

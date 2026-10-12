@@ -1994,12 +1994,14 @@ tui_daemon_runner() {
 
     python3 "$SCRIPT_DIR/db_sqlite.py" init >/dev/null 2>&1
     local keep_running=true
-    trap 'keep_running=false; log_info "\nDaemon stopped by user."; return' INT
+    runner_start_heartbeat
+    trap 'keep_running=false; runner_stop_heartbeat; log_info "\nDaemon stopped by user."; return' INT
 
     while [ "$keep_running" = true ]; do
         runner_poll_for_jobs
         sleep 5
     done
+    runner_stop_heartbeat
     trap - INT
 }
 
@@ -2220,6 +2222,28 @@ runner_update_status() {
     fi
 
     python3 "$SCRIPT_DIR/db_sqlite.py" update_status "$job_id" "$status" >/dev/null 2>&1
+}
+
+# Background keepalive: while the daemon is up (including during a long-running
+# job that blocks the poll loop), ping the backend so this runner stays marked
+# online and its in-flight job is not reclaimed and re-dispatched elsewhere.
+HEARTBEAT_PID=""
+runner_start_heartbeat() {
+    [ -z "$BACKEND_URL" ] && return
+    (
+        while true; do
+            curl -s "${BACKEND_URL}/api/runner/heartbeat?runner=${RUNNER_NAME}" >/dev/null 2>&1
+            sleep 30
+        done
+    ) &
+    HEARTBEAT_PID=$!
+}
+runner_stop_heartbeat() {
+    if [ -n "$HEARTBEAT_PID" ]; then
+        kill "$HEARTBEAT_PID" >/dev/null 2>&1
+        wait "$HEARTBEAT_PID" 2>/dev/null
+        HEARTBEAT_PID=""
+    fi
 }
 
 runner_poll_for_jobs() {
@@ -2499,7 +2523,8 @@ main() {
     log_info "Runner Name: $RUNNER_NAME"
 
     python3 "$SCRIPT_DIR/db_sqlite.py" init >/dev/null 2>&1
-    trap 'log_info "\nExiting..."; exit 0' INT
+    runner_start_heartbeat
+    trap 'runner_stop_heartbeat; log_info "\nExiting..."; exit 0' INT
 
     while true; do
         runner_poll_for_jobs
