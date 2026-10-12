@@ -17,6 +17,14 @@ fi
 export BACKEND_URL
 export GRAPHQL_ENDPOINT
 
+# Optional runner auth: when RUNNER_TOKEN is set in .env it is sent with every
+# call to the central queue so the backend can reject unregistered runners.
+# Left empty, the runner stays compatible with backends that don't enforce it.
+RUNNER_AUTH_HEADER=()
+if [ -n "$RUNNER_TOKEN" ]; then
+    RUNNER_AUTH_HEADER=(-H "X-Runner-Token: $RUNNER_TOKEN")
+fi
+
 # Concurrency & thread settings (can be overridden by env, .env, or -t/--threads)
 THREADS="${THREADS:-50}"
 
@@ -2330,6 +2338,7 @@ runner_send_log() {
         payload=$(jq -n --arg id "$job_id" --arg log "$log_data" '{id: $id, log: $log}')
         curl -s -X POST "$BACKEND_URL/api/runner/log" \
             -H "Content-Type: application/json" \
+            "${RUNNER_AUTH_HEADER[@]}" \
             -d "$payload" >/dev/null 2>&1
     fi
 
@@ -2356,6 +2365,7 @@ runner_update_status() {
         fi
         curl -s -X POST "$BACKEND_URL/api/runner/status" \
             -H "Content-Type: application/json" \
+            "${RUNNER_AUTH_HEADER[@]}" \
             -d "$payload" >/dev/null 2>&1
     fi
 
@@ -2404,7 +2414,7 @@ audit_scan_start() {
 runner_poll_for_jobs() {
     local url="${BACKEND_URL}/api/runner/next-job?runner=${RUNNER_NAME}"
     local res
-    res=$(curl -s "$url")
+    res=$(curl -s "${RUNNER_AUTH_HEADER[@]}" "$url")
     if [ -z "$res" ]; then
         return
     fi

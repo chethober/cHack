@@ -5,7 +5,7 @@ import { makeExecutableSchema } from '@graphql-tools/schema';
 import { GraphQLJSON } from 'graphql-type-json';
 import { DateTimeResolver } from 'graphql-scalars';
 import { Bot, webhookCallback } from 'grammy';
-import { GraphQLScalarType, Kind } from 'graphql';
+import { GraphQLScalarType, Kind, GraphQLError } from 'graphql';
 
 // ----------------------------------------------------
 // BigInt Custom Resolver
@@ -234,7 +234,161 @@ const typeDefs = `
     banner: String
   }
 
+  # ---- Team workflows ----
+  type ApiToken {
+    id: ID!
+    user_id: ID
+    name: String!
+    role: String!
+    revoked: Boolean!
+    last_used_at: DateTime
+    created_at: DateTime!
+    token: String   # plaintext, returned only once at creation
+    user: User
+  }
+
+  type Campaign {
+    id: ID!
+    name: String!
+    slug: String
+    owner_user_id: ID
+    company_id: ID
+    kind: String!
+    status: String!
+    authorized: Boolean!
+    scope: JSON!
+    description: String
+    data: JSON!
+    created_at: DateTime!
+    updated_at: DateTime!
+    owner: User
+    company: Company
+    members: [CampaignMember!]!
+    targetGroups: [TargetGroup!]!
+    playbooks: [Playbook!]!
+  }
+
+  type CampaignMember {
+    campaign_id: ID!
+    user_id: ID!
+    role: String!
+    created_at: DateTime!
+    user: User
+  }
+
+  type TargetGroup {
+    id: ID!
+    campaign_id: ID
+    name: String!
+    owner_user_id: ID
+    visibility: String!
+    description: String
+    data: JSON!
+    created_at: DateTime!
+    updated_at: DateTime!
+    domains: [Domain!]!
+    campaign: Campaign
+  }
+
+  type JobTemplate {
+    id: ID!
+    name: String!
+    slug: String
+    owner_user_id: ID
+    visibility: String!
+    command_template: String!
+    phases: JSON!
+    default_flags: JSON!
+    runner: String
+    description: String
+    data: JSON!
+    created_at: DateTime!
+    updated_at: DateTime!
+  }
+
+  type Playbook {
+    id: ID!
+    name: String!
+    slug: String
+    campaign_id: ID
+    owner_user_id: ID
+    visibility: String!
+    description: String
+    data: JSON!
+    created_at: DateTime!
+    updated_at: DateTime!
+    steps: [PlaybookStep!]!
+    campaign: Campaign
+  }
+
+  type PlaybookStep {
+    id: ID!
+    playbook_id: ID!
+    step_order: Int!
+    template_id: ID
+    phase: String
+    params: JSON!
+    created_at: DateTime!
+    template: JobTemplate
+  }
+
+  type RunResult {
+    jobIds: [ID!]!
+    count: Int!
+  }
+
+  input CampaignInput {
+    name: String!
+    slug: String
+    owner_user_id: ID
+    company_id: ID
+    kind: String
+    status: String
+    authorized: Boolean
+    scope: JSON
+    description: String
+    data: JSON
+  }
+
+  input TargetGroupInput {
+    name: String!
+    campaign_id: ID
+    owner_user_id: ID
+    visibility: String
+    description: String
+    data: JSON
+  }
+
+  input JobTemplateInput {
+    name: String!
+    slug: String
+    command_template: String!
+    phases: JSON
+    default_flags: JSON
+    runner: String
+    visibility: String
+    description: String
+    data: JSON
+  }
+
+  input PlaybookInput {
+    name: String!
+    slug: String
+    campaign_id: ID
+    visibility: String
+    description: String
+    data: JSON
+  }
+
+  input PlaybookStepInput {
+    step_order: Int!
+    template_id: ID
+    phase: String
+    params: JSON
+  }
+
   type Query {
+    me: User
     user(id: ID, username: String, number_id: BigInt): User
     users: [User!]!
 
@@ -267,6 +421,18 @@ const typeDefs = `
     endpoints(domain: String, limit: Int): [Endpoint!]!
     networkServices(domain: String): [NetworkService!]!
     domainReport(domain: String!): JSON!
+
+    # Team workflows
+    campaigns(status: String, kind: String): [Campaign!]!
+    campaign(id: ID!): Campaign
+    campaignBySlug(slug: String!): Campaign
+    targetGroups(campaignId: ID): [TargetGroup!]!
+    targetGroup(id: ID!): TargetGroup
+    jobTemplates: [JobTemplate!]!
+    jobTemplate(id: ID!): JobTemplate
+    playbooks(campaignId: ID): [Playbook!]!
+    playbook(id: ID!): Playbook
+    apiTokens: [ApiToken!]!
   }
 
   type Mutation {
@@ -298,6 +464,36 @@ const typeDefs = `
     createEndpointsBatch(domain: String!, endpoints: [EndpointInput!]!): Boolean!
     createSecretsBatch(domain: String!, secrets: [SecretInput!]!): Boolean!
     createNetworkServicesBatch(domain: String!, services: [NetworkServiceInput!]!): Boolean!
+
+    # ---- Team workflows ----
+    createApiToken(userId: ID, name: String!, role: String): ApiToken!
+    revokeApiToken(id: ID!): Boolean!
+
+    createCampaign(input: CampaignInput!): Campaign!
+    updateCampaign(id: ID!, input: CampaignInput!): Campaign!
+    deleteCampaign(id: ID!): Boolean!
+    setCampaignStatus(id: ID!, status: String!): Campaign!
+    addCampaignMember(campaignId: ID!, userId: ID!, role: String): CampaignMember!
+    removeCampaignMember(campaignId: ID!, userId: ID!): Boolean!
+
+    createTargetGroup(input: TargetGroupInput!): TargetGroup!
+    updateTargetGroup(id: ID!, input: TargetGroupInput!): TargetGroup!
+    deleteTargetGroup(id: ID!): Boolean!
+    addDomainToGroup(groupId: ID!, domainId: ID!): Boolean!
+    removeDomainFromGroup(groupId: ID!, domainId: ID!): Boolean!
+
+    createJobTemplate(input: JobTemplateInput!): JobTemplate!
+    updateJobTemplate(id: ID!, input: JobTemplateInput!): JobTemplate!
+    deleteJobTemplate(id: ID!): Boolean!
+
+    createPlaybook(input: PlaybookInput!): Playbook!
+    updatePlaybook(id: ID!, input: PlaybookInput!): Playbook!
+    deletePlaybook(id: ID!): Boolean!
+    setPlaybookSteps(playbookId: ID!, steps: [PlaybookStepInput!]!): Playbook!
+    bindPlaybookToTarget(playbookId: ID!, domainId: ID, groupId: ID): Boolean!
+
+    runTemplate(templateId: ID!, target: String!, runner: String, senderId: BigInt): RunResult!
+    runPlaybook(playbookId: ID!, target: String, groupId: ID, runner: String, senderId: BigInt): RunResult!
   }
 
   type Subscription {
@@ -332,6 +528,128 @@ const parseJson = (val) => {
   } catch (e) {
     return {};
   }
+};
+
+// Helper to coerce a JSON-array column to an array (default [])
+const parseJsonArray = (val) => {
+  if (Array.isArray(val)) return val;
+  if (val === null || val === undefined) return [];
+  try {
+    const p = JSON.parse(val || '[]');
+    return Array.isArray(p) ? p : [];
+  } catch (e) {
+    return [];
+  }
+};
+
+// ----------------------------------------------------
+// Auth helpers: API-token (Bearer) auth + role enforcement
+// ----------------------------------------------------
+const sha256hex = async (str) => {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+};
+
+const extractToken = (request) => {
+  if (!request || !request.headers) return null;
+  const auth = request.headers.get('authorization');
+  if (auth && /^Bearer\s+/i.test(auth)) return auth.replace(/^Bearer\s+/i, '').trim();
+  const key = request.headers.get('x-api-key');
+  return key ? key.trim() : null;
+};
+
+// Resolve the caller from an API token. Returns { userId, username, role, tokenId } or null.
+const resolveAuth = async (env, request) => {
+  const raw = extractToken(request);
+  if (!raw) return null;
+  try {
+    const hash = await sha256hex(raw);
+    const row = await env.DB.prepare(
+      `SELECT t.id AS token_id, t.role AS token_role, t.revoked,
+              u.id AS user_id, u.role AS user_role, u.username AS username
+       FROM api_tokens t LEFT JOIN users u ON u.id = t.user_id
+       WHERE t.token_hash = ?`
+    ).bind(hash).first();
+    if (!row || row.revoked) return null;
+    // Best-effort last-used stamp; never block the request on it.
+    env.DB.prepare("UPDATE api_tokens SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
+      .bind(row.token_id).run().catch(() => {});
+    // Token role scopes at or below the user's role; fall back to user role.
+    return { userId: row.user_id, username: row.username, role: row.token_role || row.user_role || 'member', tokenId: row.token_id };
+  } catch (e) {
+    console.error('auth resolve error:', e.message);
+    return null;
+  }
+};
+
+// Auth is only enforced when AUTH_ENFORCED=true, so existing single-operator
+// deployments keep working until they provision tokens and opt in.
+const authEnforced = (env) => String(env?.AUTH_ENFORCED || '').toLowerCase() === 'true';
+
+// Role ranking for API-token / GraphQL auth (distinct from the Telegram RBAC
+// ROLE_RANK below, which uses the pending<viewer<operator<admin<superadmin model).
+const TOKEN_ROLE_RANK = { viewer: 1, runner: 1, member: 2, admin: 3 };
+
+// Throw unless the caller meets the minimum role (no-op in bootstrap mode).
+const requireRole = (ctx, min) => {
+  if (!authEnforced(ctx.env)) return;
+  const role = ctx.auth?.role;
+  if (!role) {
+    throw new GraphQLError('Authentication required', { extensions: { code: 'UNAUTHENTICATED' } });
+  }
+  if ((TOKEN_ROLE_RANK[role] || 0) < (TOKEN_ROLE_RANK[min] || 99)) {
+    throw new GraphQLError(`Insufficient role: '${min}' required`, { extensions: { code: 'FORBIDDEN' } });
+  }
+};
+
+// Owner-or-admin check for mutating a specific row (no-op in bootstrap mode).
+const requireOwnerOrAdmin = (ctx, ownerUserId) => {
+  if (!authEnforced(ctx.env)) return;
+  if (ctx.auth?.role === 'admin') return;
+  if (ctx.auth?.userId && ownerUserId && ctx.auth.userId === ownerUserId) return;
+  throw new GraphQLError('Only the owner or an admin may perform this action', { extensions: { code: 'FORBIDDEN' } });
+};
+
+const slugify = (s) => String(s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+
+// Reject targets that could break out of the runner's shell command.
+const assertSafeTarget = (target) => {
+  const t = String(target || '').trim();
+  if (!t || /[;&|`$<>\n\r\\"'\s]/.test(t)) {
+    throw new GraphQLError('Invalid target: empty or contains disallowed characters', { extensions: { code: 'BAD_USER_INPUT' } });
+  }
+  return t;
+};
+
+// Map a playbook phase identifier to the cHack.sh flag that runs it.
+const PHASE_FLAGS = {
+  recon: '-d', full: '-d', vulns: '-d',
+  web: '--web', secrets: '--web',
+  network: '--network', ports: '--network',
+  infogather: '--info-gather', info: '--info-gather',
+};
+const commandForPhase = (phase, target, sender) => {
+  const p = String(phase || 'recon').toLowerCase();
+  const flag = PHASE_FLAGS[p] || `--${p}`;
+  const s = (sender !== undefined && sender !== null && sender !== '') ? ` --sender-id ${sender}` : '';
+  return `${flag} ${target}${s}`.trim();
+};
+
+// Expand a job-template command string, substituting {{target}} / {{sender}}.
+const expandCommandTemplate = (tpl, target, sender) => {
+  let out = String(tpl || '');
+  out = out.replace(/\{\{\s*target\s*\}\}/gi, target != null ? String(target) : '');
+  out = out.replace(/\{\{\s*sender(?:[-_]?id)?\s*\}\}/gi, (sender != null && sender !== '') ? String(sender) : '');
+  return out.replace(/\s+/g, ' ').trim();
+};
+
+// Queue a single scan job and return its id.
+const queueJob = async (env, command, domain, runner) => {
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO scan_jobs (id, command, domain, runner, status) VALUES (?, ?, ?, ?, 'pending')"
+  ).bind(id, command, domain, runner || 'default').run();
+  return id;
 };
 
 const resolvers = {
@@ -625,6 +943,67 @@ const resolvers = {
         secrets,
         services
       };
+    },
+
+    // ---- Team workflows ----
+    me: async (_, __, { env, auth }) => {
+      if (!auth?.userId) return null;
+      return await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(auth.userId).first();
+    },
+    campaigns: async (_, { status, kind }, { env }) => {
+      let q = "SELECT * FROM campaigns WHERE 1=1";
+      const binds = [];
+      if (status) { q += " AND status = ?"; binds.push(status); }
+      if (kind) { q += " AND kind = ?"; binds.push(kind); }
+      q += " ORDER BY created_at DESC";
+      const { results } = await env.DB.prepare(q).bind(...binds).all();
+      return results;
+    },
+    campaign: async (_, { id }, { env }) => {
+      return await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(id).first();
+    },
+    campaignBySlug: async (_, { slug }, { env }) => {
+      return await env.DB.prepare("SELECT * FROM campaigns WHERE slug = ?").bind(slug).first();
+    },
+    targetGroups: async (_, { campaignId }, { env }) => {
+      if (campaignId) {
+        const { results } = await env.DB.prepare(
+          "SELECT * FROM target_groups WHERE campaign_id = ? ORDER BY created_at DESC"
+        ).bind(campaignId).all();
+        return results;
+      }
+      const { results } = await env.DB.prepare("SELECT * FROM target_groups ORDER BY created_at DESC").all();
+      return results;
+    },
+    targetGroup: async (_, { id }, { env }) => {
+      return await env.DB.prepare("SELECT * FROM target_groups WHERE id = ?").bind(id).first();
+    },
+    jobTemplates: async (_, __, { env }) => {
+      const { results } = await env.DB.prepare("SELECT * FROM job_templates ORDER BY created_at DESC").all();
+      return results;
+    },
+    jobTemplate: async (_, { id }, { env }) => {
+      return await env.DB.prepare("SELECT * FROM job_templates WHERE id = ?").bind(id).first();
+    },
+    playbooks: async (_, { campaignId }, { env }) => {
+      if (campaignId) {
+        const { results } = await env.DB.prepare(
+          "SELECT * FROM playbooks WHERE campaign_id = ? ORDER BY created_at DESC"
+        ).bind(campaignId).all();
+        return results;
+      }
+      const { results } = await env.DB.prepare("SELECT * FROM playbooks ORDER BY created_at DESC").all();
+      return results;
+    },
+    playbook: async (_, { id }, { env }) => {
+      return await env.DB.prepare("SELECT * FROM playbooks WHERE id = ?").bind(id).first();
+    },
+    apiTokens: async (_, __, ctx) => {
+      requireRole(ctx, 'admin');
+      const { results } = await ctx.env.DB.prepare(
+        "SELECT id, user_id, name, role, revoked, last_used_at, created_at FROM api_tokens ORDER BY created_at DESC"
+      ).all();
+      return results;
     }
   },
 
@@ -1126,6 +1505,360 @@ const resolvers = {
         await env.DB.batch(statements);
       }
       return true;
+    },
+
+    // ---- Team workflows: API tokens ----
+    createApiToken: async (_, { userId, name, role }, ctx) => {
+      // Bootstrap: allowed without auth until AUTH_ENFORCED=true; then admin-only.
+      requireRole(ctx, 'admin');
+      const { env, auth } = ctx;
+      const tokenRole = role || 'member';
+      if (!TOKEN_ROLE_RANK[tokenRole]) {
+        throw new GraphQLError(`Invalid role '${tokenRole}'`, { extensions: { code: 'BAD_USER_INPUT' } });
+      }
+      const uid = userId || auth?.userId || null;
+      // 32 random bytes, hex-encoded, prefixed so it's recognizable in configs.
+      const rawBytes = crypto.getRandomValues(new Uint8Array(32));
+      const raw = 'chk_' + [...rawBytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+      const hash = await sha256hex(raw);
+      const id = crypto.randomUUID();
+      const row = await env.DB.prepare(
+        `INSERT INTO api_tokens (id, user_id, name, token_hash, role)
+         VALUES (?, ?, ?, ?, ?)
+         RETURNING id, user_id, name, role, revoked, last_used_at, created_at`
+      ).bind(id, uid, name, hash, tokenRole).first();
+      return { ...row, token: raw }; // plaintext returned only here
+    },
+    revokeApiToken: async (_, { id }, ctx) => {
+      requireRole(ctx, 'admin');
+      const res = await ctx.env.DB.prepare("UPDATE api_tokens SET revoked = 1 WHERE id = ? RETURNING id").bind(id).first();
+      return !!res;
+    },
+
+    // ---- Campaigns ----
+    createCampaign: async (_, { input }, ctx) => {
+      requireRole(ctx, 'member');
+      const { env, auth } = ctx;
+      const id = crypto.randomUUID();
+      const owner = input.owner_user_id || auth?.userId || null;
+      const row = await env.DB.prepare(
+        `INSERT INTO campaigns (id, name, slug, owner_user_id, company_id, kind, status, authorized, scope, description, data)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         RETURNING *`
+      ).bind(
+        id, input.name, input.slug || slugify(input.name), owner, input.company_id || null,
+        input.kind || 'engagement', input.status || 'prospect', input.authorized ? 1 : 0,
+        JSON.stringify(input.scope || {}), input.description || null, JSON.stringify(input.data || {})
+      ).first();
+      // Owner becomes the campaign lead.
+      if (owner) {
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO campaign_members (campaign_id, user_id, role) VALUES (?, ?, 'lead')"
+        ).bind(id, owner).run();
+      }
+      return row;
+    },
+    updateCampaign: async (_, { id, input }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM campaigns WHERE id = ?").bind(id).first();
+      if (!existing) throw new GraphQLError('Campaign not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      let patch = "";
+      const binds = [
+        input.name ?? null, input.slug ?? null, input.company_id ?? null,
+        input.kind ?? null, input.status ?? null,
+        (input.authorized === undefined || input.authorized === null) ? null : (input.authorized ? 1 : 0),
+        input.description ?? null,
+      ];
+      if (input.scope) { patch += ", scope = json_patch(COALESCE(scope,'{}'), ?)"; binds.push(JSON.stringify(input.scope)); }
+      if (input.data) { patch += ", data = json_patch(COALESCE(data,'{}'), ?)"; binds.push(JSON.stringify(input.data)); }
+      binds.push(id);
+      return await ctx.env.DB.prepare(
+        `UPDATE campaigns SET
+           name = COALESCE(?, name), slug = COALESCE(?, slug), company_id = COALESCE(?, company_id),
+           kind = COALESCE(?, kind), status = COALESCE(?, status), authorized = COALESCE(?, authorized),
+           description = COALESCE(?, description)${patch},
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ? RETURNING *`
+      ).bind(...binds).first();
+    },
+    deleteCampaign: async (_, { id }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM campaigns WHERE id = ?").bind(id).first();
+      if (!existing) return false;
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      const res = await ctx.env.DB.prepare("DELETE FROM campaigns WHERE id = ? RETURNING id").bind(id).first();
+      return !!res;
+    },
+    setCampaignStatus: async (_, { id, status }, ctx) => {
+      requireRole(ctx, 'member');
+      return await ctx.env.DB.prepare(
+        "UPDATE campaigns SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? RETURNING *"
+      ).bind(status, id).first();
+    },
+    addCampaignMember: async (_, { campaignId, userId, role }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM campaigns WHERE id = ?").bind(campaignId).first();
+      if (!existing) throw new GraphQLError('Campaign not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      return await ctx.env.DB.prepare(
+        `INSERT INTO campaign_members (campaign_id, user_id, role) VALUES (?, ?, ?)
+         ON CONFLICT(campaign_id, user_id) DO UPDATE SET role = excluded.role
+         RETURNING *`
+      ).bind(campaignId, userId, role || 'member').first();
+    },
+    removeCampaignMember: async (_, { campaignId, userId }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM campaigns WHERE id = ?").bind(campaignId).first();
+      if (!existing) return false;
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      const res = await ctx.env.DB.prepare(
+        "DELETE FROM campaign_members WHERE campaign_id = ? AND user_id = ? RETURNING user_id"
+      ).bind(campaignId, userId).first();
+      return !!res;
+    },
+
+    // ---- Target groups ----
+    createTargetGroup: async (_, { input }, ctx) => {
+      requireRole(ctx, 'member');
+      const id = crypto.randomUUID();
+      const owner = input.owner_user_id || ctx.auth?.userId || null;
+      return await ctx.env.DB.prepare(
+        `INSERT INTO target_groups (id, campaign_id, name, owner_user_id, visibility, description, data)
+         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`
+      ).bind(id, input.campaign_id || null, input.name, owner, input.visibility || 'team',
+             input.description || null, JSON.stringify(input.data || {})).first();
+    },
+    updateTargetGroup: async (_, { id, input }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM target_groups WHERE id = ?").bind(id).first();
+      if (!existing) throw new GraphQLError('Target group not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      let patch = "";
+      const binds = [input.name ?? null, input.campaign_id ?? null, input.visibility ?? null, input.description ?? null];
+      if (input.data) { patch += ", data = json_patch(COALESCE(data,'{}'), ?)"; binds.push(JSON.stringify(input.data)); }
+      binds.push(id);
+      return await ctx.env.DB.prepare(
+        `UPDATE target_groups SET
+           name = COALESCE(?, name), campaign_id = COALESCE(?, campaign_id),
+           visibility = COALESCE(?, visibility), description = COALESCE(?, description)${patch},
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ? RETURNING *`
+      ).bind(...binds).first();
+    },
+    deleteTargetGroup: async (_, { id }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM target_groups WHERE id = ?").bind(id).first();
+      if (!existing) return false;
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      const res = await ctx.env.DB.prepare("DELETE FROM target_groups WHERE id = ? RETURNING id").bind(id).first();
+      return !!res;
+    },
+    addDomainToGroup: async (_, { groupId, domainId }, ctx) => {
+      requireRole(ctx, 'member');
+      await ctx.env.DB.prepare(
+        "INSERT OR IGNORE INTO target_group_members (group_id, domain_id, added_by) VALUES (?, ?, ?)"
+      ).bind(groupId, domainId, ctx.auth?.userId || null).run();
+      return true;
+    },
+    removeDomainFromGroup: async (_, { groupId, domainId }, ctx) => {
+      requireRole(ctx, 'member');
+      const res = await ctx.env.DB.prepare(
+        "DELETE FROM target_group_members WHERE group_id = ? AND domain_id = ? RETURNING domain_id"
+      ).bind(groupId, domainId).first();
+      return !!res;
+    },
+
+    // ---- Job templates ----
+    createJobTemplate: async (_, { input }, ctx) => {
+      requireRole(ctx, 'member');
+      const id = crypto.randomUUID();
+      const owner = ctx.auth?.userId || null;
+      return await ctx.env.DB.prepare(
+        `INSERT INTO job_templates (id, name, slug, owner_user_id, visibility, command_template, phases, default_flags, runner, description, data)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
+      ).bind(
+        id, input.name, input.slug || slugify(input.name), owner, input.visibility || 'team',
+        input.command_template, JSON.stringify(input.phases || []), JSON.stringify(input.default_flags || {}),
+        input.runner || 'default', input.description || null, JSON.stringify(input.data || {})
+      ).first();
+    },
+    updateJobTemplate: async (_, { id, input }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM job_templates WHERE id = ?").bind(id).first();
+      if (!existing) throw new GraphQLError('Job template not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      let patch = "";
+      const binds = [input.name ?? null, input.slug ?? null, input.visibility ?? null,
+                     input.command_template ?? null, input.runner ?? null, input.description ?? null];
+      if (input.phases) { patch += ", phases = ?"; binds.push(JSON.stringify(input.phases)); }
+      if (input.default_flags) { patch += ", default_flags = json_patch(COALESCE(default_flags,'{}'), ?)"; binds.push(JSON.stringify(input.default_flags)); }
+      if (input.data) { patch += ", data = json_patch(COALESCE(data,'{}'), ?)"; binds.push(JSON.stringify(input.data)); }
+      binds.push(id);
+      return await ctx.env.DB.prepare(
+        `UPDATE job_templates SET
+           name = COALESCE(?, name), slug = COALESCE(?, slug), visibility = COALESCE(?, visibility),
+           command_template = COALESCE(?, command_template), runner = COALESCE(?, runner),
+           description = COALESCE(?, description)${patch},
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ? RETURNING *`
+      ).bind(...binds).first();
+    },
+    deleteJobTemplate: async (_, { id }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM job_templates WHERE id = ?").bind(id).first();
+      if (!existing) return false;
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      const res = await ctx.env.DB.prepare("DELETE FROM job_templates WHERE id = ? RETURNING id").bind(id).first();
+      return !!res;
+    },
+
+    // ---- Playbooks ----
+    createPlaybook: async (_, { input }, ctx) => {
+      requireRole(ctx, 'member');
+      const id = crypto.randomUUID();
+      const owner = ctx.auth?.userId || null;
+      return await ctx.env.DB.prepare(
+        `INSERT INTO playbooks (id, name, slug, campaign_id, owner_user_id, visibility, description, data)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
+      ).bind(id, input.name, input.slug || slugify(input.name), input.campaign_id || null, owner,
+             input.visibility || 'team', input.description || null, JSON.stringify(input.data || {})).first();
+    },
+    updatePlaybook: async (_, { id, input }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM playbooks WHERE id = ?").bind(id).first();
+      if (!existing) throw new GraphQLError('Playbook not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      let patch = "";
+      const binds = [input.name ?? null, input.slug ?? null, input.campaign_id ?? null, input.visibility ?? null, input.description ?? null];
+      if (input.data) { patch += ", data = json_patch(COALESCE(data,'{}'), ?)"; binds.push(JSON.stringify(input.data)); }
+      binds.push(id);
+      return await ctx.env.DB.prepare(
+        `UPDATE playbooks SET
+           name = COALESCE(?, name), slug = COALESCE(?, slug), campaign_id = COALESCE(?, campaign_id),
+           visibility = COALESCE(?, visibility), description = COALESCE(?, description)${patch},
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ? RETURNING *`
+      ).bind(...binds).first();
+    },
+    deletePlaybook: async (_, { id }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM playbooks WHERE id = ?").bind(id).first();
+      if (!existing) return false;
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      const res = await ctx.env.DB.prepare("DELETE FROM playbooks WHERE id = ? RETURNING id").bind(id).first();
+      return !!res;
+    },
+    setPlaybookSteps: async (_, { playbookId, steps }, ctx) => {
+      requireRole(ctx, 'member');
+      const pb = await ctx.env.DB.prepare("SELECT * FROM playbooks WHERE id = ?").bind(playbookId).first();
+      if (!pb) throw new GraphQLError('Playbook not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, pb.owner_user_id);
+      const statements = [ctx.env.DB.prepare("DELETE FROM playbook_steps WHERE playbook_id = ?").bind(playbookId)];
+      for (const s of steps) {
+        statements.push(ctx.env.DB.prepare(
+          `INSERT INTO playbook_steps (id, playbook_id, step_order, template_id, phase, params)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).bind(crypto.randomUUID(), playbookId, Number(s.step_order), s.template_id || null,
+               s.phase || null, JSON.stringify(s.params || {})));
+      }
+      await ctx.env.DB.batch(statements);
+      return pb;
+    },
+    bindPlaybookToTarget: async (_, { playbookId, domainId, groupId }, ctx) => {
+      requireRole(ctx, 'member');
+      if (!domainId && !groupId) {
+        throw new GraphQLError('Provide domainId or groupId', { extensions: { code: 'BAD_USER_INPUT' } });
+      }
+      await ctx.env.DB.prepare(
+        "INSERT INTO target_playbooks (id, playbook_id, domain_id, group_id, created_by) VALUES (?, ?, ?, ?, ?)"
+      ).bind(crypto.randomUUID(), playbookId, domainId || null, groupId || null, ctx.auth?.userId || null).run();
+      return true;
+    },
+
+    // ---- Execution: expand templates/playbooks into scan_jobs ----
+    runTemplate: async (_, { templateId, target, runner, senderId }, ctx) => {
+      requireRole(ctx, 'member');
+      const tpl = await ctx.env.DB.prepare("SELECT * FROM job_templates WHERE id = ?").bind(templateId).first();
+      if (!tpl) throw new GraphQLError('Job template not found', { extensions: { code: 'NOT_FOUND' } });
+      const safe = assertSafeTarget(target);
+      const command = expandCommandTemplate(tpl.command_template, safe, senderId != null ? String(senderId) : '');
+      const jobId = await queueJob(ctx.env, command, safe, runner || tpl.runner || 'default');
+      return { jobIds: [jobId], count: 1 };
+    },
+    runPlaybook: async (_, { playbookId, target, groupId, runner, senderId }, ctx) => {
+      requireRole(ctx, 'member');
+      const pb = await ctx.env.DB.prepare("SELECT * FROM playbooks WHERE id = ?").bind(playbookId).first();
+      if (!pb) throw new GraphQLError('Playbook not found', { extensions: { code: 'NOT_FOUND' } });
+
+      // Authorization gate: a playbook tied to a campaign only runs once that
+      // campaign is explicitly marked authorized (signed/in-scope).
+      if (pb.campaign_id) {
+        const camp = await ctx.env.DB.prepare("SELECT authorized FROM campaigns WHERE id = ?").bind(pb.campaign_id).first();
+        if (camp && !camp.authorized) {
+          throw new GraphQLError('Campaign is not marked authorized; refuse to launch scans', { extensions: { code: 'FORBIDDEN' } });
+        }
+      }
+
+      // Resolve the set of targets.
+      let targets = [];
+      if (target) {
+        targets = [assertSafeTarget(target)];
+      } else if (groupId) {
+        const { results } = await ctx.env.DB.prepare(
+          `SELECT d.host FROM target_group_members m JOIN domains d ON d.id = m.domain_id WHERE m.group_id = ?`
+        ).bind(groupId).all();
+        targets = results.map((r) => r.host).filter(Boolean).map(assertSafeTarget);
+      } else {
+        // Fall back to the playbook's bound targets (per-target playbooks).
+        const { results: boundDomains } = await ctx.env.DB.prepare(
+          `SELECT d.host FROM target_playbooks tp JOIN domains d ON d.id = tp.domain_id WHERE tp.playbook_id = ? AND tp.domain_id IS NOT NULL`
+        ).bind(playbookId).all();
+        const { results: boundGroupDomains } = await ctx.env.DB.prepare(
+          `SELECT DISTINCT d.host FROM target_playbooks tp
+             JOIN target_group_members m ON m.group_id = tp.group_id
+             JOIN domains d ON d.id = m.domain_id
+           WHERE tp.playbook_id = ? AND tp.group_id IS NOT NULL`
+        ).bind(playbookId).all();
+        targets = [...boundDomains, ...boundGroupDomains].map((r) => r.host).filter(Boolean).map(assertSafeTarget);
+      }
+
+      if (targets.length === 0) {
+        throw new GraphQLError('No targets resolved for this playbook', { extensions: { code: 'BAD_USER_INPUT' } });
+      }
+
+      const { results: stepRows } = await ctx.env.DB.prepare(
+        "SELECT * FROM playbook_steps WHERE playbook_id = ? ORDER BY step_order ASC"
+      ).bind(playbookId).all();
+      if (stepRows.length === 0) {
+        throw new GraphQLError('Playbook has no steps', { extensions: { code: 'BAD_USER_INPUT' } });
+      }
+
+      // Pre-load any templates referenced by steps.
+      const tplCache = {};
+      for (const st of stepRows) {
+        if (st.template_id && !tplCache[st.template_id]) {
+          tplCache[st.template_id] = await ctx.env.DB.prepare("SELECT * FROM job_templates WHERE id = ?").bind(st.template_id).first();
+        }
+      }
+
+      const sender = senderId != null ? String(senderId) : '';
+      const jobIds = [];
+      for (const t of targets) {
+        for (const st of stepRows) {
+          let command;
+          let stepRunner = runner || 'default';
+          if (st.template_id && tplCache[st.template_id]) {
+            const tpl = tplCache[st.template_id];
+            command = expandCommandTemplate(tpl.command_template, t, sender);
+            stepRunner = runner || tpl.runner || 'default';
+          } else {
+            command = commandForPhase(st.phase, t, sender);
+          }
+          jobIds.push(await queueJob(ctx.env, command, t, stepRunner));
+        }
+      }
+      return { jobIds, count: jobIds.length };
     }
   },
 
@@ -1161,6 +1894,84 @@ const resolvers = {
     creator: async (parent, __, { env }) => {
       if (!parent.created_by) return null;
       return await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(parent.created_by).first();
+    },
+  },
+
+  // ---- Team-workflow relationship resolvers ----
+  ApiToken: {
+    revoked: (parent) => !!parent.revoked,
+    user: async (parent, __, { env }) => {
+      if (!parent.user_id) return null;
+      return await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(parent.user_id).first();
+    },
+  },
+  Campaign: {
+    authorized: (parent) => !!parent.authorized,
+    scope: (parent) => parseJson(parent.scope),
+    data: (parent) => parseJson(parent.data),
+    owner: async (parent, __, { env }) => {
+      if (!parent.owner_user_id) return null;
+      return await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(parent.owner_user_id).first();
+    },
+    company: async (parent, __, { env }) => {
+      if (!parent.company_id) return null;
+      return await env.DB.prepare("SELECT * FROM companies WHERE id = ?").bind(parent.company_id).first();
+    },
+    members: async (parent, __, { env }) => {
+      const { results } = await env.DB.prepare("SELECT * FROM campaign_members WHERE campaign_id = ?").bind(parent.id).all();
+      return results;
+    },
+    targetGroups: async (parent, __, { env }) => {
+      const { results } = await env.DB.prepare("SELECT * FROM target_groups WHERE campaign_id = ? ORDER BY created_at DESC").bind(parent.id).all();
+      return results;
+    },
+    playbooks: async (parent, __, { env }) => {
+      const { results } = await env.DB.prepare("SELECT * FROM playbooks WHERE campaign_id = ? ORDER BY created_at DESC").bind(parent.id).all();
+      return results;
+    },
+  },
+  CampaignMember: {
+    user: async (parent, __, { env }) => {
+      if (!parent.user_id) return null;
+      return await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(parent.user_id).first();
+    },
+  },
+  TargetGroup: {
+    data: (parent) => parseJson(parent.data),
+    domains: async (parent, __, { env }) => {
+      const { results } = await env.DB.prepare(
+        `SELECT d.* FROM target_group_members m JOIN domains d ON d.id = m.domain_id WHERE m.group_id = ?`
+      ).bind(parent.id).all();
+      return results;
+    },
+    campaign: async (parent, __, { env }) => {
+      if (!parent.campaign_id) return null;
+      return await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(parent.campaign_id).first();
+    },
+  },
+  JobTemplate: {
+    phases: (parent) => parseJsonArray(parent.phases),
+    default_flags: (parent) => parseJson(parent.default_flags),
+    data: (parent) => parseJson(parent.data),
+  },
+  Playbook: {
+    data: (parent) => parseJson(parent.data),
+    steps: async (parent, __, { env }) => {
+      const { results } = await env.DB.prepare(
+        "SELECT * FROM playbook_steps WHERE playbook_id = ? ORDER BY step_order ASC"
+      ).bind(parent.id).all();
+      return results;
+    },
+    campaign: async (parent, __, { env }) => {
+      if (!parent.campaign_id) return null;
+      return await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(parent.campaign_id).first();
+    },
+  },
+  PlaybookStep: {
+    params: (parent) => parseJson(parent.params),
+    template: async (parent, __, { env }) => {
+      if (!parent.template_id) return null;
+      return await env.DB.prepare("SELECT * FROM job_templates WHERE id = ?").bind(parent.template_id).first();
     },
   },
   Subscription: {
@@ -1200,7 +2011,14 @@ const schema = makeExecutableSchema({ typeDefs, resolvers });
 const yoga = createYoga({
   schema,
   landingPage: false,
-  graphqlEndpoint: '/graphql'
+  graphqlEndpoint: '/graphql',
+  // Resolve the caller's API token (if any) into ctx.auth for every operation.
+  context: async (initialContext) => {
+    const env = initialContext.env;
+    const request = initialContext.request;
+    const auth = env ? await resolveAuth(env, request) : null;
+    return { ...initialContext, env, auth };
+  }
 });
 
 // ----------------------------------------------------
@@ -2840,6 +3658,115 @@ const getBot = (env) => {
     await ctx.reply(`📜 <b>Audit Log</b> (last ${rows.length})\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
   });
 
+  // ---- Team workflows ----
+  bot.command(["campaigns", "engagements"], async (ctx) => {
+    await registerUser(ctx);
+    const { results } = await env.DB.prepare("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 20").all();
+    if (!results.length) {
+      return await ctx.reply("📋 <b>Campaigns</b>\n\nNone yet. Create one with:\n<code>/newcampaign Acme Pentest | engagement</code>", { parse_mode: "HTML" });
+    }
+    const statusBadge = { prospect: "🔆", active: "🟢", paused: "⏸️", won: "🏆", lost: "💤", closed: "📦" };
+    const lines = results.map((c) => {
+      const b = statusBadge[c.status] || "•";
+      const auth = c.authorized ? "🔓 authorized" : "🔒 unauthorized";
+      return `${b} <b>${escapeHtml(c.name)}</b> <code>${escapeHtml(c.slug || c.id)}</code>\n   ${escapeHtml(c.kind)} · ${escapeHtml(c.status)} · ${auth}`;
+    });
+    await ctx.reply(`📋 <b>Campaigns (${results.length})</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  bot.command(["newcampaign", "newengagement"], async (ctx) => {
+    await registerUser(ctx);
+    const raw = (ctx.match || "").trim();
+    if (!raw) {
+      return await ctx.reply("Usage: <code>/newcampaign &lt;name&gt; | &lt;engagement|acquisition&gt;</code>", { parse_mode: "HTML" });
+    }
+    const [namePart, kindPart] = raw.split("|").map((s) => s.trim());
+    const kind = (kindPart || "engagement").toLowerCase() === "acquisition" ? "acquisition" : "engagement";
+    const userRow = await env.DB.prepare("SELECT id FROM users WHERE number_id = ?").bind(ctx.from.id).first();
+    const id = crypto.randomUUID();
+    const slug = slugify(namePart);
+    await env.DB.prepare(
+      `INSERT INTO campaigns (id, name, slug, owner_user_id, kind, status) VALUES (?, ?, ?, ?, ?, 'prospect')`
+    ).bind(id, namePart, slug, userRow?.id || null, kind).run();
+    if (userRow?.id) {
+      await env.DB.prepare("INSERT OR IGNORE INTO campaign_members (campaign_id, user_id, role) VALUES (?, ?, 'lead')").bind(id, userRow.id).run();
+    }
+    await ctx.reply(`✅ Campaign created: <b>${escapeHtml(namePart)}</b> (<code>${escapeHtml(slug)}</code>, ${kind}).\n\n⚠️ Mark it authorized before running playbooks against its scope.`, { parse_mode: "HTML" });
+  });
+
+  bot.command(["groups", "targetgroups"], async (ctx) => {
+    await registerUser(ctx);
+    const { results } = await env.DB.prepare(
+      `SELECT g.*, (SELECT COUNT(*) FROM target_group_members m WHERE m.group_id = g.id) AS n
+       FROM target_groups g ORDER BY g.created_at DESC LIMIT 20`
+    ).all();
+    if (!results.length) return await ctx.reply("🎯 <b>Target groups</b>\n\nNone yet.", { parse_mode: "HTML" });
+    const lines = results.map((g) => `🎯 <b>${escapeHtml(g.name)}</b> <code>${escapeHtml(g.id)}</code>\n   ${g.n} target(s) · ${escapeHtml(g.visibility)}`);
+    await ctx.reply(`🎯 <b>Target groups (${results.length})</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  bot.command("templates", async (ctx) => {
+    await registerUser(ctx);
+    const { results } = await env.DB.prepare("SELECT * FROM job_templates ORDER BY created_at DESC LIMIT 20").all();
+    if (!results.length) return await ctx.reply("🧩 <b>Job templates</b>\n\nNone yet.", { parse_mode: "HTML" });
+    const lines = results.map((t) => `🧩 <b>${escapeHtml(t.name)}</b> <code>${escapeHtml(t.slug || t.id)}</code>\n   <code>${escapeHtml(t.command_template)}</code>`);
+    await ctx.reply(`🧩 <b>Job templates (${results.length})</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  bot.command("playbooks", async (ctx) => {
+    await registerUser(ctx);
+    const { results } = await env.DB.prepare(
+      `SELECT p.*, (SELECT COUNT(*) FROM playbook_steps s WHERE s.playbook_id = p.id) AS steps
+       FROM playbooks p ORDER BY p.created_at DESC LIMIT 20`
+    ).all();
+    if (!results.length) return await ctx.reply("📘 <b>Playbooks</b>\n\nNone yet.", { parse_mode: "HTML" });
+    const lines = results.map((p) => `📘 <b>${escapeHtml(p.name)}</b> <code>${escapeHtml(p.slug || p.id)}</code>\n   ${p.steps} step(s)`);
+    await ctx.reply(`📘 <b>Playbooks (${results.length})</b>\n\nRun one with <code>/runplaybook &lt;slug&gt; &lt;target&gt;</code>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  bot.command("runplaybook", async (ctx) => {
+    await registerUser(ctx);
+    const parts = (ctx.match || "").trim().split(/\s+/).filter(Boolean);
+    if (parts.length < 2) {
+      return await ctx.reply("Usage: <code>/runplaybook &lt;playbook-slug-or-id&gt; &lt;target&gt;</code>", { parse_mode: "HTML" });
+    }
+    const [ref, target] = parts;
+    let safeTarget;
+    try {
+      safeTarget = assertSafeTarget(target);
+    } catch (e) {
+      return await ctx.reply("🛑 Invalid target: it must be a bare host/domain with no spaces or shell characters.");
+    }
+    const pb = await env.DB.prepare("SELECT * FROM playbooks WHERE id = ? OR slug = ?").bind(ref, ref).first();
+    if (!pb) return await ctx.reply(`🛑 Playbook not found: <code>${escapeHtml(ref)}</code>`, { parse_mode: "HTML" });
+
+    if (pb.campaign_id) {
+      const camp = await env.DB.prepare("SELECT name, authorized FROM campaigns WHERE id = ?").bind(pb.campaign_id).first();
+      if (camp && !camp.authorized) {
+        return await ctx.reply(`🔒 Campaign <b>${escapeHtml(camp.name)}</b> is not marked authorized. Refusing to launch scans until scope is confirmed.`, { parse_mode: "HTML" });
+      }
+    }
+
+    const { results: steps } = await env.DB.prepare(
+      "SELECT * FROM playbook_steps WHERE playbook_id = ? ORDER BY step_order ASC"
+    ).bind(pb.id).all();
+    if (!steps.length) return await ctx.reply("🛑 This playbook has no steps yet.");
+
+    const sender = String(ctx.from.id);
+    const jobIds = [];
+    for (const st of steps) {
+      let command;
+      let runner = 'default';
+      if (st.template_id) {
+        const tpl = await env.DB.prepare("SELECT * FROM job_templates WHERE id = ?").bind(st.template_id).first();
+        if (tpl) { command = expandCommandTemplate(tpl.command_template, safeTarget, sender); runner = tpl.runner || 'default'; }
+      }
+      if (!command) command = commandForPhase(st.phase, safeTarget, sender);
+      jobIds.push(await queueJob(env, command, safeTarget, runner));
+    }
+    await ctx.reply(`🚀 Queued <b>${jobIds.length}</b> job(s) from <b>${escapeHtml(pb.name)}</b> against <code>${escapeHtml(safeTarget)}</code>.\n\nTrack them with /queue.`, { parse_mode: "HTML" });
+  });
+
   bot.command("help", async (ctx) => {
     await ctx.reply(
       `📖 <b>cHack Bot Command & Management Guide</b>\n\n` +
@@ -2881,6 +3808,13 @@ const getBot = (env) => {
       `• <code>/revoke &lt;id&gt; &lt;company&gt;</code> - Remove from team <i>(admin)</i>\n` +
       `• <code>/members [company]</code> - List team memberships <i>(admin)</i>\n` +
       `• <code>/audit [n]</code> - Recent audit log <i>(admin)</i>\n\n` +
+      `<b>Team Workflows:</b>\n` +
+      `• <code>/campaigns</code> - List client/acquisition campaigns\n` +
+      `• <code>/newcampaign &lt;name&gt; | &lt;kind&gt;</code> - Create a campaign\n` +
+      `• <code>/groups</code> - List shared target groups\n` +
+      `• <code>/templates</code> - List job templates\n` +
+      `• <code>/playbooks</code> - List per-target playbooks\n` +
+      `• <code>/runplaybook &lt;slug&gt; &lt;target&gt;</code> - Expand a playbook into jobs\n\n` +
       `<i>Roles: viewer (read) → operator (scan in-scope) → admin (manage) → superadmin (ADMIN_IDS).</i>`,
       { parse_mode: "HTML" }
     );
@@ -4312,6 +5246,17 @@ const app = new Hono();
 
 app.use('*', cors());
 
+// Runner endpoints accept a shared secret when RUNNER_TOKEN is configured.
+// When it is unset, access stays open so existing deployments keep working.
+const runnerTokenOk = (c) => {
+  const expected = c.env.RUNNER_TOKEN;
+  if (!expected) return true; // bootstrap mode
+  const hdr = c.req.header('x-runner-token') || '';
+  const auth = c.req.header('authorization') || '';
+  const bearer = /^Bearer\s+/i.test(auth) ? auth.replace(/^Bearer\s+/i, '').trim() : '';
+  return hdr === expected || bearer === expected;
+};
+
 // Health Check & DB Migration
 app.get('/', (c) => c.text('cHack Serverless Backend & Bot Running!'));
 app.get('/api/db/migrate', async (c) => {
@@ -4449,6 +5394,135 @@ app.get('/api/db/migrate', async (c) => {
     await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_monitors_due ON monitors(enabled, next_run_at)").run().catch(() => {});
     await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_monitors_owner ON monitors(owner_chat_id)").run().catch(() => {});
 
+    // Team workflows: roles, tokens, campaigns, groups, templates, playbooks.
+    // users.role is unified with the Telegram RBAC model (pending/viewer/
+    // operator/admin + ADMIN_IDS superadmin); API-token auth ranks unknown
+    // roles lowest, so this stays fail-closed.
+    await c.env.DB.prepare("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'pending'").run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS api_tokens (
+        id TEXT PRIMARY KEY,
+        user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        role TEXT NOT NULL DEFAULT 'member',
+        revoked INTEGER NOT NULL DEFAULT 0,
+        last_used_at TEXT,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash)").run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS campaigns (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT UNIQUE,
+        owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        company_id TEXT REFERENCES companies(id) ON DELETE SET NULL,
+        kind TEXT NOT NULL DEFAULT 'engagement',
+        status TEXT NOT NULL DEFAULT 'prospect',
+        authorized INTEGER NOT NULL DEFAULT 0,
+        scope TEXT DEFAULT '{}',
+        description TEXT,
+        data TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS campaign_members (
+        campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL DEFAULT 'member',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (campaign_id, user_id)
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS target_groups (
+        id TEXT PRIMARY KEY,
+        campaign_id TEXT REFERENCES campaigns(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        visibility TEXT NOT NULL DEFAULT 'team',
+        description TEXT,
+        data TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS target_group_members (
+        group_id TEXT NOT NULL REFERENCES target_groups(id) ON DELETE CASCADE,
+        domain_id TEXT NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+        added_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (group_id, domain_id)
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS job_templates (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT UNIQUE,
+        owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        visibility TEXT NOT NULL DEFAULT 'team',
+        command_template TEXT NOT NULL,
+        phases TEXT DEFAULT '[]',
+        default_flags TEXT DEFAULT '{}',
+        runner TEXT DEFAULT 'default',
+        description TEXT,
+        data TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS playbooks (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT UNIQUE,
+        campaign_id TEXT REFERENCES campaigns(id) ON DELETE SET NULL,
+        owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        visibility TEXT NOT NULL DEFAULT 'team',
+        description TEXT,
+        data TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS playbook_steps (
+        id TEXT PRIMARY KEY,
+        playbook_id TEXT NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+        step_order INTEGER NOT NULL,
+        template_id TEXT REFERENCES job_templates(id) ON DELETE SET NULL,
+        phase TEXT,
+        params TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        UNIQUE (playbook_id, step_order)
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS target_playbooks (
+        id TEXT PRIMARY KEY,
+        playbook_id TEXT NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+        domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+        group_id TEXT REFERENCES target_groups(id) ON DELETE CASCADE,
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
     return c.text("D1 Database Migrations applied successfully!");
   } catch (e) {
     return c.text("Migration failed: " + e.message, 500);
@@ -4458,6 +5532,15 @@ app.get('/api/db/migrate', async (c) => {
 app.post('/api/db/reset', async (c) => {
   try {
     const tables = [
+      "target_playbooks",
+      "playbook_steps",
+      "playbooks",
+      "job_templates",
+      "target_group_members",
+      "target_groups",
+      "campaign_members",
+      "campaigns",
+      "api_tokens",
       "findings",
       "secrets",
       "network_services",
@@ -4547,6 +5630,7 @@ async function reclaimStaleJobs(env, nowSecs) {
 }
 
 app.get('/api/runner/next-job', async (c) => {
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
   const runner = c.req.query('runner') || 'default';
   // How many jobs this runner may hold at once (auto-balance: don't pile work on
   // a node that is already busy — let idle nodes pick it up instead).
@@ -4637,6 +5721,7 @@ app.get('/api/runner/heartbeat', async (c) => {
 });
 
 app.post('/api/runner/log', async (c) => {
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
   const { id, log } = await c.req.json();
   await c.env.DB.prepare(
     "UPDATE scan_jobs SET stdout = stdout || ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
@@ -4738,6 +5823,7 @@ async function releaseBlockedJobs(env, pipelineId) {
 }
 
 app.post('/api/runner/status', async (c) => {
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
   const { id, status, result } = await c.req.json();
   const nowSecs = Math.floor(Date.now() / 1000);
   const resultJson = (result === undefined || result === null)
