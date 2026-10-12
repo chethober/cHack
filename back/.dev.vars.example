@@ -1,0 +1,5 @@
+# Cloudflare Worker local secrets — copy to back/.dev.vars and fill in.
+# back/.dev.vars is git-ignored; NEVER commit real tokens.
+TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
+ADMIN_IDS=your_telegram_user_id,another_admin_id
+RUNNERS=VPS-1,VPS-2

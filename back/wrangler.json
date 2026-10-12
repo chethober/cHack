@@ -14,9 +14,7 @@
     }
   ],
   "vars": {
-    "GRAPHQL_ENDPOINT": "https://chack-back.chethober.workers.dev/graphql",
-    "TELEGRAM_BOT_TOKEN": "***REMOVED***",
-    "ADMIN_IDS": "***REMOVED***",
+    "GRAPHQL_ENDPOINT": "https://your-worker.workers.dev/graphql",
     "RUNNERS": "VPS-1,VPS-2"
   }
 }

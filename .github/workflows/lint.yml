@@ -1,0 +1,36 @@
+name: Lint
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        env:
+          # Advisory only for now — the main script predates strict linting.
+          SHELLCHECK_OPTS: -S warning
+        with:
+          scandir: '.'
+          additional_files: 'cHack.sh install.sh'
+
+  python:
+    name: Ruff (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint
+        run: ruff check --output-format=github . || true
+      - name: Syntax check
+        run: python -m py_compile js_secrets.py db_sqlite.py

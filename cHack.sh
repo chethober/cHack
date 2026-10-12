@@ -51,6 +51,15 @@ log_phase() {
     echo -e "\n[PHASE][$timestamp] $1" >> "$LOG_FILE"
 }
 
+count_lines() {
+    local file="$1"
+    if [ -s "$file" ]; then
+        wc -l < "$file" 2>/dev/null || echo 0
+    else
+        echo 0
+    fi
+}
+
 # Required Tools (Imported from Reconner)
 REQUIRED_GO_TOOLS=(
     "subfinder"
@@ -493,7 +502,7 @@ insert_company_and_domains() {
     fi
 
     local active_count
-    active_count=$(wc -l < "$active_subs_file" 2>/dev/null || echo 0)
+    active_count=$(count_lines "$active_subs_file")
     log_info "Inserting $active_count active subdomain(s) into database with parallel workers..."
 
     local db_workers=10
@@ -718,7 +727,7 @@ run_subdomain_enum() {
     fi
 
     local sub_count
-    sub_count=$(wc -l < "$output_dir/subdomains" 2>/dev/null || echo 0)
+    sub_count=$(count_lines "$output_dir/subdomains")
     log_info "Subdomain enumeration completed. Total unique subdomains: $sub_count"
 
     # 3. Subdomain Takeover Check (subzy)
@@ -758,7 +767,7 @@ run_httpx() {
         return
     fi
 
-    log_info "Probing $(wc -l < "$output_dir/subdomains") subdomains with httpx..."
+    log_info "Probing $(count_lines "$output_dir/subdomains") subdomains with httpx..."
 
     local httpx_err
     httpx_err=$(mktemp)
@@ -802,9 +811,9 @@ run_httpx() {
 
     # Extract live hosts and IPs
     jq -r '.url // empty' "$output_dir/httpx.json" | sort -u > "$output_dir/live_hosts"
-    jq -r '.host // empty' "$output_dir/httpx.json" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u > "$output_dir/ips"
+    jq -r '[(.host // empty), (.host_ip // empty), ((.a // [])[])] | .[]' "$output_dir/httpx.json" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u > "$output_dir/ips"
 
-    local live_count=$(wc -l < "$output_dir/live_hosts" 2>/dev/null || echo 0)
+    local live_count=$(count_lines "$output_dir/live_hosts")
     log_info "HTTPX scan completed. Found $live_count live web endpoints."
 
     # Visual Recon (gowitness) if available
@@ -825,10 +834,12 @@ run_naabu() {
     if [ ! -s "$output_dir/ips" ]; then
         log_info "No IPs found to scan. Skipping port scan."
         echo "{}" > "$output_dir/ports.json"
-        return
+        touch "$output_dir/ports"
+        echo "[]" > "$output_dir/network_services.json"
+        return 0
     fi
 
-    local ip_count=$(wc -l < "$output_dir/ips")
+    local ip_count=$(count_lines "$output_dir/ips")
     log_phase "Phase 3: Port Scanning & Service Enumeration (Naabu)"
     log_info "Scanning $ip_count IP addresses..."
 
@@ -919,7 +930,7 @@ run_katana() {
         return
     fi
 
-    log_info "Crawling $(wc -l < "$output_dir/live_hosts") endpoints in parallel (Katana + Gau)..."
+    log_info "Crawling $(count_lines "$output_dir/live_hosts") endpoints in parallel (Katana + Gau)..."
 
     # 1. Katana Crawling & 2. Historical URLs in Parallel
     (
@@ -977,7 +988,7 @@ run_katana() {
         fi
     fi
 
-    log_info "Crawling extracted $(wc -l < "$output_dir/katana_all" 2>/dev/null || echo 0) URLs, $(wc -l < "$output_dir/js_links" 2>/dev/null || echo 0) JS files, and $(wc -l < "$output_dir/params" 2>/dev/null || echo 0) parameterized endpoints."
+    log_info "Crawling extracted $(count_lines "$output_dir/katana_all") URLs, $(count_lines "$output_dir/js_links") JS files, and $(count_lines "$output_dir/params") parameterized endpoints."
 
     # 5. Deep JS Secret & Endpoint Analysis (Multi-threaded)
     if [ -s "$output_dir/js_links" ] && [ -f "$SCRIPT_DIR/js_secrets.py" ]; then
@@ -1044,7 +1055,7 @@ run_content_discovery() {
     mkdir -p "$output_dir/fuzz"
 
     local sensitive_paths="/.env,/.git/HEAD,/swagger.json,/api-docs,/graphql,/backup.sql,/config.php.bak"
-    local live_count=$(wc -l < "$output_dir/live_hosts" 2>/dev/null || echo 0)
+    local live_count=$(count_lines "$output_dir/live_hosts")
     log_info "Scanning exposure across $live_count live host(s) in parallel with httpx (threads: $THREADS)..."
 
     local exposure_raw="$output_dir/fuzz/httpx_exposure.json"
@@ -1105,7 +1116,7 @@ run_nuclei() {
     fi
 
     log_phase "Phase 6: Vulnerability & DAST Scanning (Nuclei + Dalfox)"
-    local host_count=$(wc -l < "$output_dir/live_hosts")
+    local host_count=$(count_lines "$output_dir/live_hosts")
     log_info "Running Nuclei against $host_count targets..."
 
     # 1. Nuclei scanning
@@ -1168,14 +1179,14 @@ run_info_gathering() {
 
     run_subdomain_enum "$domain"
     
-    local sub_count=$(wc -l < "$output_dir/subdomains" 2>/dev/null || echo 0)
+    local sub_count=$(count_lines "$output_dir/subdomains")
     send_telegram_notification "✅ <b>Phase 1: Subdomain Discovery Done</b> for <code>$domain</code> (<b>$sub_count</b> subdomains discovered)"
 
     run_httpx "$domain"
     insert_company_and_domains "$domain"
     update_httpx_results "$domain"
 
-    local live_count=$(wc -l < "$output_dir/live_hosts" 2>/dev/null || echo 0)
+    local live_count=$(count_lines "$output_dir/live_hosts")
     send_telegram_notification "✅ <b>Phase 2: Live HTTP Probing Done</b> for <code>$domain</code> (<b>$live_count</b> active hosts saved)"
 
     # Execute Phase 3 and Phase 4 concurrently in parallel
@@ -1244,7 +1255,7 @@ recon() {
         log_error "Subdomain enumeration failed"
     fi
     
-    local sub_count=$(wc -l < "$output_dir/subdomains" 2>/dev/null || echo 0)
+    local sub_count=$(count_lines "$output_dir/subdomains")
     send_telegram_notification "✅ <b>Phase 1: Subdomain Enumeration Completed</b> for <code>$domain</code>
 • Total subdomains discovered: <b>$sub_count</b>"
 
@@ -1255,7 +1266,7 @@ recon() {
     insert_company_and_domains "$domain"
     update_httpx_results "$domain"
 
-    local live_count=$(wc -l < "$output_dir/live_hosts" 2>/dev/null || echo 0)
+    local live_count=$(count_lines "$output_dir/live_hosts")
     send_telegram_notification "✅ <b>Phase 2: Live HTTP Resolution Completed</b> for <code>$domain</code>
 • Active web endpoints saved: <b>$live_count</b>"
 
@@ -1265,7 +1276,7 @@ recon() {
         if run_naabu "$domain"; then
             update_port_scan_results "$domain"
             update_network_services_results "$domain"
-            local port_count=$(wc -l < "$output_dir/ports" 2>/dev/null || echo 0)
+            local port_count=$(count_lines "$output_dir/ports")
             send_telegram_notification "✅ <b>Phase 3: Port Scan Completed</b> for <code>$domain</code>
 • Open ports: <b>$port_count</b>"
         else

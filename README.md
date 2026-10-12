@@ -2,6 +2,34 @@
 
 An automated, multi-phase reconnaissance and vulnerability assessment platform featuring an interactive TUI, CLI automation, and central Telegram bot orchestration.
 
+> ⚠️ **Authorized use only.** cHack is an offensive security tool. Only run it against
+> systems you own or are explicitly authorized to test (e.g. an in-scope bug-bounty
+> program or a signed engagement). Unauthorized scanning may be illegal. You are solely
+> responsible for how you use it.
+
+---
+
+## 🏗️ Architecture
+
+cHack is a distributed recon system with three parts:
+
+```
+   Telegram ──► Cloudflare Worker ──► D1 (cloud DB)
+   (operator)     (back/, job queue)        ▲
+                         │                   │ sync
+                         ▼                   │
+                  VPS runners  ◄─────────────┘
+                  (cHack.sh --daemon)
+                   └─ local SQLite (local.db) via db_sqlite.py
+```
+
+- **`back/`** — a Cloudflare Worker (grammY Telegram bot + GraphQL) that receives
+  operator commands and holds the central job queue in Cloudflare D1.
+- **`cHack.sh`** — the recon engine. Runs standalone (TUI/CLI) or as a `--daemon`
+  that polls the central queue for jobs and reports results back.
+- **`db_sqlite.py`** — each runner's local SQLite store, synced up to D1.
+- **`js_secrets.py`** — JS secret/credential scanner used by the web-recon phase.
+
 ---
 
 ## ⚡ 1-Liner VPS Install
@@ -87,3 +115,28 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 ADMIN_IDS=your_telegram_id
 RUNNER_NAME=VPS-1
 ```
+
+For the Cloudflare Worker's local secrets, copy the template too:
+
+```bash
+cp back/.dev.vars.example back/.dev.vars
+# then fill in your real token — back/.dev.vars is git-ignored
+```
+
+For a deployed Worker, set the token and admin IDs as **secrets** (never in `wrangler.json`):
+
+```bash
+cd back
+wrangler secret put TELEGRAM_BOT_TOKEN
+wrangler secret put ADMIN_IDS
+```
+
+> 🔒 **Never commit real tokens.** `.env` and `back/.dev.vars` are git-ignored on
+> purpose. If a token is ever committed, revoke it immediately (BotFather `/revoke`)
+> and rotate it — removing the file is not enough once it is in git history.
+
+---
+
+## 📄 License
+
+[MIT](LICENSE) © Cheth
