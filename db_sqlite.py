@@ -1079,6 +1079,191 @@ def get_db_summary():
     conn.close()
     return summary
 
+# Risk scoring: weighted contribution of each open finding/secret by severity.
+SEVERITY_WEIGHTS = {'critical': 10, 'high': 6, 'medium': 3, 'low': 1, 'info': 0}
+
+
+def _redact_secret(snippet):
+    """Mask the middle of a credential match so search results don't leak the
+    raw value. Keeps a few leading/trailing chars for recognisability."""
+    if not snippet:
+        return ""
+    s = str(snippet)
+    if len(s) <= 12:
+        return s[:2] + "***"
+    return s[:4] + "***" + s[-4:]
+
+
+def _risk_scores(conn, min_score=0.0):
+    """Derive a per-target (company) risk score from open findings and secrets.
+
+    No risk column is stored; the score is aggregated on demand as the weighted
+    sum of open findings and secrets by severity. Returns targets ordered by
+    score descending, filtered to score >= min_score.
+    """
+    cursor = conn.cursor()
+    scores = {}  # company_id -> dict
+
+    cursor.execute("SELECT id, name, slug FROM companies")
+    for r in cursor.fetchall():
+        scores[r['id']] = {
+            "company_id": r['id'], "name": r['name'], "slug": r['slug'],
+            "score": 0.0, "findings": 0, "secrets": 0,
+            "by_severity": {k: 0 for k in SEVERITY_WEIGHTS},
+        }
+
+    cursor.execute("SELECT company_id, severity, COUNT(*) AS n FROM findings WHERE status = 'open' AND company_id IS NOT NULL GROUP BY company_id, severity")
+    for r in cursor.fetchall():
+        t = scores.get(r['company_id'])
+        if not t:
+            continue
+        sev = (r['severity'] or 'info').lower()
+        t['score'] += SEVERITY_WEIGHTS.get(sev, 0) * r['n']
+        t['findings'] += r['n']
+        if sev in t['by_severity']:
+            t['by_severity'][sev] += r['n']
+
+    # Secrets have no company_id column; join through the owning domain.
+    cursor.execute("""
+        SELECT d.company_id AS cid, s.severity AS severity, COUNT(*) AS n
+        FROM secrets s JOIN domains d ON s.domain_id = d.id
+        WHERE s.status = 'open' AND d.company_id IS NOT NULL
+        GROUP BY d.company_id, s.severity
+    """)
+    for r in cursor.fetchall():
+        t = scores.get(r['cid'])
+        if not t:
+            continue
+        sev = (r['severity'] or 'high').lower()
+        t['score'] += SEVERITY_WEIGHTS.get(sev, 0) * r['n']
+        t['secrets'] += r['n']
+
+    results = [t for t in scores.values() if t['score'] >= min_score]
+    results.sort(key=lambda t: t['score'], reverse=True)
+    return results
+
+
+def search_results(term, kind='all', limit=100):
+    """Search stored recon results across hosts, services, tech stack, exposed
+    credential patterns, findings, and derived risk score.
+
+    kind: all | domain | service | tech | secret | finding | risk | asn
+      - risk: `term` is a minimum risk score (number); returns ranked targets.
+      - asn: not captured by the pipeline yet; falls back to a service/host
+        keyword match and flags the gap in the response.
+
+    Credential match snippets are redacted in results. Returns a dict with a
+    `results` map keyed by category plus a `counts` summary.
+    """
+    kind = (kind or 'all').lower()
+    like = f"%{term}%"
+    out = {}
+    conn = get_db()
+    cursor = conn.cursor()
+
+    if kind == 'risk':
+        try:
+            min_score = float(term)
+        except (TypeError, ValueError):
+            min_score = 0.0
+        out['risk'] = _risk_scores(conn, min_score)[:limit]
+        conn.close()
+        return {"query": term, "kind": kind, "counts": {"risk": len(out['risk'])}, "results": out}
+
+    note = None
+    if kind == 'asn':
+        note = ("ASN is not captured by the recon pipeline yet; matching hosts "
+                "and network services on the term instead.")
+        kind = 'all'
+
+    if kind in ('all', 'domain'):
+        cursor.execute("""
+            SELECT d.host, d.canonical_url, d.data, c.slug AS company
+            FROM domains d LEFT JOIN companies c ON d.company_id = c.id
+            WHERE lower(d.host) LIKE lower(?) OR lower(d.data) LIKE lower(?)
+            ORDER BY d.host LIMIT ?
+        """, (like, like, limit))
+        hits = []
+        for r in cursor.fetchall():
+            try:
+                data = json.loads(r['data'] or '{}')
+            except Exception:
+                data = {}
+            hits.append({
+                "host": r['host'], "company": r['company'],
+                "webserver": data.get('webserver', ''),
+                "status_code": data.get('status_code'),
+                "tech": data.get('tech', []),
+                "title": data.get('title', ''),
+            })
+        out['domains'] = hits
+
+    if kind in ('all', 'tech'):
+        # tech stack lives in domains.data.tech (JSON array)
+        cursor.execute("""
+            SELECT d.host, d.data, c.slug AS company
+            FROM domains d LEFT JOIN companies c ON d.company_id = c.id
+            WHERE lower(d.data) LIKE lower(?)
+            ORDER BY d.host LIMIT ?
+        """, (f'%"tech"%{term}%', limit))
+        hits = []
+        for r in cursor.fetchall():
+            try:
+                tech = json.loads(r['data'] or '{}').get('tech', [])
+            except Exception:
+                tech = []
+            matched = [t for t in tech if term.lower() in str(t).lower()]
+            if matched:
+                hits.append({"host": r['host'], "company": r['company'], "tech": tech, "matched": matched})
+        out['tech'] = hits
+
+    if kind in ('all', 'service'):
+        cursor.execute("""
+            SELECT d.host, ns.ip, ns.port, ns.protocol, ns.service, ns.product, ns.version, ns.banner
+            FROM network_services ns JOIN domains d ON ns.domain_id = d.id
+            WHERE lower(ns.service) LIKE lower(?) OR lower(ns.product) LIKE lower(?)
+               OR lower(ns.version) LIKE lower(?) OR lower(ns.banner) LIKE lower(?)
+               OR lower(ns.ip) LIKE lower(?) OR lower(d.host) LIKE lower(?)
+            ORDER BY ns.port LIMIT ?
+        """, (like, like, like, like, like, like, limit))
+        out['services'] = [dict(r) for r in cursor.fetchall()]
+
+    if kind in ('all', 'secret'):
+        cursor.execute("""
+            SELECT s.rule_name, s.secret_type, s.match_snippet, s.file_url, s.severity, s.status, d.host
+            FROM secrets s JOIN domains d ON s.domain_id = d.id
+            WHERE lower(s.rule_name) LIKE lower(?) OR lower(s.secret_type) LIKE lower(?)
+            ORDER BY s.created_at DESC LIMIT ?
+        """, (like, like, limit))
+        hits = []
+        for r in cursor.fetchall():
+            row = dict(r)
+            row['match_snippet'] = _redact_secret(row.get('match_snippet'))
+            hits.append(row)
+        out['secrets'] = hits
+
+    if kind in ('all', 'finding'):
+        cursor.execute("""
+            SELECT f.tool, f.severity, f.vuln_type, f.title, f.url, f.cve, f.status, d.host
+            FROM findings f JOIN domains d ON f.domain_id = d.id
+            WHERE lower(f.title) LIKE lower(?) OR lower(f.vuln_type) LIKE lower(?)
+               OR lower(f.cve) LIKE lower(?) OR lower(f.tool) LIKE lower(?)
+            ORDER BY CASE lower(f.severity) WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END, f.created_at DESC
+            LIMIT ?
+        """, (like, like, like, like, limit))
+        out['findings'] = [dict(r) for r in cursor.fetchall()]
+
+    conn.close()
+    resp = {
+        "query": term, "kind": kind,
+        "counts": {k: len(v) for k, v in out.items()},
+        "results": out,
+    }
+    if note:
+        resp['note'] = note
+    return resp
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: db_sqlite.py <command> [args...]")
@@ -1155,6 +1340,14 @@ def main():
             print("Usage: db_sqlite.py report <domain_or_slug>")
             sys.exit(1)
         print(json.dumps(generate_report(sys.argv[2]), indent=2))
+    elif cmd == 'search':
+        if len(sys.argv) < 3:
+            print("Usage: db_sqlite.py search <term> [kind]")
+            print("  kind: all (default) | domain | service | tech | secret | finding | risk | asn")
+            print("  risk: <term> is a minimum risk score, e.g. 'search 10 risk'")
+            sys.exit(1)
+        kind = sys.argv[3] if len(sys.argv) > 3 else 'all'
+        print(json.dumps(search_results(sys.argv[2], kind), indent=2))
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)

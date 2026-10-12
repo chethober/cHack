@@ -134,6 +134,28 @@ VERIFY_SECRETS=1 ./cHack.sh --web example.com  # confirm which leaked secrets ar
 ./cHack.sh -h                  # full help
 ```
 
+### Search & analytics
+Query everything the pipeline has stored — across hosts, services, tech stack,
+exposed credential patterns, findings, and a derived risk score. Available from
+the TUI **Database → Search & Analytics** menu, or directly via `db_sqlite.py`:
+
+```bash
+python3 db_sqlite.py search <term> [kind]
+#   kind: all (default) | domain | service | tech | secret | finding | risk | asn
+
+python3 db_sqlite.py search cloudflare tech     # hosts fingerprinted with a tech
+python3 db_sqlite.py search nginx service       # network services / products
+python3 db_sqlite.py search aws secret          # exposed credential rule/type (values redacted)
+python3 db_sqlite.py search takeover finding    # findings by type / CVE / title
+python3 db_sqlite.py search acme domain         # hosts by name, title, or webserver
+python3 db_sqlite.py search 10 risk             # targets with risk score ≥ 10 (ranked)
+```
+
+Risk score is aggregated on demand as the weighted sum of open findings and
+secrets by severity (critical 10 / high 6 / medium 3 / low 1). Credential match
+snippets are masked in results. ASN is not yet captured by the pipeline, so the
+`asn` kind falls back to a host/service keyword match and flags the gap.
+
 ---
 
 ## 🤖 Telegram Bot
