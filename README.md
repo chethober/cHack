@@ -187,6 +187,70 @@ Once the Worker is deployed and a runner daemon is online, control everything fr
 | `/report <domain>` | Generate an executive recon summary |
 | `/tools` | Check tool health and status |
 | `/stop <job_id>` | Stop an active scan job |
+| `/monitor <target> [interval] [type]` | Schedule recurring scans (continuous monitoring) |
+| `/monitors` | List your active monitors |
+| `/unmonitor <id>` | Remove a monitor |
+
+---
+
+## 🛰️ Continuous Attack-Surface Monitoring
+
+cHack can watch a target over time, re-running scans on a schedule and alerting
+you the moment the attack surface *changes* — not just the first time it's mapped.
+
+### Schedule recurring scans
+
+From Telegram:
+
+```
+/monitor example.com 12h            # re-scan every 12 hours (info-gather)
+/monitor example.com 1d recon       # full pipeline once a day
+/monitor 192.0.2.0/24 6h network    # port/service sweep of a CIDR every 6h
+/monitor "Acme Corp" 1d             # fan out to every known domain of a company
+/monitors                           # list what you're watching
+/unmonitor <id>                     # stop watching
+```
+
+- **target** — a domain, a company name/slug (expands to all its known registrable
+  domains), or an IP/CIDR.
+- **interval** — `30m`, `6h`, `1d`, or a bare number of minutes. Default `1d`.
+- **scan_type** — `recon` · `infogather` · `web` · `network`.
+
+Monitors are stored in the central D1 database. A **Cloudflare
+[Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/)**
+(`*/15 * * * *`, configured in `back/wrangler.json`) wakes the Worker, enqueues any
+due monitors into the same runner job queue as manual scans, and rolls each schedule
+forward. Intervals are effectively rounded up to the 15-minute tick.
+
+> After deploying the Worker, hit `GET /api/db/migrate` once to create the
+> `monitors` table on an existing database.
+
+### Drift detection between runs
+
+Every monitored scan (and every manual re-scan) ends by diffing the freshly-collected
+surface against a rolling, runner-local baseline (`surface_assets` in `local.db`). The
+first scan of a target seeds the baseline silently; later scans report only what's
+**new**:
+
+| Drift category | How it's detected |
+| :--- | :--- |
+| **New subdomains** | New hosts under the target's company in the local DB |
+| **Newly exposed ports** | New `ip:port` pairs from the port-scan phase |
+| **New TLS certificates** | New certificate serials from Certificate Transparency (crt.sh) |
+| **New cloud assets** | Subdomains whose CNAME newly points at a known cloud provider (AWS/Azure/GCP/Cloudflare/Heroku/Netlify/Vercel/…) via DNS-over-HTTPS |
+
+Each new asset is recorded in the `drift_events` table and, when the scan was launched
+by a monitor, pushed to the owner's Telegram chat as a drift alert.
+
+Drift analysis is also available directly on a runner:
+
+```bash
+python3 db_sqlite.py drift example.com infogather [telegram_chat_id]
+```
+
+TLS-cert and cloud-asset collection are best-effort (network-dependent, with timeouts)
+and never produce false "removed" signals. Set `CHACK_DRIFT_CLOUD=0` to skip the
+DNS-over-HTTPS cloud-asset classification.
 
 ---
 

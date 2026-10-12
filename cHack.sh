@@ -209,6 +209,33 @@ send_telegram_notification() {
     fi
 }
 
+# Continuous monitoring: compare the freshly-scanned attack surface against
+# the rolling baseline and (when a Telegram sender is set) alert on drift —
+# new subdomains, newly exposed ports, new TLS certs, new cloud assets.
+run_drift_detection() {
+    local target="$1"
+    local scan_type="$2"
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+    # Allow background local-DB mirror writes (execute_graphql uses &) to settle.
+    wait 2>/dev/null
+    log_info "Analyzing attack-surface drift for '$target' ($scan_type)..."
+    local summary
+    summary=$(TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
+        python3 "$SCRIPT_DIR/db_sqlite.py" drift "$target" "$scan_type" "${SENDER_ID:-}" 2>/dev/null)
+    if [ -z "$summary" ]; then
+        return 0
+    fi
+    local total_new
+    total_new=$(echo "$summary" | jq -r '.total_new // 0' 2>/dev/null)
+    if [ "${total_new:-0}" -gt 0 ] 2>/dev/null; then
+        log_info "🛰️  Drift detected: ${total_new} new asset(s) — $(echo "$summary" | jq -c '.new' 2>/dev/null)"
+    else
+        log_info "No attack-surface drift detected (baseline up to date)."
+    fi
+}
+
 escape_sql() {
     echo "$1" | sed "s/'/''/g"
 }
@@ -1224,6 +1251,8 @@ run_info_gathering() {
     local duration=$(( $(date +%s) - start_time ))
     log_phase "Information Gathering Workflow Completed in $duration seconds."
     send_telegram_notification "🏁 <b>Info-Gathering Completed</b> for <code>$domain</code> in <b>$duration</b>s."
+
+    run_drift_detection "$domain" "infogather"
 }
 
 run_web_recon() {
@@ -1242,6 +1271,8 @@ run_web_recon() {
     run_content_discovery "$domain"
     run_nuclei "$domain"
     update_findings_results "$domain"
+
+    run_drift_detection "$domain" "web"
 }
 
 run_network_recon() {
@@ -1253,6 +1284,8 @@ run_network_recon() {
     run_naabu "$target"
     update_port_scan_results "$target"
     update_network_services_results "$target"
+
+    run_drift_detection "$target" "network"
 }
 
 # ==============================================================================
@@ -1390,6 +1423,8 @@ recon() {
     send_telegram_notification "🏁 <b>Full Recon Completed</b> for <code>$domain</code>
 • Duration: <b>$duration</b>s
 • All findings, endpoints, and secrets synchronized."
+
+    run_drift_detection "$domain" "recon"
 }
 
 # ==========================================

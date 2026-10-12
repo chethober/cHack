@@ -200,3 +200,57 @@ CREATE TABLE IF NOT EXISTS network_services (
 CREATE INDEX IF NOT EXISTS idx_net_services_domain_id ON network_services(domain_id);
 CREATE INDEX IF NOT EXISTS idx_net_services_ip_port ON network_services(ip, port);
 
+
+-- ====================================================================
+-- Continuous Attack-Surface Monitoring
+-- ====================================================================
+
+-- Recurring scan schedules (consumed by the Cloudflare Worker cron trigger).
+CREATE TABLE IF NOT EXISTS monitors (
+  id TEXT PRIMARY KEY,
+  owner_chat_id INTEGER NOT NULL,              -- Telegram chat/user id to alert
+  target_type TEXT NOT NULL DEFAULT 'domain',  -- domain | company | network
+  target TEXT NOT NULL,                         -- domain, company slug/name, or IP/CIDR
+  scan_type TEXT NOT NULL DEFAULT 'infogather', -- recon | infogather | web | network
+  runner TEXT NOT NULL DEFAULT 'default',
+  interval_minutes INTEGER NOT NULL DEFAULT 1440, -- cadence between runs
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_run_at TEXT,
+  next_run_at TEXT,
+  last_job_id TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_monitors_due ON monitors(enabled, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_monitors_owner ON monitors(owner_chat_id);
+
+-- Rolling attack-surface inventory (runner-local drift baseline).
+-- One row per distinct asset ever seen for a target; drift = assets whose
+-- asset_key is not yet present when a fresh scan completes.
+CREATE TABLE IF NOT EXISTS surface_assets (
+  id TEXT PRIMARY KEY,
+  target TEXT NOT NULL,               -- normalized monitor/scan target key
+  asset_kind TEXT NOT NULL,          -- subdomain | port | tls_cert | cloud_asset
+  asset_key TEXT NOT NULL,           -- canonical identity of the asset
+  asset_meta TEXT DEFAULT '{}',      -- JSON details (ip, provider, SANs, expiry, ...)
+  first_seen TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  last_seen TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS surface_assets_uq ON surface_assets(target, asset_kind, asset_key);
+CREATE INDEX IF NOT EXISTS idx_surface_assets_target ON surface_assets(target, asset_kind);
+
+-- Detected drift between runs (alert history / audit feed).
+CREATE TABLE IF NOT EXISTS drift_events (
+  id TEXT PRIMARY KEY,
+  target TEXT NOT NULL,
+  scan_type TEXT,
+  asset_kind TEXT NOT NULL,          -- subdomain | port | tls_cert | cloud_asset
+  change_type TEXT NOT NULL DEFAULT 'new',
+  asset_key TEXT NOT NULL,
+  asset_meta TEXT DEFAULT '{}',
+  alerted INTEGER NOT NULL DEFAULT 0,
+  detected_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_drift_events_target ON drift_events(target, detected_at);
