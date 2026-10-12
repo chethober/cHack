@@ -26,6 +26,22 @@ def init_db():
         schema_sql = f.read()
     
     cursor.executescript(schema_sql)
+
+    # Idempotent upgrade of pre-existing local.db to the DAG schema.
+    # CREATE TABLE IF NOT EXISTS above is a no-op on an existing table, so
+    # the new columns must be added explicitly.
+    for ddl in (
+        "ALTER TABLE scan_jobs ADD COLUMN job_type TEXT",
+        "ALTER TABLE scan_jobs ADD COLUMN pipeline_id TEXT",
+        "ALTER TABLE scan_jobs ADD COLUMN parent_id TEXT",
+        "ALTER TABLE scan_jobs ADD COLUMN result TEXT DEFAULT '{}'",
+        "ALTER TABLE scan_jobs ADD COLUMN depends_on TEXT DEFAULT '[]'",
+    ):
+        try:
+            cursor.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # column already present
+
     conn.commit()
     conn.close()
     print("Database initialized successfully.")
@@ -51,14 +67,18 @@ def save_job(job_file):
     if row:
         cursor.execute("""
             UPDATE scan_jobs
-            SET command = ?, domain = ?, runner = ?, status = ?, updated_at = ?
+            SET command = ?, domain = ?, runner = ?, status = ?,
+                job_type = ?, pipeline_id = ?, parent_id = ?, updated_at = ?
             WHERE id = ?
-        """, (job['command'], job['domain'], job.get('runner', 'default'), job['status'], now, job['id']))
+        """, (job['command'], job['domain'], job.get('runner', 'default'), job['status'],
+              job.get('job_type'), job.get('pipeline_id'), job.get('parent_id'), now, job['id']))
     else:
         cursor.execute("""
-            INSERT INTO scan_jobs (id, command, domain, runner, status, stdout, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (job['id'], job['command'], job['domain'], job.get('runner', 'default'), job['status'], job.get('stdout', ''), now, now))
+            INSERT INTO scan_jobs (id, command, domain, runner, status, stdout,
+                                   job_type, pipeline_id, parent_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (job['id'], job['command'], job['domain'], job.get('runner', 'default'), job['status'],
+              job.get('stdout', ''), job.get('job_type'), job.get('pipeline_id'), job.get('parent_id'), now, now))
     
     conn.commit()
     conn.close()
@@ -81,15 +101,26 @@ def append_log(job_id, log_base64):
     conn.commit()
     conn.close()
 
-def update_status(job_id, status):
+def update_status(job_id, status, result=None):
     conn = get_db()
     cursor = conn.cursor()
     now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
-    cursor.execute("""
-        UPDATE scan_jobs
-        SET status = ?, updated_at = ?
-        WHERE id = ?
-    """, (status, now, job_id))
+    if result:
+        try:
+            cursor.execute("""
+                UPDATE scan_jobs
+                SET status = ?, result = ?, updated_at = ?
+                WHERE id = ?
+            """, (status, result, now, job_id))
+        except sqlite3.OperationalError:
+            # 'result' column missing on a stale db; fall back to status only.
+            cursor.execute("UPDATE scan_jobs SET status = ?, updated_at = ? WHERE id = ?", (status, now, job_id))
+    else:
+        cursor.execute("""
+            UPDATE scan_jobs
+            SET status = ?, updated_at = ?
+            WHERE id = ?
+        """, (status, now, job_id))
     conn.commit()
     conn.close()
 
@@ -1285,9 +1316,10 @@ def main():
         append_log(sys.argv[2], sys.argv[3])
     elif cmd == 'update_status':
         if len(sys.argv) < 4:
-            print("Usage: db_sqlite.py update_status <job_id> <status>")
+            print("Usage: db_sqlite.py update_status <job_id> <status> [result_json]")
             sys.exit(1)
-        update_status(sys.argv[2], sys.argv[3])
+        result_arg = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+        update_status(sys.argv[2], sys.argv[3], result_arg)
     elif cmd == 'graphql':
         if len(sys.argv) < 4:
             print("Usage: db_sqlite.py graphql <in_file> <res_file>")

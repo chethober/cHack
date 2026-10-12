@@ -61,13 +61,20 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
   runner TEXT DEFAULT 'default', -- target runner name, or 'default' for any runner
   region TEXT,                   -- preferred runner region (ISO country, e.g. 'US'); NULL = any region
   priority INTEGER NOT NULL DEFAULT 0, -- higher runs first (e.g. 10 for high-value targets)
-  status TEXT NOT NULL DEFAULT 'pending', -- pending, running, completed, failed
+  status TEXT NOT NULL DEFAULT 'pending', -- pending, running, completed, failed, blocked, skipped
   stdout TEXT DEFAULT '',
+  -- Runner orchestration columns
   attempts INTEGER NOT NULL DEFAULT 0,     -- how many times this job has been dispatched
   max_attempts INTEGER NOT NULL DEFAULT 3, -- give up (mark failed) after this many attempts
   next_eligible_at INTEGER NOT NULL DEFAULT 0, -- Unix ts; job is not dispatchable before this (retry backoff)
   assigned_runner TEXT,          -- runner currently holding the job (for stale-lease reclaim)
   started_at INTEGER,            -- Unix ts the current run was dispatched (lease start)
+  -- Task dependency graph (DAG) columns
+  job_type TEXT,                 -- phase name: subdomain_enum, httpx, naabu, katana, nuclei, ...
+  pipeline_id TEXT,              -- groups every job spawned from one recon run
+  parent_id TEXT,                -- the job whose completion spawned this one
+  result TEXT DEFAULT '{}',      -- JSON summary the phase emits (e.g. {"open_ports":[443]})
+  depends_on TEXT DEFAULT '[]',  -- JSON array of job ids that must complete before this runs (fan-in)
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -75,6 +82,36 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
 -- Dispatch ordering: pending jobs, highest priority then oldest first.
 CREATE INDEX IF NOT EXISTS idx_scan_jobs_dispatch
   ON scan_jobs(status, priority DESC, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_pipeline ON scan_jobs(pipeline_id);
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(status);
+
+-- Trigger rules table (the dependency graph, stored as editable data)
+-- When a job of `on_job_type` completes, its result JSON is tested against the
+-- condition; if it passes, a child job of `spawn_job_type` is enqueued.
+CREATE TABLE IF NOT EXISTS trigger_rules (
+  id TEXT PRIMARY KEY,
+  on_job_type TEXT NOT NULL,              -- parent phase that fires this rule
+  cond_key TEXT NOT NULL DEFAULT '',      -- key looked up in the parent's result JSON
+  cond_op TEXT NOT NULL DEFAULT 'always', -- always | exists | eq | gt | gte | contains
+  cond_value TEXT DEFAULT '',             -- compared value (numeric for gt/gte)
+  spawn_job_type TEXT NOT NULL,           -- child phase to enqueue when the condition holds
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_trigger_rules_on ON trigger_rules(on_job_type);
+
+-- Default dependency graph:
+--   subdomain_enum --(subdomains>0)--> httpx
+--   httpx --(live_hosts>0)--> naabu, katana
+--   naabu --(open_ports contains 443)--> httpx_fingerprint
+--   katana --(endpoints>0)--> nuclei
+INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES
+  ('rule_sub_httpx',    'subdomain_enum', 'subdomains', 'gt',       '0',   'httpx'),
+  ('rule_httpx_naabu',  'httpx',          'live_hosts', 'gt',       '0',   'naabu'),
+  ('rule_httpx_katana', 'httpx',          'live_hosts', 'gt',       '0',   'katana'),
+  ('rule_naabu_fp',     'naabu',          'open_ports', 'contains', '443', 'httpx_fingerprint'),
+  ('rule_katana_nuclei','katana',         'endpoints',  'gt',       '0',   'nuclei');
 
 -- Sessions table (persists Telegram bot state)
 CREATE TABLE IF NOT EXISTS sessions (

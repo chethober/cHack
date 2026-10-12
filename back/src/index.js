@@ -3712,6 +3712,39 @@ app.get('/api/db/migrate', async (c) => {
       )
     `).run().catch(() => {});
 
+    // Task dependency graph (DAG) columns on scan_jobs
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN job_type TEXT").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN pipeline_id TEXT").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN parent_id TEXT").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN result TEXT DEFAULT '{}'").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN depends_on TEXT DEFAULT '[]'").run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_scan_jobs_pipeline ON scan_jobs(pipeline_id)").run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(status)").run().catch(() => {});
+
+    // Trigger rules table (the dependency graph, stored as editable data)
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS trigger_rules (
+        id TEXT PRIMARY KEY,
+        on_job_type TEXT NOT NULL,
+        cond_key TEXT NOT NULL DEFAULT '',
+        cond_op TEXT NOT NULL DEFAULT 'always',
+        cond_value TEXT DEFAULT '',
+        spawn_job_type TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_trigger_rules_on ON trigger_rules(on_job_type)").run().catch(() => {});
+
+    // Seed the default dependency graph (idempotent)
+    await c.env.DB.batch([
+      c.env.DB.prepare("INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES (?,?,?,?,?,?)").bind('rule_sub_httpx',    'subdomain_enum', 'subdomains', 'gt',       '0',   'httpx'),
+      c.env.DB.prepare("INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES (?,?,?,?,?,?)").bind('rule_httpx_naabu',  'httpx',          'live_hosts', 'gt',       '0',   'naabu'),
+      c.env.DB.prepare("INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES (?,?,?,?,?,?)").bind('rule_httpx_katana', 'httpx',          'live_hosts', 'gt',       '0',   'katana'),
+      c.env.DB.prepare("INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES (?,?,?,?,?,?)").bind('rule_naabu_fp',     'naabu',          'open_ports', 'contains', '443', 'httpx_fingerprint'),
+      c.env.DB.prepare("INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES (?,?,?,?,?,?)").bind('rule_katana_nuclei','katana',         'endpoints',  'gt',       '0',   'nuclei'),
+    ]);
+
     return c.text("D1 Database Migrations applied successfully!");
   } catch (e) {
     return c.text("Migration failed: " + e.message, 500);
@@ -3826,6 +3859,8 @@ app.get('/api/runner/next-job', async (c) => {
   ).bind(runner, ip, country, nowSecs).run();
 
   // Recover work stranded on offline runners before handing out anything new.
+  // (reclaimStaleJobs requeues jobs whose runner went silent, up to max_attempts,
+  // then fails them — a failed job never spawns DAG children.)
   await reclaimStaleJobs(c.env, nowSecs);
 
   // Load balancing: refuse a new job if this runner is already at capacity.
@@ -3894,11 +3929,108 @@ app.post('/api/runner/log', async (c) => {
   return c.json({ success: true });
 });
 
+// ==========================================================================
+// Task dependency graph (DAG) orchestration
+// ==========================================================================
+
+// Evaluate one trigger rule's condition against a parent job's result JSON.
+function evalCondition(rule, result) {
+  const op = rule.cond_op || 'always';
+  if (op === 'always') return true;
+  const actual = result ? result[rule.cond_key] : undefined;
+  const val = rule.cond_value;
+  switch (op) {
+    case 'exists':
+      return actual !== undefined && actual !== null;
+    case 'eq':
+      return String(actual) === String(val);
+    case 'gt':
+      return Number(actual) > Number(val);
+    case 'gte':
+      return Number(actual) >= Number(val);
+    case 'contains':
+      if (Array.isArray(actual)) return actual.map(String).includes(String(val));
+      return String(actual ?? '').includes(String(val));
+    default:
+      return false;
+  }
+}
+
+// Build the runner command for a spawned child phase, carrying the sender id
+// through from the parent so Telegram notifications still route correctly.
+function buildPhaseCommand(jobType, domain, parentCommand) {
+  const m = (parentCommand || '').match(/--sender-id\s+(\S+)/);
+  const senderPart = m ? ` --sender-id ${m[1]}` : '';
+  return `--phase ${jobType} ${domain}${senderPart}`;
+}
+
+// When a job completes, enqueue the child jobs its result triggers.
+// Dedupe by (pipeline_id, job_type): every phase runs at most once per
+// pipeline, which also makes cycles in the rule set impossible.
+async function spawnTriggeredJobs(env, job) {
+  let result = {};
+  try { result = JSON.parse(job.result || '{}'); } catch { result = {}; }
+
+  const { results: rules } = await env.DB.prepare(
+    "SELECT * FROM trigger_rules WHERE on_job_type = ? AND enabled = 1"
+  ).bind(job.job_type || '').all();
+
+  for (const rule of rules || []) {
+    if (!evalCondition(rule, result)) continue;
+
+    // Skip if this phase already exists in the pipeline (dedupe / anti-cycle).
+    if (job.pipeline_id) {
+      const existing = await env.DB.prepare(
+        "SELECT id FROM scan_jobs WHERE pipeline_id = ? AND job_type = ? LIMIT 1"
+      ).bind(job.pipeline_id, rule.spawn_job_type).first();
+      if (existing) continue;
+    }
+
+    const childId = crypto.randomUUID();
+    const command = buildPhaseCommand(rule.spawn_job_type, job.domain, job.command);
+    await env.DB.prepare(
+      "INSERT INTO scan_jobs (id, command, domain, runner, status, job_type, pipeline_id, parent_id) " +
+      "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)"
+    ).bind(
+      childId, command, job.domain, job.runner || 'default',
+      rule.spawn_job_type, job.pipeline_id || job.id, job.id
+    ).run();
+  }
+}
+
+// Release any 'blocked' jobs in the pipeline whose dependencies are all done.
+async function releaseBlockedJobs(env, pipelineId) {
+  if (!pipelineId) return;
+  const { results: blocked } = await env.DB.prepare(
+    "SELECT * FROM scan_jobs WHERE pipeline_id = ? AND status = 'blocked'"
+  ).bind(pipelineId).all();
+
+  for (const b of blocked || []) {
+    let deps = [];
+    try { deps = JSON.parse(b.depends_on || '[]'); } catch { deps = []; }
+    if (!deps.length) { // no deps recorded -> nothing holds it
+      await env.DB.prepare("UPDATE scan_jobs SET status = 'pending', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").bind(b.id).run();
+      continue;
+    }
+    const placeholders = deps.map(() => '?').join(',');
+    const { results: unmet } = await env.DB.prepare(
+      `SELECT id FROM scan_jobs WHERE id IN (${placeholders}) AND status != 'completed'`
+    ).bind(...deps).all();
+    if (!unmet || unmet.length === 0) {
+      await env.DB.prepare("UPDATE scan_jobs SET status = 'pending', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").bind(b.id).run();
+    }
+  }
+}
+
 app.post('/api/runner/status', async (c) => {
-  const { id, status } = await c.req.json();
+  const { id, status, result } = await c.req.json();
   const nowSecs = Math.floor(Date.now() / 1000);
+  const resultJson = (result === undefined || result === null)
+    ? null
+    : (typeof result === 'string' ? result : JSON.stringify(result));
 
   // On failure, retry with jittered backoff until max_attempts is exhausted.
+  // A requeued job is not terminal, so it does not drive the dependency graph.
   if (status === 'failed') {
     const job = await c.env.DB.prepare(
       "SELECT attempts, max_attempts FROM scan_jobs WHERE id = ?"
@@ -3913,11 +4045,87 @@ app.post('/api/runner/status', async (c) => {
     }
   }
 
-  // Terminal state (completed, or failed with no attempts left): release the lease.
+  // Terminal state (completed, or failed with no attempts left): record the
+  // result, release the lease.
   await c.env.DB.prepare(
-    "UPDATE scan_jobs SET status = ?, assigned_runner = NULL, " +
+    "UPDATE scan_jobs SET status = ?, result = COALESCE(?, result), assigned_runner = NULL, " +
     "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
-  ).bind(status, id).run();
+  ).bind(status, resultJson, id).run();
+
+  // On successful completion, drive the dependency graph forward.
+  if (status === 'completed') {
+    const job = await c.env.DB.prepare("SELECT * FROM scan_jobs WHERE id = ?").bind(id).first();
+    if (job) {
+      try {
+        await spawnTriggeredJobs(c.env, job);
+        await releaseBlockedJobs(c.env, job.pipeline_id);
+      } catch (e) {
+        // Orchestration failure must not fail the status update itself.
+        console.error("DAG orchestration error:", e.message);
+      }
+    }
+  }
+  return c.json({ success: true });
+});
+
+// Start a new pipeline: seed a single root job and let triggers cascade.
+app.post('/api/pipeline/start', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const domain = body.domain;
+  if (!domain) return c.json({ success: false, error: "domain required" }, 400);
+  const runner = body.runner || 'default';
+  const rootType = body.job_type || 'subdomain_enum';
+  const senderId = body.sender_id;
+
+  const id = crypto.randomUUID();
+  const command = buildPhaseCommand(rootType, domain, senderId ? `--sender-id ${senderId}` : '');
+  // pipeline_id = the root job's own id, so every descendant shares it.
+  await c.env.DB.prepare(
+    "INSERT INTO scan_jobs (id, command, domain, runner, status, job_type, pipeline_id) " +
+    "VALUES (?, ?, ?, ?, 'pending', ?, ?)"
+  ).bind(id, command, domain, runner, rootType, id).run();
+
+  return c.json({ success: true, pipeline_id: id, job_id: id });
+});
+
+// Inspect every job in a pipeline (for rendering the DAG + per-node status).
+app.get('/api/pipeline/:id', async (c) => {
+  const pipelineId = c.req.param('id');
+  const { results } = await c.env.DB.prepare(
+    "SELECT id, job_type, parent_id, status, result, created_at, updated_at FROM scan_jobs WHERE pipeline_id = ? ORDER BY created_at ASC"
+  ).bind(pipelineId).all();
+  return c.json({ pipeline_id: pipelineId, jobs: results || [] });
+});
+
+// List / create trigger rules (the editable dependency graph).
+app.get('/api/rules', async (c) => {
+  const { results } = await c.env.DB.prepare(
+    "SELECT * FROM trigger_rules ORDER BY on_job_type, spawn_job_type"
+  ).all();
+  return c.json({ rules: results || [] });
+});
+
+app.post('/api/rules', async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  if (!b.on_job_type || !b.spawn_job_type) {
+    return c.json({ success: false, error: "on_job_type and spawn_job_type required" }, 400);
+  }
+  const id = b.id || crypto.randomUUID();
+  await c.env.DB.prepare(
+    "INSERT INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type, enabled) " +
+    "VALUES (?, ?, ?, ?, ?, ?, ?) " +
+    "ON CONFLICT(id) DO UPDATE SET on_job_type=excluded.on_job_type, cond_key=excluded.cond_key, " +
+    "cond_op=excluded.cond_op, cond_value=excluded.cond_value, spawn_job_type=excluded.spawn_job_type, enabled=excluded.enabled"
+  ).bind(
+    id, b.on_job_type, b.cond_key || '', b.cond_op || 'always',
+    b.cond_value != null ? String(b.cond_value) : '', b.spawn_job_type,
+    b.enabled === false ? 0 : 1
+  ).run();
+  return c.json({ success: true, id });
+});
+
+app.delete('/api/rules/:id', async (c) => {
+  await c.env.DB.prepare("DELETE FROM trigger_rules WHERE id = ?").bind(c.req.param('id')).run();
   return c.json({ success: true });
 });
 
