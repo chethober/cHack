@@ -2286,28 +2286,35 @@ const createMainMenu = async (ctx, env) => {
     console.error("D1 error in createMainMenu:", err.message);
   }
 
-  return {
-    inline_keyboard: [
-      [
-        { text: "🚀 Launch Scan", callback_data: "menu_scan" },
-        { text: "📊 Dashboard", callback_data: "menu_dashboard" }
-      ],
-      [
-        { text: "🎯 Targets", callback_data: "view_targets_0" },
-        { text: "👥 Contacts", callback_data: "view_contacts_0" },
-        { text: "📜 Scan Queue", callback_data: "view_new_domains" }
-      ],
-      [
-        { text: "🛡️ Findings", callback_data: "menu_findings" },
-        { text: "🔑 Secrets", callback_data: "menu_secrets_0" },
-        { text: "🔌 Services", callback_data: "menu_services_0" }
-      ],
-      [
-        { text: `⚙️ Runner (${runnerStatusText})`, callback_data: "change_runner" },
-        { text: "⚠️ Reset DB", callback_data: "confirm_reset_db" }
-      ]
+  // Role-aware menu: everyone admitted gets the operational buttons; the
+  // destructive admin-only control (Reset DB) is shown only to admins. Per-action
+  // role/scope checks still apply when a button is tapped.
+  const isAdmin = !!(ctx.actor && typeof ctx.actor.hasGlobal === 'function' && ctx.actor.hasGlobal('admin'));
+
+  const keyboard = [
+    [
+      { text: "🚀 Launch Scan", callback_data: "menu_scan" },
+      { text: "📊 Dashboard", callback_data: "menu_dashboard" }
+    ],
+    [
+      { text: "🎯 Targets", callback_data: "view_targets_0" },
+      { text: "👥 Contacts", callback_data: "view_contacts_0" },
+      { text: "📜 Scan Queue", callback_data: "view_new_domains" }
+    ],
+    [
+      { text: "🛡️ Findings", callback_data: "menu_findings" },
+      { text: "🔑 Secrets", callback_data: "menu_secrets_0" },
+      { text: "🔌 Services", callback_data: "menu_services_0" }
     ]
-  };
+  ];
+
+  const lastRow = [{ text: `⚙️ Runner (${runnerStatusText})`, callback_data: "change_runner" }];
+  if (isAdmin) {
+    lastRow.push({ text: "⚠️ Reset DB", callback_data: "confirm_reset_db" });
+  }
+  keyboard.push(lastRow);
+
+  return { inline_keyboard: keyboard };
 };
 
 const getBot = (env) => {
@@ -2409,6 +2416,32 @@ const getBot = (env) => {
       return;
     }
     await next();
+  });
+
+  // Slash commands are reserved for admins. Regular (non-admin) users drive the
+  // bot through inline-keyboard buttons instead. Callback queries (button taps)
+  // and plain text (e.g. a domain typed into a button flow) always pass through;
+  // only an actual /command from a non-admin is intercepted and redirected to
+  // the menu. /start and /menu stay open to everyone so they can open the keyboard.
+  bot.use(async (ctx, next) => {
+    const text = ctx.message?.text || "";
+    const isCommand = text.startsWith("/") ||
+      (ctx.message?.entities || []).some(e => e.type === "bot_command" && e.offset === 0);
+    if (!isCommand) { await next(); return; }
+
+    const actor = ctx.actor || await resolveActor(env, ctx.from);
+    if (actor.hasGlobal("admin")) { await next(); return; } // admins: full command access
+
+    const cmd = text.replace(/^\//, "").split(/[@\s]/)[0].toLowerCase();
+    if (cmd === "start" || cmd === "menu") { await next(); return; }
+
+    const menuMarkup = await createMainMenu(ctx, env);
+    await ctx.reply(
+      "🔘 <b>Button mode.</b>\n\nSlash commands are reserved for administrators. " +
+      "Use the buttons below to navigate — everything you can do is one tap away.",
+      { parse_mode: "HTML", reply_markup: menuMarkup }
+    ).catch(() => {});
+    // Do not call next(): the command handler is skipped for non-admins.
   });
 
   // Helper: auto-register user on first bot interaction
