@@ -21,6 +21,10 @@ cHack chains the best-in-class ProjectDiscovery / recon tooling into a single, r
 - **Central datastore** — per-runner SQLite synced to Cloudflare D1 for a single source of truth.
 - **Self-provisioning** — missing Go tools are auto-installed and periodically updated.
 - **Live job tracking** — stream logs, status, and executive summaries straight to Telegram.
+- **Conditional pipelines (DAG)** — chain phases on their results (`httpx` finds live hosts → `naabu`; `naabu` sees 443 → fingerprint) via editable trigger rules, not a fixed order.
+- **Continuous monitoring & drift** — schedule recurring scans and get alerted the moment new subdomains, ports, TLS certs, or cloud assets appear.
+- **Search & analytics** — query hosts, services, tech, exposed-credential patterns and findings, with an on-demand risk score.
+- **Role-based access & audit** — multi-operator roles, per-team target scope, and a tamper-evident audit log across Telegram, CLI/TUI, and the daemon.
 - **Team workflows** — campaigns, shared target groups, job templates, and per-target playbooks, with API-token auth and roles for multi-user operation.
 
 ---
@@ -74,6 +78,36 @@ A full scan (`-d <domain>`) runs six phases; individual phases are also exposed 
 | **6** | Vulnerability & DAST | Template-based scanning and XSS assessment | `nuclei`, `dalfox` |
 
 Phases 3 and 4 run **in parallel** to cut wall-clock time.
+
+### Task dependency graph (DAG)
+
+Beyond the fixed pipeline, phases can be chained **conditionally** on their results. Each phase runs as its own queued job (`--phase <type> <domain>`) and emits a machine-readable result line (`##CHACK_RESULT## {…}`). When a job completes, the backend evaluates the `trigger_rules` table against that result and enqueues the child phases whose condition holds — so work only happens where it's warranted:
+
+- `subdomain_enum` finds subdomains **→** `httpx`
+- `httpx` finds live hosts **→** `naabu` **and** `katana`
+- `naabu` reports **443 open → `httpx_fingerprint`**
+- `katana` finds endpoints **→** `nuclei`
+
+Rules are editable data (not hardcoded), with conditions `always | exists | eq | gt | gte | contains`. Each phase runs at most once per pipeline (dedupe by `pipeline_id`), which also makes rule cycles impossible; jobs stuck `running` for 30 min are reaped so a dead runner can't stall the graph. Children inherit the parent's runner so phase output files stay local.
+
+```bash
+./cHack.sh --phase naabu example.com   # run one DAG phase, emitting a result line
+
+# Start a pipeline (seeds a subdomain_enum root; triggers cascade from there)
+curl -X POST "$BACKEND_URL/api/pipeline/start" -d '{"domain":"example.com","runner":"VPS-US"}'
+
+# Inspect the pipeline's jobs + per-node status/results
+curl "$BACKEND_URL/api/pipeline/<pipeline_id>"
+
+# List / add / remove trigger rules
+curl "$BACKEND_URL/api/rules"
+curl -X POST "$BACKEND_URL/api/rules" -d '{"on_job_type":"naabu","cond_key":"open_ports","cond_op":"contains","cond_value":"22","spawn_job_type":"nuclei"}'
+curl -X DELETE "$BACKEND_URL/api/rules/<rule_id>"
+```
+
+Phase types for `--phase`: `subdomain_enum`, `httpx`, `httpx_fingerprint`, `naabu`, `katana`, `nuclei`, `content_discovery`.
+
+> After deploying the Worker, hit `GET /api/db/migrate` once to add the DAG columns, create `trigger_rules`, and seed the default graph on your live D1 database.
 
 ---
 
@@ -411,8 +445,9 @@ cHack/
 ├── install.sh            # VPS provisioning (Go, toolchain, Python deps)
 ├── back/                 # Cloudflare Worker: Telegram bot + GraphQL API
 │   ├── src/index.js
-│   ├── schema.sql
-│   └── wrangler.json
+│   ├── schema.sql        # full D1/SQLite schema (fresh installs)
+│   ├── migrations/       # one-shot migrations for pre-existing D1 databases
+│   └── wrangler.json     # bindings, cron trigger, AUTH_ENFORCED
 ├── .env.example
 └── .github/workflows/    # ShellCheck + Ruff CI
 ```
