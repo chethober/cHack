@@ -25,6 +25,13 @@ def init_db():
     with open(schema_path, "r") as f:
         schema_sql = f.read()
     
+    # Migrate FIRST: CREATE TABLE IF NOT EXISTS never alters an already-present
+    # table, and schema.sql builds indexes on the new scan_jobs columns — those
+    # CREATE INDEX statements would fail on a legacy table whose columns haven't
+    # been backfilled yet. On a fresh DB the tables don't exist, so migrate_db
+    # is a no-op and executescript creates everything (columns included).
+    migrate_db(conn)
+
     cursor.executescript(schema_sql)
 
     # Idempotent upgrade of pre-existing local.db to the DAG schema.
@@ -45,6 +52,59 @@ def init_db():
     conn.commit()
     conn.close()
     print("Database initialized successfully.")
+
+def _columns(cursor, table):
+    try:
+        cursor.execute(f"PRAGMA table_info({table})")
+        return {row[1] for row in cursor.fetchall()}
+    except sqlite3.Error:
+        return set()
+
+def migrate_db(conn):
+    """Idempotently add columns introduced after a DB was first created."""
+    cursor = conn.cursor()
+    additions = {
+        "users": [("role", "TEXT DEFAULT 'pending'")],
+        "scan_jobs": [
+            ("requested_by", "TEXT"),
+            ("requested_by_number_id", "INTEGER"),
+            ("company_id", "TEXT"),
+            ("source", "TEXT DEFAULT 'telegram'"),
+        ],
+    }
+    for table, cols in additions.items():
+        existing = _columns(cursor, table)
+        if not existing:
+            continue  # table doesn't exist yet; executescript will have made it
+        for name, decl in cols:
+            if name not in existing:
+                try:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                except sqlite3.Error as e:
+                    print(f"migration warning ({table}.{name}): {e}")
+    conn.commit()
+
+def write_audit(action, actor_label=None, actor_number_id=0, source='cli',
+                decision='allow', target_type=None, target=None, company_id=None,
+                detail=None):
+    """Append one row to the local audit_log. Best-effort; never raises."""
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO audit_log
+                 (id, actor_user_id, actor_number_id, actor_label, source, action,
+                  decision, target_type, target, company_id, detail)
+               VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(uuid.uuid4()), int(actor_number_id or 0), actor_label, source, action,
+             decision, target_type, target, company_id,
+             json.dumps(detail or {})),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        # Audit failures must not break a scan.
+        sys.stderr.write(f"audit write failed: {e}\n")
 
 def save_job(job_file):
     try:
@@ -1710,6 +1770,22 @@ def main():
 
     if cmd == 'init':
         init_db()
+    elif cmd == 'audit':
+        # Usage: db_sqlite.py audit <action> <source> <actor_label> <actor_number_id> \
+        #                          [target_type] [target] [decision]
+        if len(sys.argv) < 6:
+            print("Usage: db_sqlite.py audit <action> <source> <actor_label> <actor_number_id> "
+                  "[target_type] [target] [decision]")
+            sys.exit(1)
+        write_audit(
+            action=sys.argv[2],
+            source=sys.argv[3],
+            actor_label=sys.argv[4],
+            actor_number_id=sys.argv[5],
+            target_type=(sys.argv[6] if len(sys.argv) > 6 else None),
+            target=(sys.argv[7] if len(sys.argv) > 7 else None),
+            decision=(sys.argv[8] if len(sys.argv) > 8 else 'allow'),
+        )
     elif cmd == 'save_job':
         if len(sys.argv) < 3:
             print("Usage: db_sqlite.py save_job <job_file>")
