@@ -2313,6 +2313,9 @@ const createMainMenu = async (ctx, env) => {
     lastRow.push({ text: "⚠️ Reset DB", callback_data: "confirm_reset_db" });
   }
   keyboard.push(lastRow);
+  if (isAdmin) {
+    keyboard.push([{ text: "🛡️ Admin Control Center", callback_data: "admin_home" }]);
+  }
 
   return { inline_keyboard: keyboard };
 };
@@ -3800,6 +3803,202 @@ const getBot = (env) => {
     await ctx.reply(`🚀 Queued <b>${jobIds.length}</b> job(s) from <b>${escapeHtml(pb.name)}</b> against <code>${escapeHtml(safeTarget)}</code>.\n\nTrack them with /queue.`, { parse_mode: "HTML" });
   });
 
+  // ---- Admin Control Center (/admin) ----
+  const roleIcon = (r) => ({ superadmin: '👑', admin: '🛡️', operator: '🔧', viewer: '👁️', pending: '⏳' }[r] || '•');
+
+  const ADMIN_MENU_TEXT =
+    "🛡️ <b>Admin Control Center</b>\n\n" +
+    "Full management surface — access control, operations, assets, workflows and audit. " +
+    "Every action is role-checked and written to the tamper-evident audit log.";
+
+  const buildAdminMenu = () => ({
+    inline_keyboard: [
+      [{ text: "👥 Users & Roles", callback_data: "admin_users" },
+       { text: "🧑‍🤝‍🧑 Team Memberships", callback_data: "admin_members" }],
+      [{ text: "📊 Dashboard", callback_data: "menu_dashboard" },
+       { text: "📜 Scan Queue", callback_data: "view_new_domains" },
+       { text: "🖥️ Runners", callback_data: "change_runner" }],
+      [{ text: "🎯 Targets", callback_data: "view_targets_0" },
+       { text: "👤 Contacts", callback_data: "view_contacts_0" }],
+      [{ text: "🛡️ Findings", callback_data: "menu_findings" },
+       { text: "🔑 Secrets", callback_data: "menu_secrets_0" },
+       { text: "🔌 Services", callback_data: "menu_services_0" }],
+      [{ text: "📋 Campaigns", callback_data: "admin_campaigns" },
+       { text: "🧩 Templates", callback_data: "admin_templates" },
+       { text: "📘 Playbooks", callback_data: "admin_playbooks" }],
+      [{ text: "🧾 Audit Log", callback_data: "admin_audit" }],
+      [{ text: "⚠️ Reset Database", callback_data: "confirm_reset_db" }],
+      [{ text: "🔙 Main Menu", callback_data: "main_menu" }],
+    ],
+  });
+
+  // Callbacks only clear the "viewer" gate, so every admin-only panel must
+  // re-check the role here. Returns the actor when allowed, else null (and
+  // replaces the message with a denial).
+  const ensureAdminCallback = async (ctx) => {
+    const actor = ctx.actor || await resolveActor(env, ctx.from);
+    if (actor.hasGlobal('admin')) return actor;
+    await auditLog(env, {
+      actor_user_id: actor.userId, actor_number_id: ctx.from?.id || 0, actor_label: actor.username,
+      source: 'telegram', action: 'admin.panel', decision: 'deny',
+      target_type: 'callback', target: ctx.callbackQuery?.data || null,
+      detail: { role: actor.role },
+    });
+    await safeEditMessageText(ctx, "⛔ <b>Admins only.</b>\n\nThis panel requires the <b>admin</b> role.", {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "🔙 Main Menu", callback_data: "main_menu" }]] },
+    }).catch(() => {});
+    return null;
+  };
+
+  const renderAdminUsers = async (ctx) => {
+    const res = await env.DB.prepare(
+      "SELECT username, number_id, role FROM users ORDER BY role DESC, username ASC LIMIT 50"
+    ).all();
+    const rows = res?.results || [];
+    const kb = rows.slice(0, 20).map((r) => ([{
+      text: `${roleIcon(r.role)} ${r.username} · ${r.role || 'pending'}`,
+      callback_data: `admin_user:${r.number_id}`,
+    }]));
+    kb.push([{ text: "🔄 Refresh", callback_data: "admin_users" }, { text: "🔙 Admin", callback_data: "admin_home" }]);
+    const text = rows.length
+      ? `👥 <b>Users &amp; Roles (${rows.length})</b>\n\nTap a user to change their global role.`
+      : "👥 <b>Users &amp; Roles</b>\n\nNo users registered yet.";
+    await safeEditMessageText(ctx, text, { parse_mode: "HTML", reply_markup: { inline_keyboard: kb } });
+  };
+
+  const renderAdminUserPanel = async (ctx, numberId) => {
+    const u = await env.DB.prepare("SELECT username, number_id, role FROM users WHERE number_id = ?").bind(numberId).first();
+    if (!u) {
+      return await safeEditMessageText(ctx, "User not found.", {
+        parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: "🔙 Users", callback_data: "admin_users" }]] },
+      });
+    }
+    const roleBtns = VALID_GLOBAL_ROLES.map((r) => ({
+      text: (u.role === r ? "✅ " : "") + roleIcon(r) + " " + r,
+      callback_data: `admin_setrole:${numberId}:${r}`,
+    }));
+    const kb = [];
+    for (let i = 0; i < roleBtns.length; i += 2) kb.push(roleBtns.slice(i, i + 2));
+    kb.push([{ text: "🔙 Users", callback_data: "admin_users" }]);
+    const text =
+      `👤 <b>${escapeHtml(u.username)}</b>\n` +
+      `• Telegram ID: <code>${u.number_id}</code>\n` +
+      `• Current role: <b>${u.role || 'pending'}</b>\n\n` +
+      `Select a new global role (only a superadmin may grant/change <b>admin</b>):`;
+    await safeEditMessageText(ctx, text, { parse_mode: "HTML", reply_markup: { inline_keyboard: kb } });
+  };
+
+  // Shared with /role: same validation, superadmin guard and audit trail.
+  const applyAdminSetRole = async (ctx, actor, numberId, newRole) => {
+    if (!VALID_GLOBAL_ROLES.includes(newRole)) {
+      return await ctx.answerCallbackQuery({ text: "Invalid role.", show_alert: true }).catch(() => {});
+    }
+    if (newRole === 'admin' && !actor.isSuperadmin) {
+      return await safeEditMessageText(ctx, "⛔ Only a superadmin can grant the <b>admin</b> role.", {
+        parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: "🔙 Users", callback_data: "admin_users" }]] },
+      });
+    }
+    const target = await env.DB.prepare("SELECT id, username, role FROM users WHERE number_id = ?").bind(numberId).first();
+    if (!target) {
+      return await safeEditMessageText(ctx, "❌ User no longer exists.", {
+        parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: "🔙 Users", callback_data: "admin_users" }]] },
+      });
+    }
+    if (target.role === 'admin' && !actor.isSuperadmin) {
+      return await safeEditMessageText(ctx, "⛔ Only a superadmin can change an existing admin's role.", {
+        parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: "🔙 Users", callback_data: "admin_users" }]] },
+      });
+    }
+    await env.DB.prepare(
+      "UPDATE users SET role = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE number_id = ?"
+    ).bind(newRole, numberId).run();
+    await auditLog(env, {
+      actor_user_id: actor.userId, actor_number_id: ctx.from.id, actor_label: actor.username,
+      source: 'telegram', action: 'role.set', target_type: 'user', target: String(numberId),
+      detail: { old_role: target.role, new_role: newRole, via: 'admin-dashboard' },
+    });
+    await renderAdminUserPanel(ctx, numberId);
+  };
+
+  const renderAdminAudit = async (ctx) => {
+    const res = await env.DB.prepare(
+      "SELECT ts, actor_label, actor_number_id, source, action, decision, target_type, target FROM audit_log ORDER BY ts DESC LIMIT 15"
+    ).all();
+    const rows = res?.results || [];
+    const body = rows.length
+      ? rows.map((r) => {
+          const icon = r.decision === 'deny' ? '⛔' : '✅';
+          const who = r.actor_label || `id:${r.actor_number_id}`;
+          const tgt = r.target ? ` <code>${escapeHtml(String(r.target))}</code>` : '';
+          const when = String(r.ts).replace('T', ' ').replace('Z', '').slice(5, 19);
+          return `${icon} <code>${when}</code> ${escapeHtml(who)} [${r.source}] <b>${r.action}</b>${tgt}`;
+        }).join("\n")
+      : "Audit log is empty.";
+    await safeEditMessageText(ctx, `🧾 <b>Audit Log</b> (last ${rows.length})\n\n${body}`, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "🔄 Refresh", callback_data: "admin_audit" }, { text: "🔙 Admin", callback_data: "admin_home" }]] },
+    });
+  };
+
+  const renderAdminMembers = async (ctx) => {
+    const res = await env.DB.prepare(
+      `SELECT u.number_id, u.username, tm.role, c.name AS cname
+         FROM team_members tm
+         JOIN users u ON u.id = tm.user_id
+         JOIN companies c ON c.id = tm.company_id
+        ORDER BY c.name ASC, tm.role DESC LIMIT 100`
+    ).all();
+    const rows = res?.results || [];
+    const body = rows.length
+      ? rows.map((r) => `• <b>${escapeHtml(r.cname)}</b> ← <code>${r.number_id}</code> ${escapeHtml(r.username)} (${r.role})`).join("\n")
+      : "No team memberships yet. Grant one with <code>/grant &lt;id&gt; &lt;company&gt; [role]</code>.";
+    await safeEditMessageText(ctx, `🧑‍🤝‍🧑 <b>Team Memberships</b>\n\n${body}`, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "🔄 Refresh", callback_data: "admin_members" }, { text: "🔙 Admin", callback_data: "admin_home" }]] },
+    });
+  };
+
+  const renderAdminList = async (ctx, kind) => {
+    let text;
+    if (kind === 'campaigns') {
+      const { results } = await env.DB.prepare("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 20").all();
+      const badge = { prospect: "🔆", active: "🟢", paused: "⏸️", won: "🏆", lost: "💤", closed: "📦" };
+      text = results.length
+        ? `📋 <b>Campaigns (${results.length})</b>\n\n` + results.map((c) =>
+            `${badge[c.status] || "•"} <b>${escapeHtml(c.name)}</b> <code>${escapeHtml(c.slug || c.id)}</code>\n   ${escapeHtml(c.kind)} · ${escapeHtml(c.status)} · ${c.authorized ? "🔓 authorized" : "🔒 unauthorized"}`
+          ).join("\n")
+        : "📋 <b>Campaigns</b>\n\nNone yet. Create one with <code>/newcampaign &lt;name&gt; | &lt;kind&gt;</code>.";
+    } else if (kind === 'templates') {
+      const { results } = await env.DB.prepare("SELECT * FROM job_templates ORDER BY created_at DESC LIMIT 20").all();
+      text = results.length
+        ? `🧩 <b>Job Templates (${results.length})</b>\n\n` + results.map((t) =>
+            `🧩 <b>${escapeHtml(t.name)}</b> <code>${escapeHtml(t.slug || t.id)}</code>\n   <code>${escapeHtml(t.command_template)}</code>`
+          ).join("\n")
+        : "🧩 <b>Job Templates</b>\n\nNone yet.";
+    } else {
+      const { results } = await env.DB.prepare(
+        `SELECT p.*, (SELECT COUNT(*) FROM playbook_steps s WHERE s.playbook_id = p.id) AS steps
+         FROM playbooks p ORDER BY p.created_at DESC LIMIT 20`
+      ).all();
+      text = results.length
+        ? `📘 <b>Playbooks (${results.length})</b>\n\nRun with <code>/runplaybook &lt;slug&gt; &lt;target&gt;</code>\n\n` + results.map((p) =>
+            `📘 <b>${escapeHtml(p.name)}</b> <code>${escapeHtml(p.slug || p.id)}</code>\n   ${p.steps} step(s)`
+          ).join("\n")
+        : "📘 <b>Playbooks</b>\n\nNone yet.";
+    }
+    await safeEditMessageText(ctx, text, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "🔙 Admin", callback_data: "admin_home" }]] },
+    });
+  };
+
+  // /admin — open the Admin Control Center. Admin role required.
+  bot.command("admin", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'admin.dashboard')) return;
+    await ctx.reply(ADMIN_MENU_TEXT, { parse_mode: "HTML", reply_markup: buildAdminMenu() });
+  });
+
   bot.command("help", async (ctx) => {
     await ctx.reply(
       `📖 <b>cHack Bot Command & Management Guide</b>\n\n` +
@@ -3834,6 +4033,7 @@ const getBot = (env) => {
       `• <code>/monitors</code> - List your active monitors\n` +
       `• <code>/unmonitor &lt;id&gt;</code> - Remove a monitor\n\n` +
       `<b>Access Control & Audit:</b>\n` +
+      `• <code>/admin</code> - Open the Admin Control Center dashboard <i>(admin)</i>\n` +
       `• <code>/whoami</code> - Your ID, role & team memberships\n` +
       `• <code>/users</code> - List users & roles <i>(admin)</i>\n` +
       `• <code>/role &lt;id&gt; &lt;role&gt;</code> - Set global role <i>(admin)</i>\n` +
@@ -3875,6 +4075,37 @@ const getBot = (env) => {
         parse_mode: "HTML",
         reply_markup: menuMarkup
       });
+    } else if (data === "admin_home") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await safeEditMessageText(ctx, ADMIN_MENU_TEXT, { parse_mode: "HTML", reply_markup: buildAdminMenu() });
+    } else if (data === "admin_users") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminUsers(ctx);
+    } else if (data.startsWith("admin_user:")) {
+      if (!await ensureAdminCallback(ctx)) return;
+      const numberId = Number(data.split(":")[1]);
+      if (Number.isFinite(numberId)) await renderAdminUserPanel(ctx, numberId);
+    } else if (data.startsWith("admin_setrole:")) {
+      const actor = await ensureAdminCallback(ctx);
+      if (!actor) return;
+      const [, idStr, newRole] = data.split(":");
+      const numberId = Number(idStr);
+      if (Number.isFinite(numberId)) await applyAdminSetRole(ctx, actor, numberId, newRole);
+    } else if (data === "admin_members") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminMembers(ctx);
+    } else if (data === "admin_audit") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminAudit(ctx);
+    } else if (data === "admin_campaigns") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminList(ctx, 'campaigns');
+    } else if (data === "admin_templates") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminList(ctx, 'templates');
+    } else if (data === "admin_playbooks") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminList(ctx, 'playbooks');
     } else if (data === "menu_dashboard") {
       try {
         const compCount = (await env.DB.prepare("SELECT count(*) as cnt FROM companies").first())?.cnt || 0;
