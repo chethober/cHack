@@ -20,6 +20,14 @@ export GRAPHQL_ENDPOINT
 # Concurrency & thread settings (can be overridden by env, .env, or -t/--threads)
 THREADS="${THREADS:-50}"
 
+# Opt-in active secret verification. When enabled, the JS scanner pings each
+# provider's read-only API to confirm which matched credentials are actually
+# live, promoting them to "confirmed-live" and discarding dead ones. This sends
+# captured tokens to third parties, so it is OFF by default — only enable it for
+# targets you are explicitly authorized to test. Set VERIFY_SECRETS=1 to enable.
+VERIFY_SECRETS="${VERIFY_SECRETS:-0}"
+export VERIFY_SECRETS
+
 # Ensure extended PATH includes all Go, Python, and local binaries
 if command -v go >/dev/null 2>&1; then
     _gopath="$(go env GOPATH 2>/dev/null)"
@@ -993,7 +1001,12 @@ run_katana() {
     # 5. Deep JS Secret & Endpoint Analysis (Multi-threaded)
     if [ -s "$output_dir/js_links" ] && [ -f "$SCRIPT_DIR/js_secrets.py" ]; then
         log_info "Scanning JavaScript bundles & inline scripts for leaked secrets & API keys (concurrency: $THREADS)..."
-        python3 "$SCRIPT_DIR/js_secrets.py" "$output_dir/js_links" "$output_dir/js_findings.json" "$THREADS" 2>/dev/null || true
+        local verify_flag=""
+        if [ "$VERIFY_SECRETS" = "1" ] || [ "$VERIFY_SECRETS" = "true" ]; then
+            verify_flag="--verify"
+            log_info "Active secret verification enabled — confirming which matched credentials are live."
+        fi
+        python3 "$SCRIPT_DIR/js_secrets.py" "$output_dir/js_links" "$output_dir/js_findings.json" "$THREADS" $verify_flag 2>/dev/null || true
         
         if [ -s "$output_dir/js_findings.json" ]; then
             jq '.secrets // []' "$output_dir/js_findings.json" > "$output_dir/all_secrets.json"
