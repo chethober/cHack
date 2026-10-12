@@ -17,7 +17,7 @@ cHack chains the best-in-class ProjectDiscovery / recon tooling into a single, r
 - **Three ways to drive it** — interactive TUI, direct CLI flags, or a Telegram bot.
 - **Distributed runners** — point many VPS runners at one central queue; jobs are load-shared.
 - **Parallel execution** — port scanning and web crawling run concurrently; tunable worker threads (`-t`).
-- **JS secret mining** — dedicated scanner (`js_secrets.py`) with entropy checks, vendor filtering, and false-positive suppression.
+- **JS secret mining** — dedicated scanner (`js_secrets.py`) with entropy checks, vendor filtering, false-positive suppression, tiered classification (confirmed-live / candidate / informational), and optional **active verification** that pings each provider's read-only API to confirm which credentials are actually live.
 - **Central datastore** — per-runner SQLite synced to Cloudflare D1 for a single source of truth.
 - **Self-provisioning** — missing Go tools are auto-installed and periodically updated.
 - **Live job tracking** — stream logs, status, and executive summaries straight to Telegram.
@@ -105,7 +105,19 @@ Missing Go tools are installed automatically on first run and refreshed weekly.
 ./cHack.sh --fuzz example.com        # content & backup file discovery
 ./cHack.sh --vuln example.com        # vulnerability & DAST scanning
 ./cHack.sh -t 100 -d example.com     # tune concurrency (default: 50)
+VERIFY_SECRETS=1 ./cHack.sh --web example.com  # confirm which leaked secrets are live (opt-in)
 ```
+
+> ⚠️ **Active verification (`VERIFY_SECRETS=1`)** sends each matched credential to
+> its provider's read-only API (e.g. `GET api.github.com/user`) to check whether it
+> is live. This separates real bugs from look-alikes but transmits captured tokens
+> to third parties — only enable it against targets you are explicitly authorized to
+> test. It is **off** by default. The scanner can also be run directly with
+> `--verify` / `--only-verified`:
+> ```bash
+> python3 js_secrets.py js_links out.json 50 --verify         # tier + confirm live
+> python3 js_secrets.py js_links out.json 50 --only-verified  # keep only confirmed-live
+> ```
 
 ### Runner daemon & sync
 ```bash

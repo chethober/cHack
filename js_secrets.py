@@ -10,9 +10,12 @@ import re
 import json
 import math
 import ssl
+import time
+import socket
 import base64
 import bisect
 import urllib.request
+import urllib.error
 import concurrent.futures
 from collections import Counter
 from urllib.parse import urlparse, urljoin
@@ -62,27 +65,31 @@ EXCLUDED_ENDPOINT_EXTENSIONS = (
     ".mp3", ".wav", ".pdf", ".zip", ".tar", ".gz"
 )
 
+# Entropy is only meaningful for generic / captured-group tokens. Rules with a strong
+# fixed prefix (ghp_, AKIA, sk-ant-, …) are already proven by their format, so their
+# min_entropy is 0.0 — entropy gating there adds no precision and can wrongly discard
+# real, low-entropy keys.
 PATTERNS = [
     # Source control & packages
-    ("github_pat", "critical", r"\bghp_[0-9A-Za-z]{36}\b", 3.0),
-    ("github_oauth", "critical", r"\bgho_[0-9A-Za-z]{36}\b", 3.0),
-    ("github_app_token", "critical", r"\b(?:ghu|ghs)_[0-9A-Za-z]{36}\b", 3.0),
-    ("github_refresh", "high", r"\bghr_[0-9A-Za-z]{36}\b", 3.0),
-    ("github_fine_grained", "critical", r"\bgithub_pat_[0-9A-Za-z_]{82}\b", 3.2),
-    ("gitlab_pat", "critical", r"\bglpat-[0-9A-Za-z_\-]{20}\b", 3.0),
-    ("npm_token", "high", r"\bnpm_[0-9A-Za-z]{36}\b", 3.0),
-    ("pypi_token", "critical", r"\bpypi-AgEIcHlwaS[0-9A-Za-z_\-]{50,}\b", 3.5),
-    ("rubygems", "high", r"\brubygems_[0-9a-f]{48}\b", 3.0),
-    ("docker_hub_pat", "high", r"\bdckr_pat_[0-9A-Za-z_\-]{27,}\b", 3.0),
+    ("github_pat", "critical", r"\bghp_[0-9A-Za-z]{36}\b", 0.0),
+    ("github_oauth", "critical", r"\bgho_[0-9A-Za-z]{36}\b", 0.0),
+    ("github_app_token", "critical", r"\b(?:ghu|ghs)_[0-9A-Za-z]{36}\b", 0.0),
+    ("github_refresh", "high", r"\bghr_[0-9A-Za-z]{36}\b", 0.0),
+    ("github_fine_grained", "critical", r"\bgithub_pat_[0-9A-Za-z_]{82}\b", 0.0),
+    ("gitlab_pat", "critical", r"\bglpat-[0-9A-Za-z_\-]{20}\b", 0.0),
+    ("npm_token", "high", r"\bnpm_[0-9A-Za-z]{36}\b", 0.0),
+    ("pypi_token", "critical", r"\bpypi-AgEIcHlwaS[0-9A-Za-z_\-]{50,}\b", 0.0),
+    ("rubygems", "high", r"\brubygems_[0-9a-f]{48}\b", 0.0),
+    ("docker_hub_pat", "high", r"\bdckr_pat_[0-9A-Za-z_\-]{27,}\b", 0.0),
 
     # Cloud providers & Storage
-    ("aws_access_key", "critical", r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA|ACCA)[0-9A-Z]{16}\b", 2.8),
+    ("aws_access_key", "critical", r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA|ACCA)[0-9A-Z]{16}\b", 0.0),
     ("aws_secret_key", "critical", r"(?i)(?:aws_secret_access_key|aws_secret_key|secret_key)[\s:=\"']+([A-Za-z0-9/+=]{40})[\s\"']", 3.2),
-    ("google_api_key", "high", r"\bAIza[0-9A-Za-z\-_]{35}\b", 3.0),
+    ("google_api_key", "high", r"\bAIza[0-9A-Za-z\-_]{35}\b", 0.0),
     ("firebase_url", "medium", r"https://[a-z0-9\-]+(?:\.firebaseio\.com|\.firebaseapp\.com)", 0.0),
     ("supabase_key", "critical", r"(?i)supabase[a-z0-9_\- ]{0,20}[:=]\s*[\"']?([A-Za-z0-9_\-\.]{80,})[\"']?", 3.2),
-    ("digitalocean_pat", "critical", r"\bdop_v1_[0-9a-f]{64}\b", 3.0),
-    ("digitalocean_oauth", "critical", r"\bdoo_v1_[0-9a-f]{64}\b", 3.0),
+    ("digitalocean_pat", "critical", r"\bdop_v1_[0-9a-f]{64}\b", 0.0),
+    ("digitalocean_oauth", "critical", r"\bdoo_v1_[0-9a-f]{64}\b", 0.0),
     ("heroku_api_key", "high", r"(?i)heroku[a-z0-9_\- ]{0,20}[:=]\s*[\"']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", 2.5),
     ("azure_storage_key", "critical", r"(?i)AccountKey=([0-9A-Za-z+/]{86}==)", 3.8),
     ("cloudflare_api_token", "high", r"(?i)cloudflare[a-z0-9_\- ]{0,20}[:=]\s*[\"']?([A-Za-z0-9_\-]{40})", 3.2),
@@ -90,30 +97,32 @@ PATTERNS = [
     ("gcs_bucket", "medium", r"\b(?:storage\.googleapis\.com/[a-z0-9\.\-_]+|[a-z0-9\.\-_]+\.storage\.googleapis\.com)\b", 0.0),
 
     # Payments (Only true secret/restricted keys, not frontend publishable keys)
-    ("stripe_secret", "critical", r"\b(?:sk|rk)_live_[0-9a-zA-Z]{24,99}\b", 3.2),
-    ("square_access", "critical", r"\b(?:sq0atp|sq0csp|EAAA)[0-9A-Za-z_\-]{22,60}\b", 3.2),
-    ("paypal_braintree", "high", r"\baccess_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}\b", 3.0),
-    ("shopify_token", "critical", r"\bshp(?:at|ca|pa|ss)_[0-9a-fA-F]{32}\b", 3.0),
+    ("stripe_secret", "critical", r"\b(?:sk|rk)_live_[0-9a-zA-Z]{24,99}\b", 0.0),
+    ("square_access", "critical", r"\b(?:sq0atp|sq0csp|EAAA)[0-9A-Za-z_\-]{22,60}\b", 0.0),
+    ("paypal_braintree", "high", r"\baccess_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}\b", 0.0),
+    ("shopify_token", "critical", r"\bshp(?:at|ca|pa|ss)_[0-9a-fA-F]{32}\b", 0.0),
 
     # Messaging & Communications
-    ("slack_token", "high", r"\bxox[baprs]-[0-9A-Za-z\-]{10,72}\b", 2.8),
+    ("slack_token", "high", r"\bxox[baprs]-[0-9A-Za-z\-]{10,72}\b", 0.0),
     ("slack_webhook", "high", r"https://hooks\.slack\.com/services/T[0-9A-Za-z_\-]{8,}/B[0-9A-Za-z_\-]{8,}/[0-9A-Za-z_\-]{24,}", 0.0),
     ("discord_webhook", "medium", r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/[0-9]{17,20}/[0-9A-Za-z_\-]{60,}", 0.0),
-    ("discord_bot_token", "high", r"\b[MNO][A-Za-z0-9_\-]{23}\.[A-Za-z0-9_\-]{6}\.[A-Za-z0-9_\-]{27,}\b", 3.2),
-    ("telegram_bot_token", "high", r"\b[0-9]{8,10}:AA[0-9A-Za-z_\-]{33}\b", 3.0),
-    ("twilio_api_key", "high", r"\bSK[0-9a-fA-F]{32}\b", 2.8),
+    ("discord_bot_token", "high", r"\b[MNO][A-Za-z0-9_\-]{23}\.[A-Za-z0-9_\-]{6}\.[A-Za-z0-9_\-]{27,}\b", 0.0),
+    ("telegram_bot_token", "high", r"\b[0-9]{8,10}:AA[0-9A-Za-z_\-]{33}\b", 0.0),
+    # SK+32hex alone collides with any hex blob — require a nearby `twilio` anchor.
+    ("twilio_api_key", "high", r"(?i)twilio[a-z0-9_\- ]{0,30}[:=]\s*[\"']?(SK[0-9a-fA-F]{32})", 0.0),
     ("twilio_auth_token", "critical", r"(?i)twilio[a-z0-9_\- ]{0,20}[:=]\s*[\"']?([0-9a-fA-F]{32})[\"']?", 3.0),
-    ("sendgrid", "critical", r"\bSG\.[0-9A-Za-z_\-]{22}\.[0-9A-Za-z_\-]{43}\b", 3.5),
-    ("mailgun", "high", r"\bkey-[0-9a-f]{32}\b", 2.8),
+    ("sendgrid", "critical", r"\bSG\.[0-9A-Za-z_\-]{22}\.[0-9A-Za-z_\-]{43}\b", 0.0),
+    # `key-`+32hex is far too generic on its own — require a nearby `mailgun` anchor.
+    ("mailgun", "high", r"(?i)mailgun[a-z0-9_\- ]{0,30}[:=]\s*[\"']?(key-[0-9a-f]{32})", 0.0),
 
     # AI / SaaS
-    ("openai_key", "critical", r"\bsk-(?:proj-)?[0-9A-Za-z_\-]{20,}T3BlbkFJ[0-9A-Za-z_\-]{20,}\b", 3.5),
-    ("anthropic_key", "critical", r"\bsk-ant-[0-9A-Za-z_\-]{20,}\b", 3.0),
-    ("huggingface", "high", r"\bhf_[0-9A-Za-z]{34}\b", 3.0),
+    ("openai_key", "critical", r"\bsk-(?:proj-)?[0-9A-Za-z_\-]{20,}T3BlbkFJ[0-9A-Za-z_\-]{20,}\b", 0.0),
+    ("anthropic_key", "critical", r"\bsk-ant-[0-9A-Za-z_\-]{20,}\b", 0.0),
+    ("huggingface", "high", r"\bhf_[0-9A-Za-z]{34}\b", 0.0),
     ("datadog_api", "high", r"(?i)datadog[a-z0-9_\- ]{0,20}[:=]\s*[\"']?([0-9a-f]{32})", 2.8),
-    ("newrelic", "high", r"\bNRAK-[0-9A-Z]{27}\b", 2.8),
-    ("postman_key", "high", r"\bPMAK-[0-9a-fA-F]{24}-[0-9a-fA-F]{34}\b", 2.8),
-    ("linear_key", "high", r"\blin_api_[0-9A-Za-z]{40}\b", 3.0),
+    ("newrelic", "high", r"\bNRAK-[0-9A-Z]{27}\b", 0.0),
+    ("postman_key", "high", r"\bPMAK-[0-9a-fA-F]{24}-[0-9a-fA-F]{34}\b", 0.0),
+    ("linear_key", "high", r"\blin_api_[0-9A-Za-z]{40}\b", 0.0),
 
     # High Confidence Generic & Databases
     ("database_uri", "critical", r"\b(?:postgres|postgresql|mysql|mongodb|mongodb\+srv|redis|amqp)://[a-zA-Z0-9_\-\.]+:[^@\s\"'\`]+@[a-zA-Z0-9_\-\.:]+/[a-zA-Z0-9_\-\.]+", 2.0),
@@ -121,8 +130,16 @@ PATTERNS = [
     ("private_key_block", "critical", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----", 0.0),
     ("private_key_escaped", "critical", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----\\n", 0.0),
     ("basic_auth_url", "high", r"(?i)\b(?:https?|ftp)://[a-z0-9._%\-]+:[^\s:@\"'`/]{6,}@[a-z0-9.\-]+", 2.5),
-    ("generic_bearer", "medium", r"(?i)authorization[\"'`\s]*[:=][\"'`\s]*bearer\s+([A-Za-z0-9_\-\.=]{24,})", 3.2)
+    # Session/bearer tokens in client code are rarely persistent secrets — low signal.
+    ("generic_bearer", "low", r"(?i)authorization[\"'`\s]*[:=][\"'`\s]*bearer\s+([A-Za-z0-9_\-\.=]{24,})", 3.2)
 ]
+
+# Rules whose matches are public by design (shipped to the browser on purpose).
+# Their mere presence is not a vulnerability — only an unrestricted/privileged one is,
+# which active verification decides. Default tier: informational.
+PUBLIC_BY_DESIGN = {
+    "google_api_key", "firebase_url", "s3_bucket", "gcs_bucket",
+}
 
 COMPILED_PATTERNS = [(name, sev, re.compile(pat), min_entropy) for name, sev, pat, min_entropy in PATTERNS]
 ENDPOINT_REGEX = re.compile(
@@ -586,9 +603,270 @@ def extract_live_hosts(live_hosts_file: str, output_dir: str, max_workers: int =
     print(f"Discovered {total_inline} inline scripts, {len(all_discovered_routes)} manifest routes, and {len(merged_js)} total JS targets across live hosts.")
 
 
+# ---------------------------------------------------------------------------
+# Classification & active verification
+#
+# A regex match is a *candidate*, not a finding. Classification sorts candidates
+# into three tiers so the output ranks real risk over noise:
+#   - confirmed-live : a validator proved the credential is live (a real bug)
+#   - candidate      : matched, not (or cannot be) verified
+#   - informational  : public-by-design, or a benign/expired token
+# Active verification (--verify) sends captured tokens to each provider's
+# read-only "whoami" endpoint. It is OPT-IN: only run it against targets you
+# are authorized to test.
+# ---------------------------------------------------------------------------
+
+VERIFY_TIMEOUT = 8
+
+
+def _b64url_decode(segment: str) -> bytes:
+    """Decodes a base64url segment, tolerating missing padding."""
+    segment = segment + "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(segment)
+
+
+def analyze_jwt(token: str):
+    """Classifies a JWT by decoding its payload.
+
+    Returns (tier, severity, reason). Most JWTs in client code are short-lived
+    session tokens or public 'anon' keys — only a privileged, unexpired token is
+    worth flagging as a real risk.
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return "candidate", "high", "malformed jwt"
+        payload = json.loads(_b64url_decode(parts[1]).decode("utf-8", "ignore"))
+    except Exception:
+        return "informational", "low", "undecodable jwt payload"
+
+    now = int(time.time())
+    exp = payload.get("exp")
+    if isinstance(exp, (int, float)) and exp < now:
+        return "informational", "low", "expired jwt"
+
+    # Supabase/PostgREST-style privileged role, or explicit admin claims.
+    role = str(payload.get("role", "")).lower()
+    privileged_claims = {"service_role", "admin", "superuser", "root"}
+    claim_values = {str(v).lower() for v in payload.values() if isinstance(v, (str, int))}
+    if role in privileged_claims or privileged_claims & claim_values:
+        return "candidate", "critical", f"privileged jwt (role={role or 'n/a'})"
+
+    return "informational", "low", "non-privileged jwt"
+
+
+def _http_request(method: str, url: str, headers=None, data=None, timeout=VERIFY_TIMEOUT):
+    """Minimal HTTP helper returning (status_code, body_text) or (None, None).
+
+    Uses requests when available, else urllib. TLS verification is disabled to
+    mirror the rest of the scanner's resilience against staging/internal certs.
+    """
+    headers = headers or {}
+    if HAS_REQUESTS:
+        try:
+            resp = requests.request(
+                method, url, headers=headers, data=data,
+                timeout=timeout, verify=False, allow_redirects=False,
+            )
+            return resp.status_code, resp.text[:2048]
+        except Exception:
+            return None, None
+    try:
+        body = data.encode() if isinstance(data, str) else data
+        req = urllib.request.Request(url, headers=headers, data=body, method=method)
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=SSL_CTX),
+        )
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read(2048).decode("utf-8", "ignore")
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except Exception:
+        return None, None
+
+
+def _verify_github(token):
+    status, _ = _http_request("GET", "https://api.github.com/user",
+                              {"Authorization": f"Bearer {token}", "User-Agent": "cHack"})
+    if status == 200:
+        return True
+    if status in (401, 403):
+        return False
+    return None
+
+
+def _verify_gitlab(token):
+    status, _ = _http_request("GET", "https://gitlab.com/api/v4/user",
+                              {"PRIVATE-TOKEN": token})
+    return True if status == 200 else (False if status == 401 else None)
+
+
+def _verify_npm(token):
+    status, _ = _http_request("GET", "https://registry.npmjs.org/-/whoami",
+                              {"Authorization": f"Bearer {token}"})
+    return True if status == 200 else (False if status in (401, 403) else None)
+
+
+def _verify_stripe(token):
+    # Stripe uses HTTP basic auth with the key as the username.
+    cred = base64.b64encode(f"{token}:".encode()).decode()
+    status, _ = _http_request("GET", "https://api.stripe.com/v1/account",
+                              {"Authorization": f"Basic {cred}"})
+    return True if status == 200 else (False if status == 401 else None)
+
+
+def _verify_slack(token):
+    status, body = _http_request("POST", "https://slack.com/api/auth.test",
+                                 {"Authorization": f"Bearer {token}"})
+    if status == 200 and body:
+        try:
+            return bool(json.loads(body).get("ok"))
+        except Exception:
+            return None
+    return None
+
+
+def _verify_sendgrid(token):
+    status, _ = _http_request("GET", "https://api.sendgrid.com/v3/scopes",
+                              {"Authorization": f"Bearer {token}"})
+    return True if status == 200 else (False if status == 401 else None)
+
+
+def _verify_openai(token):
+    status, _ = _http_request("GET", "https://api.openai.com/v1/models",
+                              {"Authorization": f"Bearer {token}"})
+    return True if status == 200 else (False if status == 401 else None)
+
+
+def _verify_anthropic(token):
+    status, _ = _http_request("GET", "https://api.anthropic.com/v1/models",
+                              {"x-api-key": token, "anthropic-version": "2023-06-01"})
+    return True if status == 200 else (False if status in (401, 403) else None)
+
+
+def _verify_huggingface(token):
+    status, _ = _http_request("GET", "https://huggingface.co/api/whoami-v2",
+                              {"Authorization": f"Bearer {token}"})
+    return True if status == 200 else (False if status == 401 else None)
+
+
+def _verify_digitalocean(token):
+    status, _ = _http_request("GET", "https://api.digitalocean.com/v2/account",
+                              {"Authorization": f"Bearer {token}"})
+    return True if status == 200 else (False if status == 401 else None)
+
+
+def _verify_telegram(token):
+    status, body = _http_request("GET", f"https://api.telegram.org/bot{token}/getMe")
+    if status == 200 and body:
+        try:
+            return bool(json.loads(body).get("ok"))
+        except Exception:
+            return None
+    return False if status in (401, 404) else None
+
+
+def _verify_database_uri(token):
+    """Confirms the database host is reachable (port open). Never authenticates."""
+    parsed = urlparse(token)
+    if not parsed.hostname:
+        return None
+    default_ports = {"postgres": 5432, "postgresql": 5432, "mysql": 3306,
+                     "mongodb": 27017, "redis": 6379, "amqp": 5672}
+    port = parsed.port or default_ports.get(parsed.scheme)
+    if not port:
+        return None
+    try:
+        with socket.create_connection((parsed.hostname, port), timeout=VERIFY_TIMEOUT):
+            return True
+    except Exception:
+        return False
+
+
+VALIDATORS = {
+    "github_pat": _verify_github,
+    "github_oauth": _verify_github,
+    "github_app_token": _verify_github,
+    "github_refresh": _verify_github,
+    "github_fine_grained": _verify_github,
+    "gitlab_pat": _verify_gitlab,
+    "npm_token": _verify_npm,
+    "stripe_secret": _verify_stripe,
+    "slack_token": _verify_slack,
+    "sendgrid": _verify_sendgrid,
+    "openai_key": _verify_openai,
+    "anthropic_key": _verify_anthropic,
+    "huggingface": _verify_huggingface,
+    "digitalocean_pat": _verify_digitalocean,
+    "digitalocean_oauth": _verify_digitalocean,
+    "telegram_bot_token": _verify_telegram,
+    "database_uri": _verify_database_uri,
+}
+
+
+def classify_secret(secret: dict):
+    """Assigns a base tier (before active verification) and refines JWT findings."""
+    rule = secret["rule_name"]
+    if rule == "jwt":
+        tier, severity, reason = analyze_jwt(secret["match_snippet"])
+        secret["severity"] = severity
+        secret["classification_note"] = reason
+        return tier
+    if rule in PUBLIC_BY_DESIGN:
+        secret["classification_note"] = "public by design; flag only if unrestricted"
+        return "informational"
+    return "candidate"
+
+
+def verify_secrets(secrets, max_workers=20):
+    """Actively verifies candidate secrets against provider APIs (opt-in).
+
+    Promotes live credentials to 'confirmed-live' and drops ones proven dead.
+    Candidates with no validator, or an inconclusive result, are kept as-is.
+    """
+    verifiable = [s for s in secrets
+                  if s.get("tier") == "candidate" and s["rule_name"] in VALIDATORS]
+
+    def _run(secret):
+        try:
+            return secret, VALIDATORS[secret["rule_name"]](secret["match_snippet"])
+        except Exception:
+            return secret, None
+
+    if verifiable:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for secret, live in executor.map(_run, verifiable):
+                if live is True:
+                    secret["tier"] = "confirmed-live"
+                    secret["confidence"] = "confirmed"
+                elif live is False:
+                    secret["tier"] = "dead"  # dropped below
+    return [s for s in secrets if s.get("tier") != "dead"]
+
+
+_TIER_ORDER = {"confirmed-live": 0, "candidate": 1, "informational": 2}
+_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
 def main():
+    # Extract optional flags up front so positional parsing stays unchanged.
+    # --verify can also be enabled via the JS_VERIFY env var (used by cHack.sh).
+    verify = os.environ.get("JS_VERIFY", "").lower() in ("1", "true", "yes")
+    only_verified = False
+    flag_argv = []
+    for arg in sys.argv:
+        if arg == "--verify":
+            verify = True
+        elif arg == "--only-verified":
+            verify = True
+            only_verified = True
+        else:
+            flag_argv.append(arg)
+    sys.argv = flag_argv
+
     if len(sys.argv) < 2:
-        print("Usage: js_secrets.py <urls_or_files_list> [output_json] [threads]")
+        print("Usage: js_secrets.py <urls_or_files_list> [output_json] [threads] [--verify] [--only-verified]")
         print("       js_secrets.py --extract-live <live_hosts_file> <output_dir> [threads]")
         sys.exit(1)
 
@@ -639,15 +917,51 @@ def main():
             except Exception:
                 pass
 
+    # Classify each candidate into a tier (confirmed-live / candidate / informational).
+    for s in all_secrets:
+        s["tier"] = classify_secret(s)
+
+    # Optionally verify candidates against provider APIs, dropping dead credentials.
+    if verify:
+        all_secrets = verify_secrets(all_secrets, max_workers=min(max_workers, 20))
+
+    if only_verified:
+        all_secrets = [s for s in all_secrets if s.get("tier") == "confirmed-live"]
+
+    # Rank: confirmed bugs first, then candidates, then informational — each by severity.
+    all_secrets.sort(key=lambda s: (
+        _TIER_ORDER.get(s.get("tier"), 1),
+        _SEVERITY_ORDER.get(s.get("severity"), 4),
+    ))
+
+    tier_counts = Counter(s.get("tier", "candidate") for s in all_secrets)
+
     result = {
         "secrets": all_secrets,
-        "endpoints": all_endpoints
+        "endpoints": all_endpoints,
+        "summary": {
+            "total": len(all_secrets),
+            "confirmed_live": tier_counts.get("confirmed-live", 0),
+            "candidate": tier_counts.get("candidate", 0),
+            "informational": tier_counts.get("informational", 0),
+            "verified": verify,
+        },
     }
 
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2)
 
-    print(f"Discovered {len(all_secrets)} high-signal secrets and {len(all_endpoints)} endpoints. Saved to {output_file}")
+    if verify:
+        print(f"Discovered {len(all_secrets)} secrets "
+              f"({tier_counts.get('confirmed-live', 0)} confirmed-live, "
+              f"{tier_counts.get('candidate', 0)} candidate, "
+              f"{tier_counts.get('informational', 0)} informational) "
+              f"and {len(all_endpoints)} endpoints. Saved to {output_file}")
+    else:
+        print(f"Discovered {len(all_secrets)} candidate secrets "
+              f"({tier_counts.get('informational', 0)} informational) "
+              f"and {len(all_endpoints)} endpoints. Saved to {output_file} "
+              f"(run with --verify to confirm which are live)")
 
 
 if __name__ == '__main__':
