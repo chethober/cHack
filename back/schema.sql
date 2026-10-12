@@ -59,11 +59,48 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
   command TEXT NOT NULL,
   domain TEXT NOT NULL,
   runner TEXT DEFAULT 'default', -- target runner (e.g. VPS-US)
-  status TEXT NOT NULL DEFAULT 'pending', -- pending, running, completed, failed
+  status TEXT NOT NULL DEFAULT 'pending', -- pending, running, completed, failed, blocked, skipped
   stdout TEXT DEFAULT '',
+  -- Task dependency graph (DAG) columns
+  job_type TEXT,                 -- phase name: subdomain_enum, httpx, naabu, katana, nuclei, ...
+  pipeline_id TEXT,              -- groups every job spawned from one recon run
+  parent_id TEXT,                -- the job whose completion spawned this one
+  result TEXT DEFAULT '{}',      -- JSON summary the phase emits (e.g. {"open_ports":[443]})
+  depends_on TEXT DEFAULT '[]',  -- JSON array of job ids that must complete before this runs (fan-in)
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_pipeline ON scan_jobs(pipeline_id);
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(status);
+
+-- Trigger rules table (the dependency graph, stored as editable data)
+-- When a job of `on_job_type` completes, its result JSON is tested against the
+-- condition; if it passes, a child job of `spawn_job_type` is enqueued.
+CREATE TABLE IF NOT EXISTS trigger_rules (
+  id TEXT PRIMARY KEY,
+  on_job_type TEXT NOT NULL,              -- parent phase that fires this rule
+  cond_key TEXT NOT NULL DEFAULT '',      -- key looked up in the parent's result JSON
+  cond_op TEXT NOT NULL DEFAULT 'always', -- always | exists | eq | gt | gte | contains
+  cond_value TEXT DEFAULT '',             -- compared value (numeric for gt/gte)
+  spawn_job_type TEXT NOT NULL,           -- child phase to enqueue when the condition holds
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_trigger_rules_on ON trigger_rules(on_job_type);
+
+-- Default dependency graph:
+--   subdomain_enum --(subdomains>0)--> httpx
+--   httpx --(live_hosts>0)--> naabu, katana
+--   naabu --(open_ports contains 443)--> httpx_fingerprint
+--   katana --(endpoints>0)--> nuclei
+INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES
+  ('rule_sub_httpx',    'subdomain_enum', 'subdomains', 'gt',       '0',   'httpx'),
+  ('rule_httpx_naabu',  'httpx',          'live_hosts', 'gt',       '0',   'naabu'),
+  ('rule_httpx_katana', 'httpx',          'live_hosts', 'gt',       '0',   'katana'),
+  ('rule_naabu_fp',     'naabu',          'open_ports', 'contains', '443', 'httpx_fingerprint'),
+  ('rule_katana_nuclei','katana',         'endpoints',  'gt',       '0',   'nuclei');
 
 -- Sessions table (persists Telegram bot state)
 CREATE TABLE IF NOT EXISTS sessions (

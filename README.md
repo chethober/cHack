@@ -62,6 +62,32 @@ A full scan (`-d <domain>`) runs six phases; individual phases are also exposed 
 
 Phases 3 and 4 run **in parallel** to cut wall-clock time.
 
+### Task dependency graph (DAG)
+
+Beyond the fixed pipeline, phases can be chained **conditionally** on their results. Each phase runs as its own queued job (`--phase <type> <domain>`) and emits a machine-readable result line (`##CHACK_RESULT## {…}`). When a job completes, the backend evaluates the `trigger_rules` table against that result and enqueues the child phases whose condition holds — so work only happens where it's warranted:
+
+- `subdomain_enum` finds subdomains **→** `httpx`
+- `httpx` finds live hosts **→** `naabu` **and** `katana`
+- `naabu` reports **443 open → `httpx_fingerprint`**
+- `katana` finds endpoints **→** `nuclei`
+
+Rules are editable data (not hardcoded), with conditions `always | exists | eq | gt | gte | contains`. Each phase runs at most once per pipeline (dedupe by `pipeline_id`), which also makes rule cycles impossible; jobs stuck `running` for 30 min are reaped so a dead runner can't stall the graph. Children inherit the parent's runner so phase output files stay local.
+
+```bash
+# Start a pipeline (seeds a subdomain_enum root; triggers cascade from there)
+curl -X POST "$BACKEND_URL/api/pipeline/start" -d '{"domain":"example.com","runner":"VPS-US"}'
+
+# Inspect the pipeline's jobs + per-node status/results
+curl "$BACKEND_URL/api/pipeline/<pipeline_id>"
+
+# List / add / remove trigger rules
+curl "$BACKEND_URL/api/rules"
+curl -X POST "$BACKEND_URL/api/rules" -d '{"on_job_type":"naabu","cond_key":"open_ports","cond_op":"contains","cond_value":"22","spawn_job_type":"nuclei"}'
+curl -X DELETE "$BACKEND_URL/api/rules/<rule_id>"
+```
+
+> After deploying the Worker, hit `GET /api/db/migrate` once to add the DAG columns, create `trigger_rules`, and seed the default graph on your live D1 database.
+
 ---
 
 ## ⚡ Install
@@ -104,8 +130,11 @@ Missing Go tools are installed automatically on first run and refreshed weekly.
 ./cHack.sh --network 192.168.1.1/24  # port & network service scan (IP / CIDR / domain)
 ./cHack.sh --fuzz example.com        # content & backup file discovery
 ./cHack.sh --vuln example.com        # vulnerability & DAST scanning
+./cHack.sh --phase naabu example.com # run one DAG phase, emitting a result line
 ./cHack.sh -t 100 -d example.com     # tune concurrency (default: 50)
 ```
+
+Phase types for `--phase`: `subdomain_enum`, `httpx`, `httpx_fingerprint`, `naabu`, `katana`, `nuclei`, `content_discovery`. These are what the dependency graph dispatches; see [Task dependency graph](#task-dependency-graph-dag).
 
 ### Runner daemon & sync
 ```bash

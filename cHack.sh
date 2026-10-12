@@ -1242,6 +1242,68 @@ run_network_recon() {
     update_network_services_results "$target"
 }
 
+# ==============================================================================
+# DAG Phase Runner — each node of the task dependency graph is one phase.
+# Emits a single machine-readable result line the runner forwards to the
+# backend, where trigger rules decide which child phases to enqueue.
+# ==============================================================================
+emit_result() {
+    # $1 = compact JSON object describing this phase's outcome
+    printf '##CHACK_RESULT## %s\n' "$1"
+}
+
+run_phase() {
+    local phase=$1
+    local domain=$2
+    local output_dir="$TARGETS_DIR/$domain"
+    mkdir -p "$output_dir"
+
+    case "$phase" in
+        subdomain_enum)
+            run_subdomain_enum "$domain"
+            emit_result "{\"job_type\":\"subdomain_enum\",\"subdomains\":$(count_lines "$output_dir/subdomains")}"
+            ;;
+        httpx|httpx_fingerprint)
+            run_httpx "$domain"
+            insert_company_and_domains "$domain"
+            update_httpx_results "$domain"
+            emit_result "{\"job_type\":\"$phase\",\"live_hosts\":$(count_lines "$output_dir/live_hosts")}"
+            ;;
+        naabu)
+            run_naabu "$domain"
+            update_port_scan_results "$domain"
+            update_network_services_results "$domain"
+            local ports_csv
+            ports_csv=$(awk -F: 'NF>1{print $2}' "$output_dir/ports" 2>/dev/null | grep -E '^[0-9]+$' | sort -un | paste -sd, -)
+            emit_result "{\"job_type\":\"naabu\",\"open_ports\":[${ports_csv}],\"ports_count\":$(count_lines "$output_dir/ports")}"
+            ;;
+        katana)
+            run_katana "$domain"
+            update_endpoints_results "$domain"
+            update_secrets_results "$domain"
+            update_js_results "$domain"
+            local js_count
+            js_count=$(jq 'length' "$output_dir/js_findings.json" 2>/dev/null || echo 0)
+            emit_result "{\"job_type\":\"katana\",\"endpoints\":$(count_lines "$output_dir/katana_raw"),\"js_files\":${js_count:-0}}"
+            ;;
+        nuclei)
+            run_nuclei "$domain"
+            update_findings_results "$domain"
+            local find_count
+            find_count=$(jq 'length' "$output_dir/all_findings.json" 2>/dev/null || echo 0)
+            emit_result "{\"job_type\":\"nuclei\",\"findings\":${find_count:-0}}"
+            ;;
+        content_discovery)
+            run_content_discovery "$domain"
+            emit_result "{\"job_type\":\"content_discovery\"}"
+            ;;
+        *)
+            log_error "Unknown phase: $phase"
+            return 1
+            ;;
+    esac
+}
+
 recon() {
     local domain=$1
     local start_time=$(date +%s)
@@ -2210,16 +2272,25 @@ runner_send_log() {
 runner_update_status() {
     local job_id="$1"
     local status="$2"
+    local result="$3"  # optional compact JSON emitted by the phase
 
     if [ -n "$BACKEND_URL" ]; then
         local payload
-        payload=$(jq -n --arg id "$job_id" --arg status "$status" '{id: $id, status: $status}')
+        if [ -n "$result" ]; then
+            # --argjson so the result is sent as a JSON object, not a string;
+            # fall back to a plain status payload if it isn't valid JSON.
+            payload=$(jq -n --arg id "$job_id" --arg status "$status" --argjson result "$result" \
+                '{id: $id, status: $status, result: $result}' 2>/dev/null) \
+                || payload=$(jq -n --arg id "$job_id" --arg status "$status" '{id: $id, status: $status}')
+        else
+            payload=$(jq -n --arg id "$job_id" --arg status "$status" '{id: $id, status: $status}')
+        fi
         curl -s -X POST "$BACKEND_URL/api/runner/status" \
             -H "Content-Type: application/json" \
             -d "$payload" >/dev/null 2>&1
     fi
 
-    python3 "$SCRIPT_DIR/db_sqlite.py" update_status "$job_id" "$status" >/dev/null 2>&1
+    python3 "$SCRIPT_DIR/db_sqlite.py" update_status "$job_id" "$status" "$result" >/dev/null 2>&1
 }
 
 runner_poll_for_jobs() {
@@ -2251,21 +2322,30 @@ runner_poll_for_jobs() {
 
     python3 "$SCRIPT_DIR/db_sqlite.py" update_status "$job_id" "running" >/dev/null 2>&1
 
+    local out_file
+    out_file=$(mktemp "/tmp/chack_out_XXXXXX" 2>/dev/null || mktemp)
+
     local log_line
     eval "\"$SCRIPT_DIR/cHack.sh\" $command_str" 2>&1 | while IFS= read -r log_line || [ -n "$log_line" ]; do
         echo "$log_line"
+        printf '%s\n' "$log_line" >> "$out_file"
         runner_send_log "$job_id" "$log_line"$'\n'
     done
 
     local exit_code=${PIPESTATUS[0]}
     log_info "🏁 [Job $job_id] Process exited with code: $exit_code"
 
+    # Extract the phase result line (last one wins) for DAG trigger evaluation.
+    local result_json=""
+    result_json=$(grep -a '##CHACK_RESULT##' "$out_file" 2>/dev/null | tail -n1 | sed 's/.*##CHACK_RESULT##[[:space:]]*//')
+    rm -f "$out_file"
+
     local final_status="completed"
     if [ $exit_code -ne 0 ]; then
         final_status="failed"
     fi
 
-    runner_update_status "$job_id" "$final_status"
+    runner_update_status "$job_id" "$final_status" "$result_json"
 }
 
 main() {
@@ -2275,6 +2355,8 @@ main() {
     local NET_TARGET=""
     local FUZZ_TARGET=""
     local VULN_TARGET=""
+    local PHASE=""
+    local PHASE_TARGET=""
     local PERSON=""
     local COMPANY=""
     local USERNAME=""
@@ -2340,6 +2422,12 @@ main() {
                 if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
                 VULN_TARGET="$2"
                 shift 2
+                ;;
+            --phase)
+                if [ $# -lt 3 ]; then log_error "Option --phase requires <type> <domain>."; exit 1; fi
+                PHASE="$2"
+                PHASE_TARGET="$3"
+                shift 3
                 ;;
             -p|--person)
                 if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
@@ -2413,6 +2501,12 @@ main() {
     if [ "$FORCE_TUI" = true ]; then
         launch_tui
         exit 0
+    fi
+
+    # Single DAG phase (dispatched by the backend dependency graph)
+    if [ -n "$PHASE" ]; then
+        run_phase "$PHASE" "$PHASE_TARGET"
+        exit $?
     fi
 
     # Targeted Info Gathering
