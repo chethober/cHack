@@ -1690,8 +1690,8 @@ tui_tool_diagnostics() {
 }
 
 tui_db_explorer() {
-    local db_keys=("1" "2" "3" "4" "5" "6" "7" "8" "0")
-    local db_icons=("🏢" "📋" "🔑" "🛡️ " "🔌" "📜" "☁️ " "🔄" "⬅️ ")
+    local db_keys=("1" "2" "3" "4" "5" "6" "7" "8" "9" "0")
+    local db_icons=("🏢" "📋" "🔑" "🛡️ " "🔌" "📜" "☁️ " "🔄" "🔍" "⬅️ ")
     local db_titles=(
         "List Targets & Companies"
         "Generate Domain Report"
@@ -1701,6 +1701,7 @@ tui_db_explorer() {
         "View Recent Scan Jobs & Logs"
         "Sync Targets to Cloudflare & SQLite"
         "Initialize / Reset SQLite Database"
+        "Search & Analytics"
         "Back to Main Menu"
     )
     local db_descs=(
@@ -1712,6 +1713,7 @@ tui_db_explorer() {
         "Inspect background runner jobs and stdout"
         "Sync on-disk targets to Cloudflare D1 & local SQLite"
         "Re-run schema.sql on local SQLite"
+        "Search hosts, services, tech, secrets, findings, risk"
         ""
     )
 
@@ -1830,6 +1832,23 @@ tui_db_explorer() {
                 tui_input "Initialize local SQLite database with schema? (y/N)" "N" "confirm_init"
                 if [[ "$confirm_init" =~ ^[Yy]$ ]]; then
                     python3 "$SCRIPT_DIR/db_sqlite.py" init
+                fi
+                tui_pause
+                ;;
+            9)
+                tui_banner
+                tui_section_header "Search & Analytics"
+                echo -e "  Search across hosts, services, tech stack, exposed credentials, and findings."
+                echo -e "  Kinds: ${TUI_CYAN}all${TUI_RESET} (default) | domain | service | tech | secret | finding | risk | asn"
+                echo -e "  For ${TUI_CYAN}risk${TUI_RESET}, enter a minimum score as the term (e.g. term=10, kind=risk)."
+                echo ""
+                local search_term search_kind
+                tui_input "Search term" "" "search_term"
+                if [ -n "$search_term" ]; then
+                    tui_input "Kind (blank = all)" "all" "search_kind"
+                    [ -z "$search_kind" ] && search_kind="all"
+                    echo ""
+                    python3 "$SCRIPT_DIR/db_sqlite.py" search "$search_term" "$search_kind" | jq '.'
                 fi
                 tui_pause
                 ;;
