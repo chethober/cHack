@@ -2222,6 +2222,23 @@ runner_update_status() {
     python3 "$SCRIPT_DIR/db_sqlite.py" update_status "$job_id" "$status" >/dev/null 2>&1
 }
 
+# Write a local audit entry for a scan as it begins. Source is derived from the
+# invocation context: a job carrying --sender-id originated from Telegram (and is
+# being executed by this runner); an interactive invocation is the TUI; anything
+# else is a direct CLI run. Best-effort — a failing audit never aborts a scan.
+audit_scan_start() {
+    local action="$1" target="$2"
+    local src actor num
+    if [ -n "$SENDER_ID" ]; then
+        src="telegram"; actor="tg:${SENDER_ID}"; num="$SENDER_ID"
+    elif [ -t 0 ]; then
+        src="tui"; actor="${USER:-$(id -un 2>/dev/null || echo unknown)}"; num=0
+    else
+        src="cli"; actor="${USER:-$(id -un 2>/dev/null || echo unknown)}"; num=0
+    fi
+    python3 "$SCRIPT_DIR/db_sqlite.py" audit "$action" "$src" "$actor" "$num" domain "$target" allow >/dev/null 2>&1 || true
+}
+
 runner_poll_for_jobs() {
     local url="${BACKEND_URL}/api/runner/next-job?runner=${RUNNER_NAME}"
     local res
@@ -2417,30 +2434,35 @@ main() {
 
     # Targeted Info Gathering
     if [ -n "$INFO_GATHER" ]; then
+        audit_scan_start "scan.infogather" "$INFO_GATHER"
         run_info_gathering "$INFO_GATHER"
         exit 0
     fi
 
     # Web Recon
     if [ -n "$WEB_TARGET" ]; then
+        audit_scan_start "scan.web" "$WEB_TARGET"
         run_web_recon "$WEB_TARGET"
         exit 0
     fi
 
     # Network Recon
     if [ -n "$NET_TARGET" ]; then
+        audit_scan_start "scan.network" "$NET_TARGET"
         run_network_recon "$NET_TARGET"
         exit 0
     fi
 
     # Content Fuzzing
     if [ -n "$FUZZ_TARGET" ]; then
+        audit_scan_start "scan.content" "$FUZZ_TARGET"
         run_content_discovery "$FUZZ_TARGET"
         exit 0
     fi
 
     # Vulnerability Scan
     if [ -n "$VULN_TARGET" ]; then
+        audit_scan_start "scan.vuln" "$VULN_TARGET"
         run_nuclei "$VULN_TARGET"
         exit 0
     fi
@@ -2451,6 +2473,7 @@ main() {
             log_error "Invalid domain format: $DOMAIN"
             exit 1
         fi
+        audit_scan_start "scan.recon" "$DOMAIN"
         recon "$DOMAIN"
         exit 0
     fi

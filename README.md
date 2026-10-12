@@ -144,6 +144,54 @@ Once the Worker is deployed and a runner daemon is online, control everything fr
 
 ---
 
+## 🔐 Access Control & Audit
+
+cHack supports multiple operators with role-based access and a tamper-evident
+audit trail across every surface (Telegram, CLI/TUI, and the runner daemon).
+
+### Roles
+
+| Role | Capabilities |
+| :--- | :--- |
+| **superadmin** | Everything, incl. DB reset and granting `admin`. Defined by `ADMIN_IDS`; never stored in the DB. |
+| **admin** | Manage targets/contacts, grant roles & team scopes, view the audit log. |
+| **operator** | Launch scans against in-scope targets (teams they belong to, or unclaimed targets). |
+| **viewer** | Read-only: dashboards, findings, reports. Cannot scan. |
+| *pending* | Registered but not yet granted access. Can do nothing until promoted. |
+
+A target's **scope** is the company (team) that owns its domain. An operator may
+only scan targets belonging to a team they are a member of (admins/superadmins
+bypass scope). Membership is managed per team.
+
+> **Backward compatibility:** with `ADMIN_IDS` empty the bot stays wide-open
+> (single-tenant legacy mode — every caller is treated as an admin). As soon as
+> any `ADMIN_IDS` value is set, multi-user RBAC is enforced and new users start
+> as *pending*.
+
+### Management commands (Telegram)
+
+| Command | Role | Description |
+| :--- | :--- | :--- |
+| `/whoami` | viewer | Show your ID, global role, and team memberships |
+| `/users` | admin | List registered users and their roles |
+| `/role <id> <role>` | admin¹ | Set a user's global role (`pending\|viewer\|operator\|admin`) |
+| `/grant <id> <company> [role]` | admin | Add a user to a team (default team role: `operator`) |
+| `/revoke <id> <company>` | admin | Remove a user from a team |
+| `/members [company]` | admin | List team memberships |
+| `/audit [n]` | admin | Show the last `n` audit entries (default 15, max 50) |
+
+¹ Only a superadmin may grant or change the `admin` role.
+
+### Audit log
+
+Every scan and sensitive action (role/scope changes, deletions, DB reset, and
+denied attempts) is appended to the `audit_log` table with actor, source,
+decision (allow/deny), target, and scope. The audit log is **not** cleared by a
+database reset. Local CLI/TUI and daemon scans are recorded on each runner;
+Telegram actions and runner dispatch are recorded centrally in D1.
+
+---
+
 ## ⚙️ Configuration
 
 ### Runner (`.env`)

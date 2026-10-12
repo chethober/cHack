@@ -1233,6 +1233,157 @@ const escapeHtml = (str) => {
     .replace(/'/g, '&#039;');
 };
 
+// ===========================================================================
+// RBAC & Audit helpers (role-based access and audit controls)
+// ===========================================================================
+
+// Global role hierarchy. Higher rank = more privilege. "superadmin" is granted
+// out-of-band via the ADMIN_IDS secret and is never stored in the DB.
+const ROLE_RANK = { pending: 0, viewer: 1, operator: 2, admin: 3, superadmin: 4 };
+const roleRank = (role) => ROLE_RANK[role] ?? 0;
+
+const parseAdminIds = (env) => (env.ADMIN_IDS || "")
+  .split(",")
+  .map((id) => Number(String(id).trim()))
+  .filter((id) => Number.isFinite(id) && id !== 0);
+
+// Resolve the acting user into an authorization context. Pure read; never
+// mutates. `legacyOpen` reproduces the pre-RBAC behaviour: when no ADMIN_IDS
+// are configured the bot is wide open and every caller is treated as admin, so
+// existing single-tenant deployments keep working unchanged.
+const resolveActor = async (env, from) => {
+  const numberId = from?.id || 0;
+  const adminIds = parseAdminIds(env);
+  const legacyOpen = adminIds.length === 0;
+  const isSuperadmin = adminIds.includes(numberId);
+
+  let user = null;
+  try {
+    user = await env.DB.prepare(
+      "SELECT id, username, role FROM users WHERE number_id = ?"
+    ).bind(numberId).first();
+  } catch (_) { /* table may be mid-migration */ }
+
+  let memberships = [];
+  if (user?.id) {
+    try {
+      const res = await env.DB.prepare(
+        "SELECT company_id, role FROM team_members WHERE user_id = ?"
+      ).bind(user.id).all();
+      memberships = res?.results || [];
+    } catch (_) { /* team_members may not exist yet */ }
+  }
+
+  // Effective global role. Superadmins (ADMIN_IDS) always win. When no ADMIN_IDS
+  // are configured the deployment is single-tenant/legacy and the sole operator
+  // is treated as a superadmin, preserving pre-RBAC behaviour (including reset).
+  let role = user?.role || 'pending';
+  const effectiveSuper = isSuperadmin || legacyOpen;
+  if (effectiveSuper) role = 'superadmin';
+
+  const teamRoleFor = (companyId) => {
+    const m = memberships.find((x) => x.company_id === companyId);
+    return m ? m.role : null;
+  };
+
+  return {
+    numberId,
+    userId: user?.id || null,
+    username: user?.username || (from?.username ? `@${from.username}` : `user_${numberId}`),
+    role,
+    rank: roleRank(role),
+    isSuperadmin: effectiveSuper,
+    legacyOpen,
+    memberships,
+    teamRoleFor,
+    hasGlobal: (min) => roleRank(role) >= roleRank(min),
+  };
+};
+
+// Append-only audit write. Best-effort: a logging failure must never block or
+// crash the action being logged. Callable from both bot and runner contexts.
+const auditLog = async (env, entry) => {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO audit_log
+         (id, actor_user_id, actor_number_id, actor_label, source, action,
+          decision, target_type, target, company_id, detail)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      crypto.randomUUID(),
+      entry.actor_user_id || null,
+      entry.actor_number_id || 0,
+      entry.actor_label || null,
+      entry.source || 'telegram',
+      entry.action,
+      entry.decision || 'allow',
+      entry.target_type || null,
+      entry.target || null,
+      entry.company_id || null,
+      JSON.stringify(entry.detail || {})
+    ).run();
+  } catch (err) {
+    console.error("audit_log write failed:", err.message);
+  }
+};
+
+// Per-user/team target-scope check. Returns { allowed, companyId, reason }.
+// Policy:
+//   - viewer/pending: never allowed to scan.
+//   - admin/superadmin (global): may scan any target.
+//   - operator (global): may scan a target whose company they belong to, or a
+//     target not yet claimed by any company (first scan claims nothing by
+//     itself, but is permitted so a team can onboard new in-scope assets).
+//   - a target belonging to a company the operator is NOT a member of is denied.
+const checkScanScope = async (env, actor, targetValue) => {
+  if (!actor.hasGlobal('operator')) {
+    return { allowed: false, companyId: null, reason: 'insufficient-role' };
+  }
+  if (actor.hasGlobal('admin')) {
+    // Still resolve company for attribution, but never block.
+    const companyId = await resolveTargetCompany(env, targetValue);
+    return { allowed: true, companyId, reason: 'admin-bypass' };
+  }
+  // operator: enforce team scope.
+  const companyId = await resolveTargetCompany(env, targetValue);
+  if (!companyId) {
+    return { allowed: true, companyId: null, reason: 'unclaimed-target' };
+  }
+  const member = actor.memberships.some((m) => m.company_id === companyId);
+  return member
+    ? { allowed: true, companyId, reason: 'team-member' }
+    : { allowed: false, companyId, reason: 'out-of-scope' };
+};
+
+// Best-effort resolution of a scan target to its owning company. Matches an
+// exact domain host first, then its registrable parent (sub.example.com ->
+// example.com), then a company name/slug. Returns a company id or null.
+const resolveTargetCompany = async (env, value) => {
+  if (!value) return null;
+  const v = String(value).trim().toLowerCase();
+  try {
+    const dom = await env.DB.prepare(
+      "SELECT company_id FROM domains WHERE lower(host) = ? LIMIT 1"
+    ).bind(v).first();
+    if (dom?.company_id) return dom.company_id;
+
+    const parts = v.split('.');
+    if (parts.length > 2) {
+      const parent = parts.slice(-2).join('.');
+      const pdom = await env.DB.prepare(
+        "SELECT company_id FROM domains WHERE lower(host) = ? LIMIT 1"
+      ).bind(parent).first();
+      if (pdom?.company_id) return pdom.company_id;
+    }
+
+    const comp = await env.DB.prepare(
+      "SELECT id FROM companies WHERE lower(name) = ? OR lower(slug) = ? LIMIT 1"
+    ).bind(v, v).first();
+    if (comp?.id) return comp.id;
+  } catch (_) { /* best effort */ }
+  return null;
+};
+
 const createMainMenu = async (ctx, env) => {
   const currentRunner = ctx.session?.selected_runner || 'default';
   let runnerStatusText = `⚙️ ${currentRunner}`;
@@ -1331,14 +1482,56 @@ const getBot = (env) => {
     }
   });
 
-  // Admin access gate middleware
+  // RBAC access gate middleware.
+  // Registers the caller (so admins can later reference/promote them), resolves
+  // their effective role, and enforces a minimum of "viewer". Unknown callers
+  // are recorded as role='pending' and denied with a friendly message rather
+  // than silently dropped. Backward compatible: with no ADMIN_IDS configured the
+  // bot stays wide open (every caller resolves to admin via legacyOpen).
   bot.use(async (ctx, next) => {
     if (!ctx.from) return;
-    const adminIdsStr = env.ADMIN_IDS || "";
-    const adminIds = adminIdsStr.split(",").map(id => Number(id.trim())).filter(id => !isNaN(id));
-    
-    if (adminIds.length > 0 && !adminIds.includes(ctx.from.id)) {
-      console.log(`Unauthorized access attempt by Telegram ID: ${ctx.from.id}`);
+    const u = ctx.from;
+    const username = u.username ? `@${u.username}` : `user_${u.id}`;
+
+    // Upsert the user row without ever clobbering an assigned role.
+    try {
+      const existing = await env.DB.prepare(
+        "SELECT id FROM users WHERE number_id = ?"
+      ).bind(u.id).first();
+      if (!existing) {
+        await env.DB.prepare(
+          `INSERT INTO users (id, username, number_id, first_name, last_name, role)
+           VALUES (?, ?, ?, ?, ?, 'pending')`
+        ).bind(crypto.randomUUID(), u.username || `user_${u.id}`, u.id,
+               u.first_name || '', u.last_name || '').run();
+      }
+    } catch (err) {
+      console.error("user upsert error:", err.message);
+    }
+
+    const actor = await resolveActor(env, u);
+    ctx.actor = actor;
+
+    // Minimum access is "viewer". A user with no global role but who belongs to
+    // at least one team is also admitted (team-scoped access).
+    const admitted = actor.hasGlobal('viewer') || actor.memberships.length > 0;
+    if (!admitted) {
+      console.log(`Access pending/denied for Telegram ID: ${u.id} (${username})`);
+      await auditLog(env, {
+        actor_user_id: actor.userId, actor_number_id: u.id, actor_label: username,
+        source: 'telegram', action: 'access.denied', decision: 'deny',
+        target_type: 'user', target: String(u.id),
+        detail: { role: actor.role, reason: 'not-provisioned' },
+      });
+      try {
+        await ctx.reply(
+          "⛔ <b>Access pending.</b>\n\nYour Telegram account is registered but has " +
+          "not been granted a role yet. Ask an administrator to run " +
+          `<code>/grant ${u.id} viewer</code> (or a higher role).\n\n` +
+          `Your ID: <code>${u.id}</code>`,
+          { parse_mode: "HTML" }
+        ).catch(() => {});
+      } catch (_) { /* ignore */ }
       return;
     }
     await next();
@@ -1390,9 +1583,39 @@ const getBot = (env) => {
     return `<b><a href="http://${host}">${escapeHtml(host)}</a></b> ${statusStr} ~ <i>${escapeHtml(title)}</i> | <code>${escapeHtml(tech)}</code>`;
   };
 
-  // Queue scan helper
+  // Map scan type -> audit action name.
+  const SCAN_ACTION = {
+    domain: 'scan.recon', person: 'scan.person', company: 'scan.company',
+    infogather: 'scan.infogather', web: 'scan.web', network: 'scan.network',
+  };
+
+  // Queue scan helper. Enforces per-user/team target scope before enqueuing,
+  // records attribution on the job row, and writes an audit entry (allow/deny).
+  // Returns the job id on success, or null if the scan was denied (a reply has
+  // already been sent to the user in that case).
   const triggerScan = async (ctx, type, value, runner = 'default') => {
+    const actor = ctx.actor || await resolveActor(env, ctx.from);
     const userId = ctx.from?.id || 0;
+    const action = SCAN_ACTION[type] || 'scan.unknown';
+
+    // Scope enforcement.
+    const scope = await checkScanScope(env, actor, value);
+    if (!scope.allowed) {
+      await auditLog(env, {
+        actor_user_id: actor.userId, actor_number_id: userId, actor_label: actor.username,
+        source: 'telegram', action, decision: 'deny',
+        target_type: type, target: value, company_id: scope.companyId,
+        detail: { reason: scope.reason, role: actor.role },
+      });
+      const msg = scope.reason === 'insufficient-role'
+        ? "⛔ <b>Not allowed.</b> Scanning requires the <code>operator</code> role or higher. " +
+          "Ask an admin to raise your role with <code>/role</code>."
+        : "⛔ <b>Out of scope.</b> That target belongs to a team you are not a member of. " +
+          "Ask an admin to add you with <code>/grant</code>, or pick an in-scope target.";
+      await ctx.reply(msg, { parse_mode: "HTML" }).catch(() => {});
+      return null;
+    }
+
     let command = "";
     if (type === 'domain') {
       command = `-d ${value} --sender-id ${userId}`;
@@ -1412,12 +1635,40 @@ const getBot = (env) => {
     } else if (type === 'network') {
       command = `--network ${value} --sender-id ${userId}`;
     }
-    
+
     const id = crypto.randomUUID();
     await env.DB.prepare(
-      "INSERT INTO scan_jobs (id, command, domain, runner, status) VALUES (?, ?, ?, ?, 'pending')"
-    ).bind(id, command, value, runner).run();
+      `INSERT INTO scan_jobs
+         (id, command, domain, runner, status, requested_by, requested_by_number_id, company_id, source)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, 'telegram')`
+    ).bind(id, command, value, runner, actor.userId, userId, scope.companyId).run();
+
+    await auditLog(env, {
+      actor_user_id: actor.userId, actor_number_id: userId, actor_label: actor.username,
+      source: 'telegram', action, decision: 'allow',
+      target_type: type, target: value, company_id: scope.companyId,
+      detail: { job_id: id, runner, scope: scope.reason },
+    });
     return id;
+  };
+
+  // Guard a handler to a minimum global role. On failure it audits the denial,
+  // replies, and returns false so the caller can `return` early.
+  const requireRole = async (ctx, min, action, targetType = null, target = null) => {
+    const actor = ctx.actor || await resolveActor(env, ctx.from);
+    if (actor.hasGlobal(min)) return true;
+    await auditLog(env, {
+      actor_user_id: actor.userId, actor_number_id: ctx.from?.id || 0, actor_label: actor.username,
+      source: 'telegram', action, decision: 'deny', target_type: targetType, target,
+      detail: { reason: 'insufficient-role', required: min, role: actor.role },
+    });
+    const msg = `⛔ Requires the ${min} role. Ask an admin to raise your role.`;
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: msg, show_alert: true }).catch(() => {});
+    } else {
+      await ctx.reply(msg, { parse_mode: "HTML" }).catch(() => {});
+    }
+    return false;
   };
 
   const createRunnerKeyboard = async () => {
@@ -1635,12 +1886,19 @@ const getBot = (env) => {
 
   bot.command("clean", async (ctx) => {
     await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'queue.clean')) return;
     const res = await env.DB.prepare("DELETE FROM scan_jobs WHERE status IN ('completed', 'failed')").run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor?.userId, actor_number_id: ctx.from?.id || 0,
+      actor_label: ctx.actor?.username, source: 'telegram', action: 'queue.clean',
+      target_type: 'job', detail: {},
+    });
     await ctx.reply(`🧹 Cleaned up finished/failed scan jobs from queue.`);
   });
 
   bot.command("newcompany", async (ctx) => {
     await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'company.create')) return;
     ctx.session.step = 'COMPANY_INPUT';
     await ctx.reply("🏢 <b>Target: Company / Domain</b>\n\nPlease send me the company name or domain (e.g. <code>CHTH Corp</code> or <code>chth.xyz</code>):", {
       parse_mode: "HTML",
@@ -1652,6 +1910,7 @@ const getBot = (env) => {
 
   bot.command("newperson", async (ctx) => {
     await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'person.create')) return;
     ctx.session.step = 'PERSON_INPUT';
     await ctx.reply("🔍 <b>Target: Person</b>\n\nSend me the person's phone number (<code>+1555...</code>), username (<code>@che...</code>), or name (e.g. <code>Cheth Ober</code>):", {
       parse_mode: "HTML",
@@ -1662,6 +1921,8 @@ const getBot = (env) => {
   });
 
   bot.command("delcompany", async (ctx) => {
+    await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'company.delete')) return;
     const name = ctx.match?.trim();
     if (!name) {
       return await ctx.reply("❌ Usage: <code>/delcompany &lt;company name or slug&gt;</code>", { parse_mode: "HTML" });
@@ -1671,10 +1932,16 @@ const getBot = (env) => {
       return await ctx.reply(`❌ Company <code>${escapeHtml(name)}</code> not found.`, { parse_mode: "HTML" });
     }
     await env.DB.prepare("DELETE FROM companies WHERE id = ?").bind(comp.id).run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor?.userId, actor_number_id: ctx.from?.id || 0, actor_label: ctx.actor?.username,
+      source: 'telegram', action: 'company.delete', target_type: 'company', target: comp.name, company_id: comp.id, detail: {},
+    });
     await ctx.reply(`🗑️ Company <code>${escapeHtml(comp.name)}</code> and all associated domains/findings deleted.`, { parse_mode: "HTML" });
   });
 
   bot.command("deldomain", async (ctx) => {
+    await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'domain.delete')) return;
     const host = ctx.match?.trim()?.toLowerCase();
     if (!host) {
       return await ctx.reply("❌ Usage: <code>/deldomain &lt;host&gt;</code>", { parse_mode: "HTML" });
@@ -1684,10 +1951,16 @@ const getBot = (env) => {
       return await ctx.reply(`❌ Domain <code>${escapeHtml(host)}</code> not found.`, { parse_mode: "HTML" });
     }
     await env.DB.prepare("DELETE FROM domains WHERE id = ?").bind(dom.id).run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor?.userId, actor_number_id: ctx.from?.id || 0, actor_label: ctx.actor?.username,
+      source: 'telegram', action: 'domain.delete', target_type: 'domain', target: host, company_id: dom.company_id, detail: {},
+    });
     await ctx.reply(`🗑️ Domain <code>${escapeHtml(host)}</code> deleted.`, { parse_mode: "HTML" });
   });
 
   bot.command("delperson", async (ctx) => {
+    await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'person.delete')) return;
     const name = ctx.match?.trim();
     if (!name) {
       return await ctx.reply("❌ Usage: <code>/delperson &lt;first name&gt;</code>", { parse_mode: "HTML" });
@@ -1697,6 +1970,10 @@ const getBot = (env) => {
       return await ctx.reply(`❌ Person <code>${escapeHtml(name)}</code> not found.`, { parse_mode: "HTML" });
     }
     await env.DB.prepare("DELETE FROM people WHERE id = ?").bind(person.id).run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor?.userId, actor_number_id: ctx.from?.id || 0, actor_label: ctx.actor?.username,
+      source: 'telegram', action: 'person.delete', target_type: 'person', target: name, company_id: person.company_id, detail: {},
+    });
     await ctx.reply(`🗑️ Contact <code>${escapeHtml(person.given_name)} ${escapeHtml(person.family_name || '')}</code> deleted.`, { parse_mode: "HTML" });
   });
 
@@ -1873,6 +2150,7 @@ const getBot = (env) => {
     }
     const runner = ctx.session?.selected_runner || 'default';
     const jobId = await triggerScan(ctx, 'domain', domain, runner);
+    if (!jobId) return; // scan denied by scope/role (reply already sent)
     await ctx.reply(
       `🚀 <b>Full Recon Scan Queued</b>\n\n` +
       `• <b>Target:</b> <code>${escapeHtml(domain)}</code>\n` +
@@ -1898,6 +2176,7 @@ const getBot = (env) => {
     }
     const runner = ctx.session?.selected_runner || 'default';
     const jobId = await triggerScan(ctx, 'infogather', domain, runner);
+    if (!jobId) return; // scan denied by scope/role (reply already sent)
     await ctx.reply(
       `🔍 <b>Info-Gathering Scan Queued</b>\n\n` +
       `• <b>Target:</b> <code>${escapeHtml(domain)}</code>\n` +
@@ -1923,6 +2202,7 @@ const getBot = (env) => {
     }
     const runner = ctx.session?.selected_runner || 'default';
     const jobId = await triggerScan(ctx, 'web', domain, runner);
+    if (!jobId) return; // scan denied by scope/role (reply already sent)
     await ctx.reply(
       `🌐 <b>Web Recon & Crawl Queued</b>\n\n` +
       `• <b>Target:</b> <code>${escapeHtml(domain)}</code>\n` +
@@ -1948,6 +2228,7 @@ const getBot = (env) => {
     }
     const runner = ctx.session?.selected_runner || 'default';
     const jobId = await triggerScan(ctx, 'network', target, runner);
+    if (!jobId) return; // scan denied by scope/role (reply already sent)
     await ctx.reply(
       `🔌 <b>Network & Port Scan Queued</b>\n\n` +
       `• <b>Target:</b> <code>${escapeHtml(target)}</code>\n` +
@@ -2156,6 +2437,7 @@ const getBot = (env) => {
 
   bot.command(["resetdb", "reset"], async (ctx) => {
     await registerUser(ctx);
+    if (!await requireRole(ctx, 'superadmin', 'db.reset')) return;
     await ctx.reply(
       `⚠️ <b>DANGER: Reset Cloudflare Database</b>\n\n` +
       `Are you sure you want to permanently delete <b>ALL</b> data in Cloudflare DB?\n\n` +
@@ -2187,6 +2469,207 @@ const getBot = (env) => {
     );
   });
 
+  // ===========================================================================
+  // RBAC management commands
+  // ===========================================================================
+
+  const VALID_GLOBAL_ROLES = ['pending', 'viewer', 'operator', 'admin'];
+  const VALID_TEAM_ROLES = ['viewer', 'operator', 'admin'];
+
+  // Resolve a company by slug or name for membership commands.
+  const findCompany = async (q) => env.DB.prepare(
+    "SELECT id, name, slug FROM companies WHERE lower(slug) = lower(?) OR lower(name) = lower(?) LIMIT 1"
+  ).bind(q, q).first();
+
+  // /whoami — show your identity, role and team memberships (viewer+).
+  bot.command("whoami", async (ctx) => {
+    const a = ctx.actor || await resolveActor(env, ctx.from);
+    let teams = "none";
+    if (a.memberships.length) {
+      const ids = a.memberships.map((m) => m.company_id);
+      const placeholders = ids.map(() => '?').join(',');
+      const rows = await env.DB.prepare(
+        `SELECT id, name FROM companies WHERE id IN (${placeholders})`
+      ).bind(...ids).all();
+      const nameById = Object.fromEntries((rows?.results || []).map((r) => [r.id, r.name]));
+      teams = a.memberships.map((m) => `${escapeHtml(nameById[m.company_id] || m.company_id)} (${m.role})`).join(", ");
+    }
+    await ctx.reply(
+      `👤 <b>Who am I</b>\n\n` +
+      `• <b>Telegram ID:</b> <code>${a.numberId}</code>\n` +
+      `• <b>Username:</b> ${escapeHtml(a.username)}\n` +
+      `• <b>Global role:</b> <code>${a.role}</code>${a.isSuperadmin ? ' (superadmin via ADMIN_IDS)' : ''}\n` +
+      `• <b>Teams:</b> ${teams}`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // /users — list registered users and their global roles (admin+).
+  bot.command("users", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'user.list')) return;
+    const res = await env.DB.prepare(
+      "SELECT username, number_id, role FROM users ORDER BY role DESC, username ASC LIMIT 50"
+    ).all();
+    const rows = res?.results || [];
+    if (!rows.length) return await ctx.reply("No users registered yet.");
+    const lines = rows.map((r) =>
+      `• <code>${r.number_id}</code> ${escapeHtml(r.username)} — <b>${r.role || 'pending'}</b>`
+    );
+    await ctx.reply(`👥 <b>Registered Users</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  // /role <telegram_id> <pending|viewer|operator|admin> — set a global role.
+  // admin+ required; only a superadmin may grant/revoke the 'admin' role.
+  bot.command("role", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'role.set')) return;
+    const args = (ctx.match || "").trim().split(/\s+/).filter(Boolean);
+    if (args.length < 2) {
+      return await ctx.reply("❌ Usage: <code>/role &lt;telegram_id&gt; &lt;pending|viewer|operator|admin&gt;</code>", { parse_mode: "HTML" });
+    }
+    const [idStr, newRole] = args;
+    const numberId = Number(idStr);
+    if (!Number.isFinite(numberId)) {
+      return await ctx.reply("❌ Telegram ID must be numeric.", { parse_mode: "HTML" });
+    }
+    if (!VALID_GLOBAL_ROLES.includes(newRole)) {
+      return await ctx.reply(`❌ Role must be one of: <code>${VALID_GLOBAL_ROLES.join(', ')}</code>`, { parse_mode: "HTML" });
+    }
+    if (newRole === 'admin' && !ctx.actor.isSuperadmin) {
+      return await ctx.reply("⛔ Only a superadmin can grant the <b>admin</b> role.", { parse_mode: "HTML" });
+    }
+    const target = await env.DB.prepare("SELECT id, username, role FROM users WHERE number_id = ?").bind(numberId).first();
+    if (!target) {
+      return await ctx.reply(`❌ No registered user with ID <code>${numberId}</code>. Ask them to message the bot once first.`, { parse_mode: "HTML" });
+    }
+    if (target.role === 'admin' && !ctx.actor.isSuperadmin) {
+      return await ctx.reply("⛔ Only a superadmin can change an existing admin's role.", { parse_mode: "HTML" });
+    }
+    await env.DB.prepare(
+      "UPDATE users SET role = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE number_id = ?"
+    ).bind(newRole, numberId).run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor.userId, actor_number_id: ctx.from.id, actor_label: ctx.actor.username,
+      source: 'telegram', action: 'role.set', target_type: 'user', target: String(numberId),
+      detail: { old_role: target.role, new_role: newRole },
+    });
+    await ctx.reply(`✅ Global role for <code>${numberId}</code> (${escapeHtml(target.username)}) set to <b>${newRole}</b>.`, { parse_mode: "HTML" });
+  });
+
+  // /grant <telegram_id> <company> [viewer|operator|admin] — add team membership.
+  bot.command("grant", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'team.grant')) return;
+    const args = (ctx.match || "").trim().split(/\s+/).filter(Boolean);
+    if (args.length < 2) {
+      return await ctx.reply("❌ Usage: <code>/grant &lt;telegram_id&gt; &lt;company&gt; [viewer|operator|admin]</code>", { parse_mode: "HTML" });
+    }
+    const numberId = Number(args[0]);
+    const role = args[2] && VALID_TEAM_ROLES.includes(args[2]) ? args[2] : 'operator';
+    const companyQ = args[1];
+    if (!Number.isFinite(numberId)) {
+      return await ctx.reply("❌ Telegram ID must be numeric.", { parse_mode: "HTML" });
+    }
+    const target = await env.DB.prepare("SELECT id, username, role FROM users WHERE number_id = ?").bind(numberId).first();
+    if (!target) {
+      return await ctx.reply(`❌ No registered user with ID <code>${numberId}</code>. Ask them to message the bot once first.`, { parse_mode: "HTML" });
+    }
+    const company = await findCompany(companyQ);
+    if (!company) {
+      return await ctx.reply(`❌ Company <code>${escapeHtml(companyQ)}</code> not found. Create it with /newcompany first.`, { parse_mode: "HTML" });
+    }
+    await env.DB.prepare(
+      `INSERT INTO team_members (id, company_id, user_id, role, created_by)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(company_id, user_id) DO UPDATE SET role = excluded.role`
+    ).bind(crypto.randomUUID(), company.id, target.id, role, ctx.actor.userId).run();
+    // A viewer/pending user who gains a team membership should be at least a
+    // viewer globally so they can sign in; never downgrade a higher role.
+    if (roleRank(target.role) < roleRank('viewer')) {
+      await env.DB.prepare("UPDATE users SET role = 'viewer' WHERE id = ?").bind(target.id).run();
+    }
+    await auditLog(env, {
+      actor_user_id: ctx.actor.userId, actor_number_id: ctx.from.id, actor_label: ctx.actor.username,
+      source: 'telegram', action: 'team.grant', target_type: 'user', target: String(numberId),
+      company_id: company.id, detail: { team_role: role, company: company.name },
+    });
+    await ctx.reply(`✅ <code>${numberId}</code> (${escapeHtml(target.username)}) added to <b>${escapeHtml(company.name)}</b> as <b>${role}</b>.`, { parse_mode: "HTML" });
+  });
+
+  // /revoke <telegram_id> <company> — remove team membership.
+  bot.command("revoke", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'team.revoke')) return;
+    const args = (ctx.match || "").trim().split(/\s+/).filter(Boolean);
+    if (args.length < 2) {
+      return await ctx.reply("❌ Usage: <code>/revoke &lt;telegram_id&gt; &lt;company&gt;</code>", { parse_mode: "HTML" });
+    }
+    const numberId = Number(args[0]);
+    const target = await env.DB.prepare("SELECT id, username FROM users WHERE number_id = ?").bind(numberId).first();
+    const company = await findCompany(args[1]);
+    if (!target || !company) {
+      return await ctx.reply("❌ User or company not found.", { parse_mode: "HTML" });
+    }
+    const res = await env.DB.prepare(
+      "DELETE FROM team_members WHERE company_id = ? AND user_id = ?"
+    ).bind(company.id, target.id).run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor.userId, actor_number_id: ctx.from.id, actor_label: ctx.actor.username,
+      source: 'telegram', action: 'team.revoke', target_type: 'user', target: String(numberId),
+      company_id: company.id, detail: { company: company.name },
+    });
+    await ctx.reply(`✅ Removed <code>${numberId}</code> from <b>${escapeHtml(company.name)}</b>.`, { parse_mode: "HTML" });
+  });
+
+  // /members [company] — list team memberships (admin+).
+  bot.command("members", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'team.list')) return;
+    const q = (ctx.match || "").trim();
+    let rows;
+    if (q) {
+      const company = await findCompany(q);
+      if (!company) return await ctx.reply(`❌ Company <code>${escapeHtml(q)}</code> not found.`, { parse_mode: "HTML" });
+      const res = await env.DB.prepare(
+        `SELECT u.number_id, u.username, tm.role, ? AS cname
+           FROM team_members tm JOIN users u ON u.id = tm.user_id
+          WHERE tm.company_id = ? ORDER BY tm.role DESC`
+      ).bind(company.name, company.id).all();
+      rows = res?.results || [];
+    } else {
+      const res = await env.DB.prepare(
+        `SELECT u.number_id, u.username, tm.role, c.name AS cname
+           FROM team_members tm
+           JOIN users u ON u.id = tm.user_id
+           JOIN companies c ON c.id = tm.company_id
+          ORDER BY c.name ASC, tm.role DESC LIMIT 100`
+      ).all();
+      rows = res?.results || [];
+    }
+    if (!rows.length) return await ctx.reply("No team memberships found.");
+    const lines = rows.map((r) =>
+      `• <b>${escapeHtml(r.cname)}</b> ← <code>${r.number_id}</code> ${escapeHtml(r.username)} (${r.role})`
+    );
+    await ctx.reply(`🧩 <b>Team Memberships</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  // /audit [n] — show the last n audit entries (admin+, default 15, max 50).
+  bot.command("audit", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'audit.view')) return;
+    let n = parseInt((ctx.match || "").trim(), 10);
+    if (!Number.isFinite(n) || n <= 0) n = 15;
+    n = Math.min(n, 50);
+    const res = await env.DB.prepare(
+      "SELECT ts, actor_label, actor_number_id, source, action, decision, target_type, target FROM audit_log ORDER BY ts DESC LIMIT ?"
+    ).bind(n).all();
+    const rows = res?.results || [];
+    if (!rows.length) return await ctx.reply("Audit log is empty.");
+    const lines = rows.map((r) => {
+      const icon = r.decision === 'deny' ? '⛔' : '✅';
+      const who = r.actor_label || `id:${r.actor_number_id}`;
+      const tgt = r.target ? ` <code>${escapeHtml(String(r.target))}</code>` : '';
+      const when = String(r.ts).replace('T', ' ').replace('Z', '').slice(5, 19);
+      return `${icon} <code>${when}</code> ${escapeHtml(who)} [${r.source}] <b>${r.action}</b>${tgt}`;
+    });
+    await ctx.reply(`📜 <b>Audit Log</b> (last ${rows.length})\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
   bot.command("help", async (ctx) => {
     await ctx.reply(
       `📖 <b>cHack Bot Command & Management Guide</b>\n\n` +
@@ -2215,7 +2698,16 @@ const getBot = (env) => {
       `• <code>/vulns [domain] [severity]</code> - Search vulnerabilities\n` +
       `• <code>/secrets [domain]</code> - Search discovered secrets\n` +
       `• <code>/ports [domain]</code> - Search open services\n` +
-      `• <code>/report &lt;domain&gt;</code> - Executive summary report`,
+      `• <code>/report &lt;domain&gt;</code> - Executive summary report\n\n` +
+      `<b>Access Control & Audit:</b>\n` +
+      `• <code>/whoami</code> - Your ID, role & team memberships\n` +
+      `• <code>/users</code> - List users & roles <i>(admin)</i>\n` +
+      `• <code>/role &lt;id&gt; &lt;role&gt;</code> - Set global role <i>(admin)</i>\n` +
+      `• <code>/grant &lt;id&gt; &lt;company&gt; [role]</code> - Add to team <i>(admin)</i>\n` +
+      `• <code>/revoke &lt;id&gt; &lt;company&gt;</code> - Remove from team <i>(admin)</i>\n` +
+      `• <code>/members [company]</code> - List team memberships <i>(admin)</i>\n` +
+      `• <code>/audit [n]</code> - Recent audit log <i>(admin)</i>\n\n` +
+      `<i>Roles: viewer (read) → operator (scan in-scope) → admin (manage) → superadmin (ADMIN_IDS).</i>`,
       { parse_mode: "HTML" }
     );
   });
@@ -2488,6 +2980,7 @@ const getBot = (env) => {
       if (!comp) return;
       const runner = ctx.session?.selected_runner || 'default';
       const jobId = await triggerScan(ctx, 'company', comp.name, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       await safeEditMessageText(ctx, `🚀 <b>Full Recon Scan Queued for ${escapeHtml(comp.name)}</b>\n\n• <b>Runner:</b> <code>${runner}</code>\n• <b>Job ID:</b> <code>${jobId}</code>`, {
         parse_mode: "HTML",
         reply_markup: {
@@ -2644,6 +3137,7 @@ const getBot = (env) => {
       else if (scanType === 'net') typeKey = 'network';
 
       const jobId = await triggerScan(ctx, typeKey, dom.host, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       await safeEditMessageText(ctx, `🚀 <b>Scan Queued for ${escapeHtml(dom.host)}</b>\n\n• <b>Type:</b> <code>${scanType.toUpperCase()}</code>\n• <b>Runner:</b> <code>${runner}</code>\n• <b>Job ID:</b> <code>${jobId}</code>`, {
         parse_mode: "HTML",
         reply_markup: {
@@ -2762,6 +3256,7 @@ const getBot = (env) => {
       const fullName = `${person.given_name} ${person.family_name || ''}`.trim();
       const runner = ctx.session?.selected_runner || 'default';
       const jobId = await triggerScan(ctx, 'person', fullName, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       await safeEditMessageText(ctx, `🚀 <b>OSINT Scan Queued for ${escapeHtml(fullName)}</b>\n\n• <b>Runner:</b> <code>${runner}</code>\n• <b>Job ID:</b> <code>${jobId}</code>`, {
         parse_mode: "HTML",
         reply_markup: {
@@ -3305,6 +3800,7 @@ const getBot = (env) => {
         console.error("D1 error in remove_runner:", err.message);
       }
     } else if (data === "confirm_reset_db") {
+      if (!await requireRole(ctx, 'superadmin', 'db.reset')) return;
       await safeEditMessageText(
         ctx,
         `⚠️ <b>DANGER: Reset Cloudflare Database</b>\n\n` +
@@ -3336,7 +3832,10 @@ const getBot = (env) => {
         }
       );
     } else if (data === "do_reset_db") {
+      if (!await requireRole(ctx, 'superadmin', 'db.reset')) return;
       try {
+        // Note: audit_log is intentionally NOT wiped — the audit trail must
+        // survive a database reset. team_members is cleared with its users.
         const tables = [
           "findings",
           "secrets",
@@ -3348,10 +3847,16 @@ const getBot = (env) => {
           "scan_jobs",
           "runners",
           "sessions",
+          "team_members",
           "users"
         ];
         const statements = tables.map(t => env.DB.prepare(`DELETE FROM ${t}`));
         await env.DB.batch(statements);
+        await auditLog(env, {
+          actor_user_id: ctx.actor?.userId, actor_number_id: ctx.from?.id || 0,
+          actor_label: ctx.actor?.username, source: 'telegram', action: 'db.reset',
+          target_type: 'db', target: 'all', detail: { tables },
+        });
 
         ctx.session = {
           selected_runner: 'default',
@@ -3401,6 +3906,7 @@ const getBot = (env) => {
         return await ctx.reply("❌ Invalid domain format. Try again or type /menu to reset.");
       }
       const jobId = await triggerScan(ctx, 'domain', text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
         `🚀 <b>Full Recon Scan Queued!</b>\n\n` +
@@ -3420,6 +3926,7 @@ const getBot = (env) => {
     } 
     else if (step === 'PERSON_INPUT') {
       const jobId = await triggerScan(ctx, 'person', text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
         `🔍 <b>Person OSINT Scan Queued!</b>\n\n` +
@@ -3441,6 +3948,7 @@ const getBot = (env) => {
       const isDomain = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(text);
       const targetType = isDomain ? 'domain' : 'company';
       const jobId = await triggerScan(ctx, targetType, text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       
       await ctx.reply(
@@ -3461,6 +3969,7 @@ const getBot = (env) => {
     }
     else if (step === 'INFOGATHER_INPUT') {
       const jobId = await triggerScan(ctx, 'infogather', text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
         `🔍 <b>Info-Gathering Scan Queued!</b>\n\n` +
@@ -3480,6 +3989,7 @@ const getBot = (env) => {
     }
     else if (step === 'WEB_INPUT') {
       const jobId = await triggerScan(ctx, 'web', text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
         `🌐 <b>Web Recon & Crawl Queued!</b>\n\n` +
@@ -3499,6 +4009,7 @@ const getBot = (env) => {
     }
     else if (step === 'NET_INPUT') {
       const jobId = await triggerScan(ctx, 'network', text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
         `🔌 <b>Network & Port Scan Queued!</b>\n\n` +
@@ -3581,6 +4092,7 @@ const getBot = (env) => {
       const isDomain = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(text);
       if (isDomain) {
         const jobId = await triggerScan(ctx, 'domain', text, runner);
+        if (!jobId) return; // scan denied by scope/role (reply already sent)
         await ctx.reply(
           `🚀 <b>Full Recon Scan Queued!</b>\n\n` +
           `• <b>Target:</b> <code>${escapeHtml(text)}</code>\n` +
@@ -3772,6 +4284,16 @@ app.get('/api/runner/next-job', async (c) => {
   await c.env.DB.prepare(
     "UPDATE scan_jobs SET status = 'running', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
   ).bind(job.id).run();
+
+  // Audit the dispatch so execution is traceable to the requester and runner.
+  await auditLog(c.env, {
+    actor_user_id: job.requested_by || null,
+    actor_number_id: job.requested_by_number_id || 0,
+    actor_label: `runner:${runner}`,
+    source: 'daemon', action: 'job.dispatch', target_type: 'job', target: job.domain,
+    company_id: job.company_id || null,
+    detail: { job_id: job.id, runner, command: job.command },
+  });
 
   return c.json({ job });
 });

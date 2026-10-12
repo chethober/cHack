@@ -1,5 +1,10 @@
 # Cloudflare Worker local secrets — copy to back/.dev.vars and fill in.
 # back/.dev.vars is git-ignored; NEVER commit real tokens.
 TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
+# ADMIN_IDS = comma-separated Telegram user IDs that are SUPERADMINS. They always
+# have full access and can grant roles (/role) and team scopes (/grant) to others.
+# Leave EMPTY only for a single-tenant/dev setup: an empty ADMIN_IDS opens the bot
+# to everyone (legacy behaviour). With any value set, everyone else starts as
+# 'pending' and must be granted a role by a superadmin before they can use it.
 ADMIN_IDS=your_telegram_user_id,another_admin_id
 RUNNERS=VPS-1,VPS-2
