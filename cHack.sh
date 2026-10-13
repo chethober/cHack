@@ -1322,6 +1322,66 @@ run_nuclei() {
         done < "$output_dir/nuclei.json"
     fi
 
+    # 2. Dalfox reflected/DOM XSS verification on parameterized URLs
+    if command -v dalfox >/dev/null 2>&1 && [ -s "$output_dir/params" ]; then
+        local param_count
+        param_count=$(count_lines "$output_dir/params")
+        log_info "Running Dalfox XSS verification against $param_count parameterized URLs..."
+        : > "$output_dir/dalfox.json"
+        timeout 600 dalfox file "$output_dir/params" \
+            --format json \
+            --silence \
+            --no-spinner \
+            --skip-bav \
+            --worker "$THREADS" \
+            -o "$output_dir/dalfox.json" >/dev/null 2>&1 || true
+
+        if [ -s "$output_dir/dalfox.json" ]; then
+            # Dalfox emits either a JSON array or JSON-lines depending on version;
+            # normalise both to a stream of PoC objects.
+            local dalfox_objs
+            dalfox_objs=$(jq -c 'if type=="array" then .[] else . end' "$output_dir/dalfox.json" 2>/dev/null)
+            local dfndx=0
+            while IFS= read -r dline; do
+                [ -z "$dline" ] && continue
+                local d_url d_sev d_param d_payload d_type d_cwe d_ev d_title
+                d_url=$(echo "$dline" | jq -r '.data // .url // ""' 2>/dev/null)
+                [ -z "$d_url" ] && continue
+                d_sev=$(echo "$dline" | jq -r '(.severity // "high") | ascii_downcase' 2>/dev/null)
+                d_param=$(echo "$dline" | jq -r '.param // ""' 2>/dev/null)
+                d_payload=$(echo "$dline" | jq -r '.payload // ""' 2>/dev/null)
+                d_type=$(echo "$dline" | jq -r '.inject_type // .type // "reflected"' 2>/dev/null)
+                d_cwe=$(echo "$dline" | jq -r '.cwe // ""' 2>/dev/null)
+                d_ev=$(echo "$dline" | jq -r '.evidence // .poc // .message_str // ""' 2>/dev/null)
+                case "$d_sev" in critical|high|medium|low|info) ;; *) d_sev="high" ;; esac
+                d_title="Reflected XSS ($d_type)"
+                [ -n "$d_param" ] && d_title="Reflected XSS in '$d_param' ($d_type)"
+
+                local d_item
+                d_item=$(jq -n \
+                    --arg title "$d_title" \
+                    --arg sev "$d_sev" \
+                    --arg url "$d_url" \
+                    --arg desc "Dalfox verified a cross-site scripting vector${d_param:+ via parameter '$d_param'}. ${d_cwe:+($d_cwe) }Payload: ${d_payload}" \
+                    --arg cve "" \
+                    --arg ev "$d_ev" \
+                    --arg tool "dalfox" \
+                    --arg vt "xss" \
+                    '{title: $title, severity: $sev, url: $url, description: $desc, cve: $cve, evidence: $ev, tool: $tool, vuln_type: $vt}')
+                all_findings=$(echo "$all_findings" | jq --argjson i "$d_item" '. += [$i]')
+                dfndx=$((dfndx + 1))
+            done <<< "$dalfox_objs"
+
+            if [ "$dfndx" -gt 0 ]; then
+                log_info "🚨 Dalfox confirmed $dfndx XSS vector(s)!"
+                send_telegram_notification "🎯 <b>Dalfox Confirmed XSS</b> for <code>$domain</code>
+• Verified vectors: <b>$dfndx</b>"
+            fi
+        fi
+    elif ! command -v dalfox >/dev/null 2>&1; then
+        log_warn "dalfox not installed — skipping XSS verification (run: ./cHack.sh --update-tools)."
+    fi
+
     # Merge exposure findings if present
     if [ -s "$output_dir/exposure_findings.json" ]; then
         all_findings=$(jq -s '.[0] + .[1]' <(echo "$all_findings") "$output_dir/exposure_findings.json")

@@ -60,7 +60,7 @@ A full scan (`-d <domain>`) runs six phases; individual phases are also exposed 
 | **3** | Port & service scan | Discover open ports and network services | `naabu` |
 | **4** | Web crawl & JS secrets | Crawl, mine URLs & parameters, extract secrets from JS | `katana`, `hakrawler`, `gau`, `waybackurls`, `js_secrets.py` |
 | **5** | Content discovery | Find directories, sensitive files, and backup exposures | content & backup fuzzing |
-| **6** | Vulnerability & DAST | Template-based scanning, XSS assessment & client-side bug hunting | `nuclei`, `dalfox`, `client_bugs.py` |
+| **6** | Vulnerability & DAST | Template scanning (`nuclei`), reflected-XSS verification on parameterized URLs (`dalfox`), and client-side bug hunting (`client_bugs.py`) |
 
 Phases 3 and 4 run **in parallel** to cut wall-clock time.
 
