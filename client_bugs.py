@@ -121,6 +121,24 @@ PM_LISTENER_RE = re.compile(
 )
 ORIGIN_CHECK_RE = re.compile(r"\.origin\b|\.source\b|originIsAllowed|trustedOrigins|allowedOrigins",
                              re.IGNORECASE)
+# Framework HTML sinks that bypass the framework's auto-escaping.
+FRAMEWORK_SINKS = re.compile(
+    r"v-html\b|ng-bind-html\b|\[innerHTML\]|\btrustAsHtml\s*\(|\$sce\.trustAs|\$compile\s*\("
+    r"|setAttribute\s*\(\s*[\"']on\w+[\"']",
+    re.IGNORECASE,
+)
+# Sensitive values persisted to web storage (readable by any XSS).
+STORAGE_RE = re.compile(
+    r"(?:local|session)Storage\.setItem\s*\(\s*[\"'`][^\"'`]*"
+    r"(?:token|jwt|secret|password|passwd|api[_-]?key|auth|session|credential|bearer)"
+    r"[^\"'`]*[\"'`]",
+    re.IGNORECASE,
+)
+# Insecure WebSocket transport.
+WS_INSECURE_RE = re.compile(r"new\s+WebSocket\s*\(\s*[\"'`]\s*ws://", re.IGNORECASE)
+# javascript: URI built from a dynamic/concatenated value.
+JS_URI_RE = re.compile(r"[\"'`]\s*javascript:[^\"'`]*[\"'`]\s*\+|=\s*[\"'`]javascript:[\"'`]\s*\+",
+                       re.IGNORECASE)
 
 # Proximity window (chars) for correlating a source with a sink on big/minified files.
 PROXIMITY = 160
@@ -219,6 +237,31 @@ def analyze_js(content, source_url):
     # Prototype pollution.
     scan(PROTO_SINKS, "Prototype-pollution-prone assignment", "prototype-pollution",
          "high", "medium", require_source=False)
+    # Framework escaping bypass (v-html / ng-bind-html / trustAsHtml / $compile).
+    scan(FRAMEWORK_SINKS, "Framework HTML-escaping bypass", "xss",
+         "high", "medium", require_source=False)
+    # javascript: URI built by concatenation (href/location).
+    scan(JS_URI_RE, "Dynamically built javascript: URI", "xss",
+         "high", "medium", require_source=False)
+
+    # Sensitive data written to localStorage/sessionStorage (XSS-exfiltratable).
+    for m in STORAGE_RE.finditer(content):
+        ln = _line_of(content, m.start())
+        findings.append(_finding(
+            "Sensitive data stored in web storage", "medium", source_url,
+            f"A token/credential-like value is written to web storage at line {ln}. "
+            f"localStorage/sessionStorage is readable by any XSS on the origin; prefer "
+            f"HttpOnly cookies for secrets.",
+            f"L{ln}: {_snippet(content, m.start())}", vuln_type="sensitive-storage"))
+
+    # Insecure WebSocket transport.
+    for m in WS_INSECURE_RE.finditer(content):
+        ln = _line_of(content, m.start())
+        findings.append(_finding(
+            "Insecure WebSocket (ws://)", "medium", source_url,
+            f"A WebSocket is opened over plaintext ws:// at line {ln}; traffic is "
+            f"interceptable/modifiable and blocked as mixed content on HTTPS pages.",
+            f"L{ln}: {_snippet(content, m.start())}", vuln_type="insecure-transport"))
 
     # postMessage wildcard target origin.
     for m in PM_WILDCARD_RE.finditer(content):
@@ -306,6 +349,9 @@ SECURITY_HEADERS = {
     "x-content-type-options", "referrer-policy", "permissions-policy",
 }
 
+CALLBACK_PARAMS = {"callback", "cb", "jsonp", "jsonpcallback", "jsoncallback",
+                   "json_callback", "jscallback", "function", "func"}
+
 
 def _normalize_host(h):
     h = h.strip()
@@ -373,7 +419,15 @@ def check_cors(host):
                 f"Origin: {test_origin}  ->  ACAO: {acao}; ACAC: {acac}",
                 vuln_type="cors"))
             break  # one CORS finding per host is enough
-    # Wildcard ACAO (informational unless with credentials, which browsers block).
+    else:
+        # No reflection, but a static wildcard ACAO is still worth noting.
+        _, hdrs, _ = _http(host, headers={"Origin": evil})
+        if hdrs.get("access-control-allow-origin", "") == "*":
+            findings.append(_finding(
+                "CORS Access-Control-Allow-Origin: *", "info", host,
+                "Responses are readable by any origin. Low risk while credentials are not "
+                "allowed, but review for any endpoint returning sensitive data.",
+                "Access-Control-Allow-Origin: *", vuln_type="cors"))
     return findings
 
 
@@ -407,6 +461,13 @@ def check_headers(host):
             "Weak Content-Security-Policy (unsafe-inline/eval)", "low", host,
             "CSP allows 'unsafe-inline' or 'unsafe-eval', largely negating its XSS protection.",
             f"CSP: {csp[:180]}", vuln_type="security-headers"))
+    else:
+        m = re.search(r"script-src[^;]*", csp, re.IGNORECASE)
+        if m and re.search(r"(?:^|\s)\*(?:\s|$)|https?:(?:\s|$)", m.group(0)):
+            findings.append(_finding(
+                "Weak Content-Security-Policy (wildcard script-src)", "low", host,
+                "script-src permits a wildcard/scheme source, allowing scripts from any host.",
+                f"CSP script-src: {m.group(0)[:180]}", vuln_type="security-headers"))
     return findings
 
 
@@ -453,6 +514,69 @@ def check_open_redirect(param_url):
     return findings
 
 
+def check_jsonp(param_url):
+    """Inject a canary callback name; flag endpoints that wrap JSON in it (JSONP)."""
+    try:
+        parts = urlsplit(param_url)
+        qs = parse_qsl(parts.query, keep_blank_values=True)
+    except Exception:
+        return []
+    cb_keys = [k for k, _ in qs if k.lower() in CALLBACK_PARAMS]
+    if not cb_keys:
+        return []
+    canary = f"chackCb{uuid.uuid4().hex[:6]}"
+    findings = []
+    for key in set(cb_keys):
+        new_qs = [(k, canary if k == key else v) for k, v in qs]
+        test_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(new_qs), parts.fragment))
+        status, hdrs, body = _http(test_url, allow_redirects=True)
+        if status is None or not body:
+            continue
+        ctype = hdrs.get("content-type", "").lower()
+        # Response executes the attacker-named callback with data payload.
+        if re.search(r"(?:^|[^\w.])" + re.escape(canary) + r"\s*\(", body[:4000]) and \
+           ("javascript" in ctype or "application/json" not in ctype):
+            findings.append(_finding(
+                "JSONP endpoint (callback reflected)", "medium", test_url,
+                f"Parameter '{key}' controls a JSONP callback name that is reflected into an "
+                f"executable response. Cross-origin pages can include this to steal the data "
+                f"(and it can enable XSS if the callback is not validated).",
+                f"callback={canary} -> body: {body[:120].strip()}", vuln_type="jsonp"))
+    return findings
+
+
+def check_mixed_and_tabnabbing(host):
+    """Fetch host HTML; flag reverse-tabnabbing links and HTTPS mixed content."""
+    if not host.startswith("https://"):
+        return []
+    status, _, body = _http(host, allow_redirects=True)
+    if status is None or not body:
+        return []
+    findings = []
+    # Reverse tabnabbing: target=_blank anchors without rel=noopener/noreferrer.
+    tab = 0
+    for m in re.finditer(r"<a\b[^>]*\btarget\s*=\s*[\"']?_blank[\"']?[^>]*>", body, re.IGNORECASE):
+        if tab >= 5:
+            break
+        tag = m.group(0)
+        if not re.search(r"rel\s*=\s*[\"'][^\"']*(?:noopener|noreferrer)", tag, re.IGNORECASE):
+            findings.append(_finding(
+                "Reverse tabnabbing (target=_blank without rel=noopener)", "low", host,
+                "A target=_blank link lacks rel=noopener; the opened page can rewrite "
+                "window.opener.location to a phishing page.",
+                tag[:160], vuln_type="tabnabbing"))
+            tab += 1
+    # Mixed content: http:// subresources loaded by an HTTPS page.
+    mix = re.search(r"(?:src|href)\s*=\s*[\"']http://[^\"']+\.(?:js|css)", body, re.IGNORECASE)
+    if mix:
+        findings.append(_finding(
+            "Mixed content (HTTP resource on HTTPS page)", "low", host,
+            "An HTTPS page references an http:// script/style resource; it is interceptable "
+            "(and typically blocked by the browser).",
+            mix.group(0)[:160], vuln_type="mixed-content"))
+    return findings
+
+
 def run_active(live_hosts_file, params_file, output_json, max_workers=20):
     hosts = []
     if os.path.isfile(live_hosts_file):
@@ -464,9 +588,12 @@ def run_active(live_hosts_file, params_file, output_json, max_workers=20):
     if os.path.isfile(params_file):
         with open(params_file, "r", encoding="utf-8", errors="ignore") as f:
             params = [p.strip() for p in f if p.strip().startswith(("http://", "https://"))]
-    # Only test params that actually carry a redirect-like key, cap the volume.
-    params = [p for p in dict.fromkeys(params)
-              if any(f"{k}=" in p.lower() or f"{k}%3d" in p.lower() for k in REDIRECT_PARAMS)][:150]
+    all_params = list(dict.fromkeys(params))
+    # Redirect-like params (open redirect) and callback params (JSONP), capped.
+    redir_params = [p for p in all_params
+                    if any(f"{k}=" in p.lower() or f"{k}%3d" in p.lower() for k in REDIRECT_PARAMS)][:150]
+    jsonp_params = [p for p in all_params
+                    if any(f"{k}=" in p.lower() or f"{k}%3d" in p.lower() for k in CALLBACK_PARAMS)][:150]
 
     findings = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -474,8 +601,11 @@ def run_active(live_hosts_file, params_file, output_json, max_workers=20):
         for h in hosts:
             jobs.append(ex.submit(check_cors, h))
             jobs.append(ex.submit(check_headers, h))
-        for p in params:
+            jobs.append(ex.submit(check_mixed_and_tabnabbing, h))
+        for p in redir_params:
             jobs.append(ex.submit(check_open_redirect, p))
+        for p in jsonp_params:
+            jobs.append(ex.submit(check_jsonp, p))
         for fut in concurrent.futures.as_completed(jobs):
             try:
                 findings.extend(fut.result())
@@ -492,7 +622,8 @@ def run_active(live_hosts_file, params_file, output_json, max_workers=20):
         out.append(fnd)
     _write(output_json, out)
     print(f"[client_bugs:active] {len(out)} live client-side findings "
-          f"({len(hosts)} hosts, {len(params)} redirect-candidate params) -> {output_json}")
+          f"({len(hosts)} hosts, {len(redir_params)} redirect + {len(jsonp_params)} jsonp "
+          f"candidate params) -> {output_json}")
 
 
 # ===========================================================================

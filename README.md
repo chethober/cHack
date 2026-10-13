@@ -18,7 +18,7 @@ cHack chains the best-in-class ProjectDiscovery / recon tooling into a single, r
 - **Distributed runners** — point many VPS runners at one central queue; jobs are load-shared.
 - **Parallel execution** — port scanning and web crawling run concurrently; tunable worker threads (`-t`).
 - **JS secret mining** — dedicated scanner (`js_secrets.py`) with entropy checks, vendor filtering, and false-positive suppression.
-- **Client-side bug hunting** — dedicated analyzer (`client_bugs.py`): static DOM-XSS source→sink, insecure `postMessage` and prototype-pollution detection, plus live CORS, clickjacking and open-redirect probing.
+- **Client-side bug hunting** — dedicated analyzer (`client_bugs.py`). Static: DOM-XSS source→sink, dynamic code-exec, insecure `postMessage`, prototype pollution, framework escaping bypass (`v-html`/`trustAsHtml`), sensitive web-storage, insecure WebSocket. Active: CORS misconfig, clickjacking/security headers, open redirect, JSONP hijacking, reverse tabnabbing, mixed content.
 - **Central datastore** — per-runner SQLite synced to Cloudflare D1 for a single source of truth.
 - **Self-provisioning** — missing Go tools are auto-installed and periodically updated.
 - **Live job tracking** — stream logs, status, and executive summaries straight to Telegram.
