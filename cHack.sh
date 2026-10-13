@@ -120,22 +120,28 @@ OPTIONAL_TOOLS=(
 # every runner via `go install ...@latest`. Bump deliberately (and review the
 # changelog) rather than tracking latest. Tools without upstream release tags
 # fall back to "latest" (documented exception) via get_tool_package.
+# Pinned to current upstream release tags (verified 2026-10-14). Bump here and
+# run `./cHack.sh --update-tools` to apply. Major-version bumps that change the
+# Go module path (e.g. dalfox v2->v3) must also be updated in get_tool_module.
 declare -A TOOL_VERSIONS=(
-    [httpx]="v1.6.9"
-    [naabu]="v2.3.3"
-    [subfinder]="v2.6.6"
-    [katana]="v1.1.0"
-    [nuclei]="v3.3.7"
-    [dnsx]="v1.2.1"
-    [alterx]="v0.0.4"
+    [httpx]="v1.12.0"
+    [naabu]="v2.6.1"
+    [subfinder]="v2.17.0"
+    [katana]="v1.8.0"
+    [nuclei]="v3.11.1"
+    [dnsx]="v1.3.1"
+    [alterx]="v0.1.0"
     [gau]="v2.2.4"
-    [dalfox]="v2.9.2"
-    [subzy]="v1.1.0"
-    [scilla]="v1.3.0"
+    # dalfox latest is v3.x, but the module path here is /v2; staying on the
+    # newest v2 release until the path is migrated to /v3.
+    [dalfox]="v2.13.0"
+    [subzy]="v1.2.1"
+    [scilla]="v1.3.4"
     [puredns]="v2.1.1"
-    [gowitness]="v3.0.5"
-    [hakrawler]="v2.1"
-    # No upstream semver release tags — pinned to latest by necessity:
+    # No Go-semver-compatible release tags (tags lack the v-prefix and the module
+    # has no /vN path), so a pinned vX.Y.Z cannot resolve — track latest:
+    [gowitness]="latest"
+    [hakrawler]="latest"
     [assetfinder]="latest"
     [waybackurls]="latest"
 )
