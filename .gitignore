@@ -27,3 +27,6 @@ local.db-wal
 # Temporary state
 resume.cfg
 temp_job_*.json
+
+# Authorized-scope allowlist (per-operator; never commit real scope)
+scope.txt

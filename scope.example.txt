@@ -1,0 +1,18 @@
+# cHack authorized-scope allowlist — copy to scope.txt and edit.
+#
+# One entry per line. Lines starting with '#' and blank lines are ignored.
+# cHack refuses to scan any target not matched here (unless --allow-out-of-scope).
+#
+# Domain entries match the exact host AND any subdomain:
+#   example.com        -> matches example.com, api.example.com, a.b.example.com
+#
+# IP / CIDR entries match IP-literal targets via Python's ipaddress module:
+#   192.0.2.0/24
+#   198.51.100.10
+#   2001:db8::/32
+#
+# Only add targets you own or are explicitly authorized to test
+# (in-scope bug-bounty asset or a signed engagement).
+
+example.com
+192.0.2.0/24
