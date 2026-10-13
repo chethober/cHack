@@ -1420,6 +1420,7 @@ run_client_recon() {
     # Standalone client-side bug hunt. Reuses prior crawl data when present,
     # otherwise performs the minimum crawl needed to feed the analyzer.
     local domain=$1
+    scope_guard "$domain" || return 1
     local output_dir="$TARGETS_DIR/$domain"
     mkdir -p "$output_dir"
 
