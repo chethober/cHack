@@ -937,6 +937,177 @@ def generate_report(domain_or_slug):
         "endpoints": endpoints
     }
 
+# ---------------------------------------------------------------------------
+# Report exporters: SARIF 2.1.0 (CI ingestion) and STIX 2.1 (threat intel).
+# ---------------------------------------------------------------------------
+
+# Approximate CVSS v3.1 base scores + SARIF levels per severity bucket. These
+# are coarse defaults used when a finding carries no explicit score.
+_SEVERITY_MODEL = {
+    "critical": {"cvss": 9.5, "sarif": "error", "rank": 5},
+    "high":     {"cvss": 8.0, "sarif": "error", "rank": 4},
+    "medium":   {"cvss": 5.5, "sarif": "warning", "rank": 3},
+    "low":      {"cvss": 3.1, "sarif": "note", "rank": 2},
+    "info":     {"cvss": 0.0, "sarif": "note", "rank": 1},
+}
+
+
+def severity_model(severity):
+    """Normalize a free-form severity string to the CVSS/SARIF/rank model."""
+    return _SEVERITY_MODEL.get((severity or "info").strip().lower(), _SEVERITY_MODEL["info"])
+
+
+def _redact(value, keep=4):
+    """Redact a secret value, keeping only a short prefix for correlation."""
+    if not value:
+        return ""
+    s = str(value)
+    if len(s) <= keep:
+        return "*" * len(s)
+    return s[:keep] + "…[redacted]"
+
+
+def report_sarif(report, include_secrets=False):
+    """Render a report dict as a SARIF 2.1.0 log (CWE/severity aware)."""
+    findings = report.get("findings") or []
+    secrets = report.get("secrets") or []
+
+    rules = {}
+    results = []
+
+    def add_result(rule_id, rule_name, level, message, uri, props):
+        if rule_id not in rules:
+            rules[rule_id] = {
+                "id": rule_id,
+                "name": rule_name,
+                "shortDescription": {"text": rule_name},
+            }
+        loc = []
+        if uri:
+            loc = [{"physicalLocation": {"artifactLocation": {"uri": uri}}}]
+        results.append({
+            "ruleId": rule_id,
+            "level": level,
+            "message": {"text": message},
+            "locations": loc,
+            "properties": props,
+        })
+
+    for f in findings:
+        model = severity_model(f.get("severity"))
+        vt = (f.get("vuln_type") or "finding").strip() or "finding"
+        rule_id = f"chack/{vt}"
+        props = {
+            "security-severity": str(model["cvss"]),
+            "severity": (f.get("severity") or "info"),
+            "tool": f.get("tool") or "",
+            "cve": f.get("cve") or "",
+        }
+        msg = f.get("title") or vt
+        if f.get("description"):
+            msg = f"{msg}: {f['description']}"
+        add_result(rule_id, vt, model["sarif"], msg,
+                   f.get("url") or f.get("host") or "", props)
+
+    for s in secrets:
+        model = severity_model(s.get("severity") or "high")
+        snippet = s.get("match_snippet") or ""
+        if not include_secrets:
+            snippet = _redact(snippet)
+        add_result("chack/secret", "leaked-secret", model["sarif"],
+                   f"{s.get('rule_name') or 'secret'} ({s.get('secret_type') or 'unknown'}): {snippet}",
+                   s.get("file_url") or s.get("host") or "",
+                   {"security-severity": str(model["cvss"]),
+                    "severity": s.get("severity") or "high",
+                    "secret_type": s.get("secret_type") or ""})
+
+    return {
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "cHack",
+                "informationUri": "https://github.com/chethober/cHack",
+                "rules": list(rules.values()),
+            }},
+            "results": results,
+        }],
+    }
+
+
+def report_stix(report, include_secrets=False):
+    """Render a report dict as a STIX 2.1 bundle (vulnerabilities + indicators)."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    objects = []
+
+    identity_id = f"identity--{uuid.uuid4()}"
+    objects.append({
+        "type": "identity", "spec_version": "2.1", "id": identity_id,
+        "created": now, "modified": now,
+        "name": "cHack", "identity_class": "system",
+    })
+
+    def obj(d):
+        d.setdefault("spec_version", "2.1")
+        d.setdefault("created", now)
+        d.setdefault("modified", now)
+        d.setdefault("created_by_ref", identity_id)
+        objects.append(d)
+
+    for f in report.get("findings") or []:
+        model = severity_model(f.get("severity"))
+        name = f.get("title") or (f.get("vuln_type") or "finding")
+        desc = f.get("description") or ""
+        if f.get("cve"):
+            obj({
+                "type": "vulnerability", "id": f"vulnerability--{uuid.uuid4()}",
+                "name": f.get("cve"),
+                "description": f"{name}: {desc}".strip(": "),
+                "external_references": [{"source_name": "cve", "external_id": f.get("cve")}],
+                "labels": [f.get("severity") or "info"],
+            })
+        if f.get("url"):
+            obj({
+                "type": "observed-data", "id": f"observed-data--{uuid.uuid4()}",
+                "first_observed": now, "last_observed": now, "number_observed": 1,
+                "objects": {"0": {"type": "url", "value": f.get("url")}},
+                "labels": [f.get("vuln_type") or "finding", f.get("severity") or "info"],
+            })
+
+    for ns in report.get("services") or []:
+        ip = ns.get("ip")
+        port = ns.get("port")
+        if not ip:
+            continue
+        obj({
+            "type": "observed-data", "id": f"observed-data--{uuid.uuid4()}",
+            "first_observed": now, "last_observed": now, "number_observed": 1,
+            "objects": {
+                "0": {"type": "ipv4-addr", "value": ip},
+                "1": {"type": "network-traffic", "dst_ref": "0",
+                      "dst_port": port, "protocols": [ns.get("protocol") or "tcp"]},
+            },
+            "labels": ["network-service", ns.get("service") or "unknown"],
+        })
+
+    for s in report.get("secrets") or []:
+        snippet = s.get("match_snippet") or ""
+        if not include_secrets:
+            snippet = _redact(snippet)
+        obj({
+            "type": "indicator", "id": f"indicator--{uuid.uuid4()}",
+            "name": f"Leaked {s.get('secret_type') or 'secret'}: {s.get('rule_name') or ''}".strip(),
+            "description": f"Snippet: {snippet}; source: {s.get('file_url') or s.get('host') or ''}",
+            "indicator_types": ["compromised"],
+            "pattern": f"[x-chack:secret_type = '{s.get('secret_type') or 'unknown'}']",
+            "pattern_type": "stix",
+            "valid_from": now,
+            "labels": [s.get("severity") or "high"],
+        })
+
+    return {"type": "bundle", "id": f"bundle--{uuid.uuid4()}", "objects": objects}
+
+
 def get_all_targets():
     conn = get_db()
     cursor = conn.cursor()
@@ -1155,6 +1326,16 @@ def main():
             print("Usage: db_sqlite.py report <domain_or_slug>")
             sys.exit(1)
         print(json.dumps(generate_report(sys.argv[2]), indent=2))
+    elif cmd in ('report_sarif', 'report_stix'):
+        if len(sys.argv) < 3:
+            print(f"Usage: db_sqlite.py {cmd} <domain_or_slug> [--include-secrets]")
+            sys.exit(1)
+        include_secrets = '--include-secrets' in sys.argv[3:]
+        rep = generate_report(sys.argv[2])
+        if cmd == 'report_sarif':
+            print(json.dumps(report_sarif(rep, include_secrets), indent=2))
+        else:
+            print(json.dumps(report_stix(rep, include_secrets), indent=2))
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)
