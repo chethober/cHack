@@ -16,6 +16,7 @@ if [ -z "$GRAPHQL_ENDPOINT" ] && [ -n "$BACKEND_URL" ]; then
 fi
 export BACKEND_URL
 export GRAPHQL_ENDPOINT
+export RUNNER_TOKEN
 
 # Concurrency & thread settings (can be overridden by env, .env, or -t/--threads)
 THREADS="${THREADS:-50}"
@@ -234,6 +235,7 @@ execute_graphql() {
 
     if [ -n "$GRAPHQL_ENDPOINT" ]; then
         if response=$(curl -s --connect-timeout 10 -m 15 -X POST "$GRAPHQL_ENDPOINT" \
+            -H "Authorization: Bearer $RUNNER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$payload" 2>&1); then
             if ! echo "$response" | jq -e '.errors' >/dev/null 2>&1; then
@@ -1106,6 +1108,39 @@ run_content_discovery() {
 # ==============================================================================
 # PHASE 6: Vulnerability & DAST Assessment
 # ==============================================================================
+run_client_analysis() {
+    # Client-side bug hunting: static DOM-XSS/postMessage/prototype-pollution
+    # analysis of crawled JS + live CORS / clickjacking / open-redirect probing.
+    local domain=$1
+    local output_dir="$TARGETS_DIR/$domain"
+
+    if [ ! -f "$SCRIPT_DIR/client_bugs.py" ]; then
+        return
+    fi
+    if [ ! -s "$output_dir/js_links" ] && [ ! -s "$output_dir/live_hosts" ]; then
+        log_info "No JS or live hosts available for client-side analysis. Skipping."
+        return
+    fi
+
+    log_info "🔍 Client-side bug analysis (DOM XSS, postMessage, CORS, clickjacking, open redirect)..."
+    python3 "$SCRIPT_DIR/client_bugs.py" all "$output_dir" "$THREADS" 2>/dev/null || true
+
+    if [ -s "$output_dir/client_findings.json" ]; then
+        local cc
+        cc=$(jq '. | length' "$output_dir/client_findings.json" 2>/dev/null || echo 0)
+        if [ "$cc" -gt 0 ]; then
+            log_info "🧩 Client-side analysis produced $cc finding(s)."
+            local high_cc
+            high_cc=$(jq '[.[] | select(.severity=="high" or .severity=="critical")] | length' "$output_dir/client_findings.json" 2>/dev/null || echo 0)
+            if [ "$high_cc" -gt 0 ]; then
+                send_telegram_notification "🧩 <b>Client-Side Bugs Found</b> for <code>$domain</code>
+• Total: <b>$cc</b>  (high/critical: <b>$high_cc</b>)
+• DOM XSS / postMessage / CORS / open-redirect checks"
+            fi
+        fi
+    fi
+}
+
 run_nuclei() {
     local domain=$1
     local output_dir="$TARGETS_DIR/$domain"
@@ -1115,7 +1150,11 @@ run_nuclei() {
         return
     fi
 
-    log_phase "Phase 6: Vulnerability & DAST Scanning (Nuclei + Dalfox)"
+    log_phase "Phase 6: Vulnerability & DAST Scanning (Nuclei + Dalfox + Client-Side)"
+
+    # Client-side bug hunting runs alongside the server-side DAST.
+    run_client_analysis "$domain"
+
     local host_count=$(count_lines "$output_dir/live_hosts")
     log_info "Running Nuclei against $host_count targets..."
 
@@ -1159,6 +1198,11 @@ run_nuclei() {
     # Merge exposure findings if present
     if [ -s "$output_dir/exposure_findings.json" ]; then
         all_findings=$(jq -s '.[0] + .[1]' <(echo "$all_findings") "$output_dir/exposure_findings.json")
+    fi
+
+    # Merge client-side findings if present
+    if [ -s "$output_dir/client_findings.json" ]; then
+        all_findings=$(jq -s '.[0] + .[1]' <(echo "$all_findings") "$output_dir/client_findings.json")
     fi
 
     echo "$all_findings" > "$output_dir/all_findings.json"
@@ -1240,6 +1284,37 @@ run_network_recon() {
     run_naabu "$target"
     update_port_scan_results "$target"
     update_network_services_results "$target"
+}
+
+run_client_recon() {
+    # Standalone client-side bug hunt. Reuses prior crawl data when present,
+    # otherwise performs the minimum crawl needed to feed the analyzer.
+    local domain=$1
+    local output_dir="$TARGETS_DIR/$domain"
+    mkdir -p "$output_dir"
+
+    if [ ! -s "$output_dir/js_links" ] && [ ! -s "$output_dir/live_hosts" ]; then
+        log_info "No prior crawl data for $domain — running subdomain + httpx + crawl first..."
+        run_subdomain_enum "$domain"
+        run_httpx "$domain"
+        insert_company_and_domains "$domain"
+        update_httpx_results "$domain"
+        run_katana "$domain"
+    fi
+
+    run_client_analysis "$domain"
+
+    # Persist client findings to the DB via the standard findings pipeline.
+    if [ -s "$output_dir/client_findings.json" ]; then
+        if [ -s "$output_dir/all_findings.json" ]; then
+            jq -s '.[0] + .[1]' "$output_dir/all_findings.json" "$output_dir/client_findings.json" \
+                > "$output_dir/all_findings.json.tmp" 2>/dev/null \
+                && mv "$output_dir/all_findings.json.tmp" "$output_dir/all_findings.json"
+        else
+            cp "$output_dir/client_findings.json" "$output_dir/all_findings.json"
+        fi
+        update_findings_results "$domain"
+    fi
 }
 
 recon() {
@@ -2173,6 +2248,8 @@ show_usage() {
     echo "  --network TARGET          Run network & port scan on IP / CIDR / domain"
     echo "  --fuzz DOMAIN             Run content & backup file discovery"
     echo "  --vuln DOMAIN             Run Nuclei & DAST vulnerability scanning"
+    echo "  --client DOMAIN           Hunt client-side bugs (DOM XSS, postMessage,"
+    echo "                            CORS, clickjacking, open redirect)"
     echo "  -t, --threads NUM         Set concurrency / worker threads (default: 50)"
     echo ""
     echo "Target & Entity Management:"
@@ -2198,6 +2275,7 @@ runner_send_log() {
         local payload
         payload=$(jq -n --arg id "$job_id" --arg log "$log_data" '{id: $id, log: $log}')
         curl -s -X POST "$BACKEND_URL/api/runner/log" \
+            -H "Authorization: Bearer $RUNNER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$payload" >/dev/null 2>&1
     fi
@@ -2215,6 +2293,7 @@ runner_update_status() {
         local payload
         payload=$(jq -n --arg id "$job_id" --arg status "$status" '{id: $id, status: $status}')
         curl -s -X POST "$BACKEND_URL/api/runner/status" \
+            -H "Authorization: Bearer $RUNNER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$payload" >/dev/null 2>&1
     fi
@@ -2225,7 +2304,7 @@ runner_update_status() {
 runner_poll_for_jobs() {
     local url="${BACKEND_URL}/api/runner/next-job?runner=${RUNNER_NAME}"
     local res
-    res=$(curl -s "$url")
+    res=$(curl -s -H "Authorization: Bearer $RUNNER_TOKEN" "$url")
     if [ -z "$res" ]; then
         return
     fi
@@ -2275,6 +2354,7 @@ main() {
     local NET_TARGET=""
     local FUZZ_TARGET=""
     local VULN_TARGET=""
+    local CLIENT_TARGET=""
     local PERSON=""
     local COMPANY=""
     local USERNAME=""
@@ -2339,6 +2419,11 @@ main() {
             --vuln)
                 if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
                 VULN_TARGET="$2"
+                shift 2
+                ;;
+            --client)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                CLIENT_TARGET="$2"
                 shift 2
                 ;;
             -p|--person)
@@ -2442,6 +2527,12 @@ main() {
     # Vulnerability Scan
     if [ -n "$VULN_TARGET" ]; then
         run_nuclei "$VULN_TARGET"
+        exit 0
+    fi
+
+    # Client-side bug hunt (DOM XSS, postMessage, CORS, clickjacking, open redirect)
+    if [ -n "$CLIENT_TARGET" ]; then
+        run_client_recon "$CLIENT_TARGET"
         exit 0
     fi
 

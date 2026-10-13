@@ -3,3 +3,12 @@
 TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
 ADMIN_IDS=your_telegram_user_id,another_admin_id
 RUNNERS=VPS-1,VPS-2
+
+# Shared secret authenticating runners + GraphQL/DB control plane.
+# Generate: openssl rand -hex 32  (prod: wrangler secret put RUNNER_TOKEN)
+RUNNER_TOKEN=your_shared_runner_token
+
+# Optional: Telegram webhook secret_token. When set, /webhook rejects requests
+# whose X-Telegram-Bot-Api-Secret-Token header does not match.
+# Register it with setWebhook(secret_token=...). Generate: openssl rand -hex 32
+TELEGRAM_WEBHOOK_SECRET=your_webhook_secret

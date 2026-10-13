@@ -1,5 +1,4 @@
 import { Hono } from 'hono';
-import { cors } from 'hono/cors';
 import { createYoga, createSchema } from 'graphql-yoga';
 import { makeExecutableSchema } from '@graphql-tools/schema';
 import { GraphQLJSON } from 'graphql-type-json';
@@ -3624,7 +3623,42 @@ const getBot = (env) => {
 // ----------------------------------------------------
 const app = new Hono();
 
-app.use('*', cors());
+// ----------------------------------------------------
+// Authentication: shared-secret bearer token
+// ----------------------------------------------------
+// Constant-time string comparison to avoid timing side-channels.
+const safeEqual = (a, b) => {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+};
+
+// Gate the runner/GraphQL/DB control plane behind RUNNER_TOKEN.
+// Fails closed: if the secret is not configured, all protected routes are
+// rejected until the operator sets it (wrangler secret put RUNNER_TOKEN).
+const requireToken = async (c, next) => {
+  const expected = c.env.RUNNER_TOKEN;
+  if (!expected) {
+    return c.json({ error: 'Server auth not configured (RUNNER_TOKEN unset)' }, 503);
+  }
+  const header = c.req.header('Authorization') || '';
+  const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!presented || !safeEqual(presented, expected)) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+  await next();
+};
+
+// No wildcard CORS: these endpoints are server-to-server (runners) + the
+// Telegram webhook, so no browser origin should be able to read them. The
+// bearer guard below protects the data/control routes.
+app.use('/graphql', requireToken);
+app.use('/api/db/*', requireToken);
+app.use('/api/runner/*', requireToken);
 
 // Health Check & DB Migration
 app.get('/', (c) => c.text('cHack Serverless Backend & Bot Running!'));
@@ -3705,6 +3739,14 @@ app.get('/api/db/migrate', async (c) => {
 });
 
 app.post('/api/db/reset', async (c) => {
+  // Destructive: wipes every table. Require an explicit confirmation field in
+  // addition to the bearer token, so a leaked token alone can't trivially wipe
+  // the central database by accident or replay.
+  let body = {};
+  try { body = await c.req.json(); } catch { /* no body */ }
+  if (body.confirm !== 'WIPE') {
+    return c.json({ success: false, error: "Refused: send {\"confirm\":\"WIPE\"} to confirm full database reset." }, 400);
+  }
   try {
     const tables = [
       "findings",
@@ -3737,6 +3779,16 @@ app.get('/graphql', async (c) => {
 
 // Telegram Bot Webhook
 app.post('/webhook', async (c) => {
+  // Verify the secret token Telegram echoes back (set via setWebhook's
+  // secret_token). Enforced only when TELEGRAM_WEBHOOK_SECRET is configured,
+  // so existing deployments keep working until they set it.
+  const webhookSecret = c.env.TELEGRAM_WEBHOOK_SECRET;
+  if (webhookSecret) {
+    const presented = c.req.header('X-Telegram-Bot-Api-Secret-Token') || '';
+    if (!safeEqual(presented, webhookSecret)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+  }
   const bot = getBot(c.env);
   bot.use((ctx, next) => {
     ctx.executionCtx = c.executionCtx;
