@@ -15,13 +15,18 @@ cHack chains the best-in-class ProjectDiscovery / recon tooling into a single, r
 
 - **Six-phase recon pipeline** — fully automated from a single domain to a vulnerability report.
 - **Three ways to drive it** — interactive TUI, direct CLI flags, or a Telegram bot.
-- **Distributed runners** — point many VPS runners at one central queue; jobs are load-shared.
+- **Distributed runners** — point many VPS runners at one central queue; the scheduler auto-balances by capacity, routes by region, honors per-job priority, retries failures with jittered backoff, and reclaims jobs stranded on offline nodes.
 - **Parallel execution** — port scanning and web crawling run concurrently; tunable worker threads (`-t`).
-- **JS secret mining** — dedicated scanner (`js_secrets.py`) with entropy checks, vendor filtering, and false-positive suppression.
+- **JS secret mining** — dedicated scanner (`js_secrets.py`) with entropy checks, vendor filtering, false-positive suppression, tiered classification (confirmed-live / candidate / informational), and optional **active verification** that pings each provider's read-only API to confirm which credentials are actually live.
 - **Client-side bug hunting** — dedicated analyzer (`client_bugs.py`). Static: DOM-XSS source→sink, dynamic code-exec, insecure `postMessage`, prototype pollution, framework escaping bypass (`v-html`/`trustAsHtml`), sensitive web-storage, insecure WebSocket. Active: CORS misconfig, clickjacking/security headers, open redirect, JSONP hijacking, reverse tabnabbing, mixed content.
 - **Central datastore** — per-runner SQLite synced to Cloudflare D1 for a single source of truth.
 - **Self-provisioning** — missing Go tools are auto-installed and periodically updated.
 - **Live job tracking** — stream logs, status, and executive summaries straight to Telegram.
+- **Conditional pipelines (DAG)** — chain phases on their results (`httpx` finds live hosts → `naabu`; `naabu` sees 443 → fingerprint) via editable trigger rules, not a fixed order.
+- **Continuous monitoring & drift** — schedule recurring scans and get alerted the moment new subdomains, ports, TLS certs, or cloud assets appear.
+- **Search & analytics** — query hosts, services, tech, exposed-credential patterns and findings, with an on-demand risk score.
+- **Role-based access & audit** — multi-operator roles, per-team target scope, and a tamper-evident audit log across Telegram, CLI/TUI, and the daemon.
+- **Team workflows** — campaigns, shared target groups, job templates, and per-target playbooks, with API-token auth and roles for multi-user operation.
 
 ---
 
@@ -47,6 +52,18 @@ cHack is a distributed system with three cooperating parts:
 - **`js_secrets.py`** — JavaScript secret/credential scanner used by the web-recon phase.
 - **`client_bugs.py`** — client-side bug analyzer (DOM XSS, `postMessage`, prototype pollution, CORS, clickjacking, open redirect) used by the DAST phase.
 
+### Runner orchestration
+
+The central queue (`back/`, Cloudflare D1) schedules work across every connected runner:
+
+- **Auto-balance** — each runner pulls only while it has a free slot (`?slots=N`, default 1), so new work flows to idle nodes instead of piling onto busy ones.
+- **Region-aware** — a job may pin a region (ISO country, e.g. `US`); it only runs on a runner in that region, and region-local jobs are preferred over unpinned ones.
+- **Priority** — higher-`priority` jobs (e.g. high-value targets) are dispatched ahead of the rest; ties break by age.
+- **Retries with jitter** — a failed job is requeued up to `max_attempts` (default 3) with exponential backoff plus jitter (`30s · 2^attempt`, capped at 30 min).
+- **Health checks & reclaim** — runners heartbeat continuously (even mid-job); a runner silent past ~3 min is treated as offline and its in-flight jobs are requeued (or failed once attempts run out). Claims are atomic, so two runners never execute the same job.
+
+> **Upgrading an existing deployment:** these add columns to `scan_jobs`. After deploying the Worker, hit `GET /api/db/migrate` once to apply the (idempotent) schema changes.
+
 ---
 
 ## 🔁 The Recon Pipeline
@@ -63,6 +80,36 @@ A full scan (`-d <domain>`) runs six phases; individual phases are also exposed 
 | **6** | Vulnerability & DAST | Template scanning (`nuclei`), reflected-XSS verification on parameterized URLs (`dalfox`), and client-side bug hunting (`client_bugs.py`) |
 
 Phases 3 and 4 run **in parallel** to cut wall-clock time.
+
+### Task dependency graph (DAG)
+
+Beyond the fixed pipeline, phases can be chained **conditionally** on their results. Each phase runs as its own queued job (`--phase <type> <domain>`) and emits a machine-readable result line (`##CHACK_RESULT## {…}`). When a job completes, the backend evaluates the `trigger_rules` table against that result and enqueues the child phases whose condition holds — so work only happens where it's warranted:
+
+- `subdomain_enum` finds subdomains **→** `httpx`
+- `httpx` finds live hosts **→** `naabu` **and** `katana`
+- `naabu` reports **443 open → `httpx_fingerprint`**
+- `katana` finds endpoints **→** `nuclei`
+
+Rules are editable data (not hardcoded), with conditions `always | exists | eq | gt | gte | contains`. Each phase runs at most once per pipeline (dedupe by `pipeline_id`), which also makes rule cycles impossible; jobs stuck `running` for 30 min are reaped so a dead runner can't stall the graph. Children inherit the parent's runner so phase output files stay local.
+
+```bash
+./cHack.sh --phase naabu example.com   # run one DAG phase, emitting a result line
+
+# Start a pipeline (seeds a subdomain_enum root; triggers cascade from there)
+curl -X POST "$BACKEND_URL/api/pipeline/start" -d '{"domain":"example.com","runner":"VPS-US"}'
+
+# Inspect the pipeline's jobs + per-node status/results
+curl "$BACKEND_URL/api/pipeline/<pipeline_id>"
+
+# List / add / remove trigger rules
+curl "$BACKEND_URL/api/rules"
+curl -X POST "$BACKEND_URL/api/rules" -d '{"on_job_type":"naabu","cond_key":"open_ports","cond_op":"contains","cond_value":"22","spawn_job_type":"nuclei"}'
+curl -X DELETE "$BACKEND_URL/api/rules/<rule_id>"
+```
+
+Phase types for `--phase`: `subdomain_enum`, `httpx`, `httpx_fingerprint`, `naabu`, `katana`, `nuclei`, `content_discovery`.
+
+> After deploying the Worker, hit `GET /api/db/migrate` once to add the DAG columns, create `trigger_rules`, and seed the default graph on your live D1 database.
 
 ---
 
@@ -108,7 +155,19 @@ Missing Go tools are installed automatically on first run and refreshed weekly.
 ./cHack.sh --vuln example.com        # vulnerability & DAST scanning
 ./cHack.sh --client example.com      # client-side bugs: DOM XSS, postMessage, CORS, clickjacking, open redirect
 ./cHack.sh -t 100 -d example.com     # tune concurrency (default: 50)
+VERIFY_SECRETS=1 ./cHack.sh --web example.com  # confirm which leaked secrets are live (opt-in)
 ```
+
+> ⚠️ **Active verification (`VERIFY_SECRETS=1`)** sends each matched credential to
+> its provider's read-only API (e.g. `GET api.github.com/user`) to check whether it
+> is live. This separates real bugs from look-alikes but transmits captured tokens
+> to third parties — only enable it against targets you are explicitly authorized to
+> test. It is **off** by default. The scanner can also be run directly with
+> `--verify` / `--only-verified`:
+> ```bash
+> python3 js_secrets.py js_links out.json 50 --verify         # tier + confirm live
+> python3 js_secrets.py js_links out.json 50 --only-verified  # keep only confirmed-live
+> ```
 
 ### Runner daemon & sync
 ```bash
@@ -124,6 +183,28 @@ Missing Go tools are installed automatically on first run and refreshed weekly.
 ./cHack.sh -u analyst          # add a user
 ./cHack.sh -h                  # full help
 ```
+
+### Search & analytics
+Query everything the pipeline has stored — across hosts, services, tech stack,
+exposed credential patterns, findings, and a derived risk score. Available from
+the TUI **Database → Search & Analytics** menu, or directly via `db_sqlite.py`:
+
+```bash
+python3 db_sqlite.py search <term> [kind]
+#   kind: all (default) | domain | service | tech | secret | finding | risk | asn
+
+python3 db_sqlite.py search cloudflare tech     # hosts fingerprinted with a tech
+python3 db_sqlite.py search nginx service       # network services / products
+python3 db_sqlite.py search aws secret          # exposed credential rule/type (values redacted)
+python3 db_sqlite.py search takeover finding    # findings by type / CVE / title
+python3 db_sqlite.py search acme domain         # hosts by name, title, or webserver
+python3 db_sqlite.py search 10 risk             # targets with risk score ≥ 10 (ranked)
+```
+
+Risk score is aggregated on demand as the weighted sum of open findings and
+secrets by severity (critical 10 / high 6 / medium 3 / low 1). Credential match
+snippets are masked in results. ASN is not yet captured by the pipeline, so the
+`asn` kind falls back to a host/service keyword match and flags the gap.
 
 ---
 
@@ -144,6 +225,175 @@ Once the Worker is deployed and a runner daemon is online, control everything fr
 | `/report <domain>` | Generate an executive recon summary |
 | `/tools` | Check tool health and status |
 | `/stop <job_id>` | Stop an active scan job |
+| `/monitor <target> [interval] [type]` | Schedule recurring scans (continuous monitoring) |
+| `/monitors` | List your active monitors |
+| `/unmonitor <id>` | Remove a monitor |
+
+---
+
+## 🛰️ Continuous Attack-Surface Monitoring
+
+cHack can watch a target over time, re-running scans on a schedule and alerting
+you the moment the attack surface *changes* — not just the first time it's mapped.
+
+### Schedule recurring scans
+
+From Telegram:
+
+```
+/monitor example.com 12h            # re-scan every 12 hours (info-gather)
+/monitor example.com 1d recon       # full pipeline once a day
+/monitor 192.0.2.0/24 6h network    # port/service sweep of a CIDR every 6h
+/monitor "Acme Corp" 1d             # fan out to every known domain of a company
+/monitors                           # list what you're watching
+/unmonitor <id>                     # stop watching
+```
+
+- **target** — a domain, a company name/slug (expands to all its known registrable
+  domains), or an IP/CIDR.
+- **interval** — `30m`, `6h`, `1d`, or a bare number of minutes. Default `1d`.
+- **scan_type** — `recon` · `infogather` · `web` · `network`.
+
+Monitors are stored in the central D1 database. A **Cloudflare
+[Cron Trigger](https://developers.cloudflare.com/workers/configuration/cron-triggers/)**
+(`*/15 * * * *`, configured in `back/wrangler.json`) wakes the Worker, enqueues any
+due monitors into the same runner job queue as manual scans, and rolls each schedule
+forward. Intervals are effectively rounded up to the 15-minute tick.
+
+> After deploying the Worker, hit `GET /api/db/migrate` once to create the
+> `monitors` table on an existing database.
+
+### Drift detection between runs
+
+Every monitored scan (and every manual re-scan) ends by diffing the freshly-collected
+surface against a rolling, runner-local baseline (`surface_assets` in `local.db`). The
+first scan of a target seeds the baseline silently; later scans report only what's
+**new**:
+
+| Drift category | How it's detected |
+| :--- | :--- |
+| **New subdomains** | New hosts under the target's company in the local DB |
+| **Newly exposed ports** | New `ip:port` pairs from the port-scan phase |
+| **New TLS certificates** | New certificate serials from Certificate Transparency (crt.sh) |
+| **New cloud assets** | Subdomains whose CNAME newly points at a known cloud provider (AWS/Azure/GCP/Cloudflare/Heroku/Netlify/Vercel/…) via DNS-over-HTTPS |
+
+Each new asset is recorded in the `drift_events` table and, when the scan was launched
+by a monitor, pushed to the owner's Telegram chat as a drift alert.
+
+Drift analysis is also available directly on a runner:
+
+```bash
+python3 db_sqlite.py drift example.com infogather [telegram_chat_id]
+```
+
+TLS-cert and cloud-asset collection are best-effort (network-dependent, with timeouts)
+and never produce false "removed" signals. Set `CHACK_DRIFT_CLOUD=0` to skip the
+DNS-over-HTTPS cloud-asset classification.
+
+---
+
+## 🔐 Access Control & Audit
+
+cHack supports multiple operators with role-based access and a tamper-evident
+audit trail across every surface (Telegram, CLI/TUI, and the runner daemon).
+
+### Roles
+
+| Role | Capabilities |
+| :--- | :--- |
+| **superadmin** | Everything, incl. DB reset and granting `admin`. Defined by `ADMIN_IDS`; never stored in the DB. |
+| **admin** | Manage targets/contacts, grant roles & team scopes, view the audit log. |
+| **operator** | Launch scans against in-scope targets (teams they belong to, or unclaimed targets). |
+| **viewer** | Read-only: dashboards, findings, reports. Cannot scan. |
+| *pending* | Registered but not yet granted access. Can do nothing until promoted. |
+
+A target's **scope** is the company (team) that owns its domain. An operator may
+only scan targets belonging to a team they are a member of (admins/superadmins
+bypass scope). Membership is managed per team.
+
+> **Backward compatibility:** with `ADMIN_IDS` empty the bot stays wide-open
+> (single-tenant legacy mode — every caller is treated as an admin). As soon as
+> any `ADMIN_IDS` value is set, multi-user RBAC is enforced and new users start
+> as *pending*.
+
+### Management commands (Telegram)
+
+| Command | Role | Description |
+| :--- | :--- | :--- |
+| `/whoami` | viewer | Show your ID, global role, and team memberships |
+| `/users` | admin | List registered users and their roles |
+| `/role <id> <role>` | admin¹ | Set a user's global role (`pending\|viewer\|operator\|admin`) |
+| `/grant <id> <company> [role]` | admin | Add a user to a team (default team role: `operator`) |
+| `/revoke <id> <company>` | admin | Remove a user from a team |
+| `/members [company]` | admin | List team memberships |
+| `/audit [n]` | admin | Show the last `n` audit entries (default 15, max 50) |
+
+¹ Only a superadmin may grant or change the `admin` role.
+
+### Audit log
+
+Every scan and sensitive action (role/scope changes, deletions, DB reset, and
+denied attempts) is appended to the `audit_log` table with actor, source,
+decision (allow/deny), target, and scope. The audit log is **not** cleared by a
+database reset. Local CLI/TUI and daemon scans are recorded on each runner;
+Telegram actions and runner dispatch are recorded centrally in D1.
+
+---
+
+## 👥 Team Workflows
+
+For client engagements and acquisition pipelines, cHack models shared work on top
+of the existing company/domain data. All four pieces live in the central D1 database
+(and sync to each runner's local SQLite via `back/schema.sql`):
+
+| Concept | What it is |
+| :--- | :--- |
+| **Campaigns** | A client *engagement* or *acquisition* workflow grouping targets, playbooks and findings under one authorized scope. Has a status (`prospect → active → won/lost/closed`) and an `authorized` gate. |
+| **Shared target groups** | Reusable, team-visible sets of domains you can scan as one unit. |
+| **Job templates** | Parameterized scan definitions whose `command_template` expands `{{target}}` / `{{sender}}` into a real `cHack.sh` invocation. |
+| **Per-target playbooks** | Ordered sequences of template/phase steps, optionally bound to a specific domain or group. Running one expands into one queued job per step per target. |
+
+> 🔒 **Authorization gate.** A playbook attached to a campaign refuses to launch
+> until that campaign is explicitly marked `authorized` — a deliberate guard that
+> keeps scans inside a scope you've confirmed you're allowed to test.
+
+### From Telegram
+
+```
+/campaigns                         # list campaigns
+/newcampaign Acme Pentest | engagement
+/groups                            # list shared target groups
+/templates                         # list job templates
+/playbooks                         # list playbooks
+/runplaybook <slug> <target>       # expand a playbook into queued jobs
+```
+
+### From the GraphQL API
+
+The Worker's `/graphql` endpoint exposes full CRUD for `campaigns`, `targetGroups`,
+`jobTemplates` and `playbooks`, plus `runTemplate` / `runPlaybook` mutations that
+queue jobs the runners pick up. See `back/src/index.js` for the schema.
+
+### Multi-user access & roles
+
+Programmatic access is authenticated with **API tokens** (SHA-256 hashed at rest;
+the plaintext is shown only once at creation). Roles rank `admin > member > viewer`,
+with a dedicated `runner` role for result-push. Per-campaign membership adds
+`lead / member / viewer` on top.
+
+Enforcement is **off by default** so existing single-operator deployments keep
+working. To turn it on:
+
+```bash
+# 1. While still unenforced (bootstrap), mint an admin token via the API:
+#    mutation { createApiToken(name:"me", role:"admin"){ token } }
+# 2. Flip the Worker binding and redeploy:
+cd back && wrangler deploy   # with AUTH_ENFORCED="true"
+```
+
+Thereafter, team-workflow mutations require `Authorization: Bearer <token>`.
+Optionally set a `RUNNER_TOKEN` secret on the Worker and the matching value in each
+runner's `.env` to reject unregistered runners from the job queue.
 
 ---
 
@@ -199,8 +449,9 @@ cHack/
 ├── install.sh            # VPS provisioning (Go, toolchain, Python deps)
 ├── back/                 # Cloudflare Worker: Telegram bot + GraphQL API
 │   ├── src/index.js
-│   ├── schema.sql
-│   └── wrangler.json
+│   ├── schema.sql        # full D1/SQLite schema (fresh installs)
+│   ├── migrations/       # one-shot migrations for pre-existing D1 databases
+│   └── wrangler.json     # bindings, cron trigger, AUTH_ENFORCED
 ├── .env.example
 └── .github/workflows/    # ShellCheck + Ruff CI
 ```

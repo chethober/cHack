@@ -4,7 +4,7 @@ import { makeExecutableSchema } from '@graphql-tools/schema';
 import { GraphQLJSON } from 'graphql-type-json';
 import { DateTimeResolver } from 'graphql-scalars';
 import { Bot, webhookCallback } from 'grammy';
-import { GraphQLScalarType, Kind } from 'graphql';
+import { GraphQLScalarType, Kind, GraphQLError } from 'graphql';
 
 // ----------------------------------------------------
 // BigInt Custom Resolver
@@ -233,7 +233,161 @@ const typeDefs = `
     banner: String
   }
 
+  # ---- Team workflows ----
+  type ApiToken {
+    id: ID!
+    user_id: ID
+    name: String!
+    role: String!
+    revoked: Boolean!
+    last_used_at: DateTime
+    created_at: DateTime!
+    token: String   # plaintext, returned only once at creation
+    user: User
+  }
+
+  type Campaign {
+    id: ID!
+    name: String!
+    slug: String
+    owner_user_id: ID
+    company_id: ID
+    kind: String!
+    status: String!
+    authorized: Boolean!
+    scope: JSON!
+    description: String
+    data: JSON!
+    created_at: DateTime!
+    updated_at: DateTime!
+    owner: User
+    company: Company
+    members: [CampaignMember!]!
+    targetGroups: [TargetGroup!]!
+    playbooks: [Playbook!]!
+  }
+
+  type CampaignMember {
+    campaign_id: ID!
+    user_id: ID!
+    role: String!
+    created_at: DateTime!
+    user: User
+  }
+
+  type TargetGroup {
+    id: ID!
+    campaign_id: ID
+    name: String!
+    owner_user_id: ID
+    visibility: String!
+    description: String
+    data: JSON!
+    created_at: DateTime!
+    updated_at: DateTime!
+    domains: [Domain!]!
+    campaign: Campaign
+  }
+
+  type JobTemplate {
+    id: ID!
+    name: String!
+    slug: String
+    owner_user_id: ID
+    visibility: String!
+    command_template: String!
+    phases: JSON!
+    default_flags: JSON!
+    runner: String
+    description: String
+    data: JSON!
+    created_at: DateTime!
+    updated_at: DateTime!
+  }
+
+  type Playbook {
+    id: ID!
+    name: String!
+    slug: String
+    campaign_id: ID
+    owner_user_id: ID
+    visibility: String!
+    description: String
+    data: JSON!
+    created_at: DateTime!
+    updated_at: DateTime!
+    steps: [PlaybookStep!]!
+    campaign: Campaign
+  }
+
+  type PlaybookStep {
+    id: ID!
+    playbook_id: ID!
+    step_order: Int!
+    template_id: ID
+    phase: String
+    params: JSON!
+    created_at: DateTime!
+    template: JobTemplate
+  }
+
+  type RunResult {
+    jobIds: [ID!]!
+    count: Int!
+  }
+
+  input CampaignInput {
+    name: String!
+    slug: String
+    owner_user_id: ID
+    company_id: ID
+    kind: String
+    status: String
+    authorized: Boolean
+    scope: JSON
+    description: String
+    data: JSON
+  }
+
+  input TargetGroupInput {
+    name: String!
+    campaign_id: ID
+    owner_user_id: ID
+    visibility: String
+    description: String
+    data: JSON
+  }
+
+  input JobTemplateInput {
+    name: String!
+    slug: String
+    command_template: String!
+    phases: JSON
+    default_flags: JSON
+    runner: String
+    visibility: String
+    description: String
+    data: JSON
+  }
+
+  input PlaybookInput {
+    name: String!
+    slug: String
+    campaign_id: ID
+    visibility: String
+    description: String
+    data: JSON
+  }
+
+  input PlaybookStepInput {
+    step_order: Int!
+    template_id: ID
+    phase: String
+    params: JSON
+  }
+
   type Query {
+    me: User
     user(id: ID, username: String, number_id: BigInt): User
     users: [User!]!
 
@@ -266,6 +420,18 @@ const typeDefs = `
     endpoints(domain: String, limit: Int): [Endpoint!]!
     networkServices(domain: String): [NetworkService!]!
     domainReport(domain: String!): JSON!
+
+    # Team workflows
+    campaigns(status: String, kind: String): [Campaign!]!
+    campaign(id: ID!): Campaign
+    campaignBySlug(slug: String!): Campaign
+    targetGroups(campaignId: ID): [TargetGroup!]!
+    targetGroup(id: ID!): TargetGroup
+    jobTemplates: [JobTemplate!]!
+    jobTemplate(id: ID!): JobTemplate
+    playbooks(campaignId: ID): [Playbook!]!
+    playbook(id: ID!): Playbook
+    apiTokens: [ApiToken!]!
   }
 
   type Mutation {
@@ -297,6 +463,36 @@ const typeDefs = `
     createEndpointsBatch(domain: String!, endpoints: [EndpointInput!]!): Boolean!
     createSecretsBatch(domain: String!, secrets: [SecretInput!]!): Boolean!
     createNetworkServicesBatch(domain: String!, services: [NetworkServiceInput!]!): Boolean!
+
+    # ---- Team workflows ----
+    createApiToken(userId: ID, name: String!, role: String): ApiToken!
+    revokeApiToken(id: ID!): Boolean!
+
+    createCampaign(input: CampaignInput!): Campaign!
+    updateCampaign(id: ID!, input: CampaignInput!): Campaign!
+    deleteCampaign(id: ID!): Boolean!
+    setCampaignStatus(id: ID!, status: String!): Campaign!
+    addCampaignMember(campaignId: ID!, userId: ID!, role: String): CampaignMember!
+    removeCampaignMember(campaignId: ID!, userId: ID!): Boolean!
+
+    createTargetGroup(input: TargetGroupInput!): TargetGroup!
+    updateTargetGroup(id: ID!, input: TargetGroupInput!): TargetGroup!
+    deleteTargetGroup(id: ID!): Boolean!
+    addDomainToGroup(groupId: ID!, domainId: ID!): Boolean!
+    removeDomainFromGroup(groupId: ID!, domainId: ID!): Boolean!
+
+    createJobTemplate(input: JobTemplateInput!): JobTemplate!
+    updateJobTemplate(id: ID!, input: JobTemplateInput!): JobTemplate!
+    deleteJobTemplate(id: ID!): Boolean!
+
+    createPlaybook(input: PlaybookInput!): Playbook!
+    updatePlaybook(id: ID!, input: PlaybookInput!): Playbook!
+    deletePlaybook(id: ID!): Boolean!
+    setPlaybookSteps(playbookId: ID!, steps: [PlaybookStepInput!]!): Playbook!
+    bindPlaybookToTarget(playbookId: ID!, domainId: ID, groupId: ID): Boolean!
+
+    runTemplate(templateId: ID!, target: String!, runner: String, senderId: BigInt): RunResult!
+    runPlaybook(playbookId: ID!, target: String, groupId: ID, runner: String, senderId: BigInt): RunResult!
   }
 
   type Subscription {
@@ -331,6 +527,128 @@ const parseJson = (val) => {
   } catch (e) {
     return {};
   }
+};
+
+// Helper to coerce a JSON-array column to an array (default [])
+const parseJsonArray = (val) => {
+  if (Array.isArray(val)) return val;
+  if (val === null || val === undefined) return [];
+  try {
+    const p = JSON.parse(val || '[]');
+    return Array.isArray(p) ? p : [];
+  } catch (e) {
+    return [];
+  }
+};
+
+// ----------------------------------------------------
+// Auth helpers: API-token (Bearer) auth + role enforcement
+// ----------------------------------------------------
+const sha256hex = async (str) => {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+};
+
+const extractToken = (request) => {
+  if (!request || !request.headers) return null;
+  const auth = request.headers.get('authorization');
+  if (auth && /^Bearer\s+/i.test(auth)) return auth.replace(/^Bearer\s+/i, '').trim();
+  const key = request.headers.get('x-api-key');
+  return key ? key.trim() : null;
+};
+
+// Resolve the caller from an API token. Returns { userId, username, role, tokenId } or null.
+const resolveAuth = async (env, request) => {
+  const raw = extractToken(request);
+  if (!raw) return null;
+  try {
+    const hash = await sha256hex(raw);
+    const row = await env.DB.prepare(
+      `SELECT t.id AS token_id, t.role AS token_role, t.revoked,
+              u.id AS user_id, u.role AS user_role, u.username AS username
+       FROM api_tokens t LEFT JOIN users u ON u.id = t.user_id
+       WHERE t.token_hash = ?`
+    ).bind(hash).first();
+    if (!row || row.revoked) return null;
+    // Best-effort last-used stamp; never block the request on it.
+    env.DB.prepare("UPDATE api_tokens SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
+      .bind(row.token_id).run().catch(() => {});
+    // Token role scopes at or below the user's role; fall back to user role.
+    return { userId: row.user_id, username: row.username, role: row.token_role || row.user_role || 'member', tokenId: row.token_id };
+  } catch (e) {
+    console.error('auth resolve error:', e.message);
+    return null;
+  }
+};
+
+// Auth is only enforced when AUTH_ENFORCED=true, so existing single-operator
+// deployments keep working until they provision tokens and opt in.
+const authEnforced = (env) => String(env?.AUTH_ENFORCED || '').toLowerCase() === 'true';
+
+// Role ranking for API-token / GraphQL auth (distinct from the Telegram RBAC
+// ROLE_RANK below, which uses the pending<viewer<operator<admin<superadmin model).
+const TOKEN_ROLE_RANK = { viewer: 1, runner: 1, member: 2, admin: 3 };
+
+// Throw unless the caller meets the minimum role (no-op in bootstrap mode).
+const requireRole = (ctx, min) => {
+  if (!authEnforced(ctx.env)) return;
+  const role = ctx.auth?.role;
+  if (!role) {
+    throw new GraphQLError('Authentication required', { extensions: { code: 'UNAUTHENTICATED' } });
+  }
+  if ((TOKEN_ROLE_RANK[role] || 0) < (TOKEN_ROLE_RANK[min] || 99)) {
+    throw new GraphQLError(`Insufficient role: '${min}' required`, { extensions: { code: 'FORBIDDEN' } });
+  }
+};
+
+// Owner-or-admin check for mutating a specific row (no-op in bootstrap mode).
+const requireOwnerOrAdmin = (ctx, ownerUserId) => {
+  if (!authEnforced(ctx.env)) return;
+  if (ctx.auth?.role === 'admin') return;
+  if (ctx.auth?.userId && ownerUserId && ctx.auth.userId === ownerUserId) return;
+  throw new GraphQLError('Only the owner or an admin may perform this action', { extensions: { code: 'FORBIDDEN' } });
+};
+
+const slugify = (s) => String(s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+
+// Reject targets that could break out of the runner's shell command.
+const assertSafeTarget = (target) => {
+  const t = String(target || '').trim();
+  if (!t || /[;&|`$<>\n\r\\"'\s]/.test(t)) {
+    throw new GraphQLError('Invalid target: empty or contains disallowed characters', { extensions: { code: 'BAD_USER_INPUT' } });
+  }
+  return t;
+};
+
+// Map a playbook phase identifier to the cHack.sh flag that runs it.
+const PHASE_FLAGS = {
+  recon: '-d', full: '-d', vulns: '-d',
+  web: '--web', secrets: '--web',
+  network: '--network', ports: '--network',
+  infogather: '--info-gather', info: '--info-gather',
+};
+const commandForPhase = (phase, target, sender) => {
+  const p = String(phase || 'recon').toLowerCase();
+  const flag = PHASE_FLAGS[p] || `--${p}`;
+  const s = (sender !== undefined && sender !== null && sender !== '') ? ` --sender-id ${sender}` : '';
+  return `${flag} ${target}${s}`.trim();
+};
+
+// Expand a job-template command string, substituting {{target}} / {{sender}}.
+const expandCommandTemplate = (tpl, target, sender) => {
+  let out = String(tpl || '');
+  out = out.replace(/\{\{\s*target\s*\}\}/gi, target != null ? String(target) : '');
+  out = out.replace(/\{\{\s*sender(?:[-_]?id)?\s*\}\}/gi, (sender != null && sender !== '') ? String(sender) : '');
+  return out.replace(/\s+/g, ' ').trim();
+};
+
+// Queue a single scan job and return its id.
+const queueJob = async (env, command, domain, runner) => {
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO scan_jobs (id, command, domain, runner, status) VALUES (?, ?, ?, ?, 'pending')"
+  ).bind(id, command, domain, runner || 'default').run();
+  return id;
 };
 
 const resolvers = {
@@ -624,6 +942,67 @@ const resolvers = {
         secrets,
         services
       };
+    },
+
+    // ---- Team workflows ----
+    me: async (_, __, { env, auth }) => {
+      if (!auth?.userId) return null;
+      return await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(auth.userId).first();
+    },
+    campaigns: async (_, { status, kind }, { env }) => {
+      let q = "SELECT * FROM campaigns WHERE 1=1";
+      const binds = [];
+      if (status) { q += " AND status = ?"; binds.push(status); }
+      if (kind) { q += " AND kind = ?"; binds.push(kind); }
+      q += " ORDER BY created_at DESC";
+      const { results } = await env.DB.prepare(q).bind(...binds).all();
+      return results;
+    },
+    campaign: async (_, { id }, { env }) => {
+      return await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(id).first();
+    },
+    campaignBySlug: async (_, { slug }, { env }) => {
+      return await env.DB.prepare("SELECT * FROM campaigns WHERE slug = ?").bind(slug).first();
+    },
+    targetGroups: async (_, { campaignId }, { env }) => {
+      if (campaignId) {
+        const { results } = await env.DB.prepare(
+          "SELECT * FROM target_groups WHERE campaign_id = ? ORDER BY created_at DESC"
+        ).bind(campaignId).all();
+        return results;
+      }
+      const { results } = await env.DB.prepare("SELECT * FROM target_groups ORDER BY created_at DESC").all();
+      return results;
+    },
+    targetGroup: async (_, { id }, { env }) => {
+      return await env.DB.prepare("SELECT * FROM target_groups WHERE id = ?").bind(id).first();
+    },
+    jobTemplates: async (_, __, { env }) => {
+      const { results } = await env.DB.prepare("SELECT * FROM job_templates ORDER BY created_at DESC").all();
+      return results;
+    },
+    jobTemplate: async (_, { id }, { env }) => {
+      return await env.DB.prepare("SELECT * FROM job_templates WHERE id = ?").bind(id).first();
+    },
+    playbooks: async (_, { campaignId }, { env }) => {
+      if (campaignId) {
+        const { results } = await env.DB.prepare(
+          "SELECT * FROM playbooks WHERE campaign_id = ? ORDER BY created_at DESC"
+        ).bind(campaignId).all();
+        return results;
+      }
+      const { results } = await env.DB.prepare("SELECT * FROM playbooks ORDER BY created_at DESC").all();
+      return results;
+    },
+    playbook: async (_, { id }, { env }) => {
+      return await env.DB.prepare("SELECT * FROM playbooks WHERE id = ?").bind(id).first();
+    },
+    apiTokens: async (_, __, ctx) => {
+      requireRole(ctx, 'admin');
+      const { results } = await ctx.env.DB.prepare(
+        "SELECT id, user_id, name, role, revoked, last_used_at, created_at FROM api_tokens ORDER BY created_at DESC"
+      ).all();
+      return results;
     }
   },
 
@@ -1125,6 +1504,360 @@ const resolvers = {
         await env.DB.batch(statements);
       }
       return true;
+    },
+
+    // ---- Team workflows: API tokens ----
+    createApiToken: async (_, { userId, name, role }, ctx) => {
+      // Bootstrap: allowed without auth until AUTH_ENFORCED=true; then admin-only.
+      requireRole(ctx, 'admin');
+      const { env, auth } = ctx;
+      const tokenRole = role || 'member';
+      if (!TOKEN_ROLE_RANK[tokenRole]) {
+        throw new GraphQLError(`Invalid role '${tokenRole}'`, { extensions: { code: 'BAD_USER_INPUT' } });
+      }
+      const uid = userId || auth?.userId || null;
+      // 32 random bytes, hex-encoded, prefixed so it's recognizable in configs.
+      const rawBytes = crypto.getRandomValues(new Uint8Array(32));
+      const raw = 'chk_' + [...rawBytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+      const hash = await sha256hex(raw);
+      const id = crypto.randomUUID();
+      const row = await env.DB.prepare(
+        `INSERT INTO api_tokens (id, user_id, name, token_hash, role)
+         VALUES (?, ?, ?, ?, ?)
+         RETURNING id, user_id, name, role, revoked, last_used_at, created_at`
+      ).bind(id, uid, name, hash, tokenRole).first();
+      return { ...row, token: raw }; // plaintext returned only here
+    },
+    revokeApiToken: async (_, { id }, ctx) => {
+      requireRole(ctx, 'admin');
+      const res = await ctx.env.DB.prepare("UPDATE api_tokens SET revoked = 1 WHERE id = ? RETURNING id").bind(id).first();
+      return !!res;
+    },
+
+    // ---- Campaigns ----
+    createCampaign: async (_, { input }, ctx) => {
+      requireRole(ctx, 'member');
+      const { env, auth } = ctx;
+      const id = crypto.randomUUID();
+      const owner = input.owner_user_id || auth?.userId || null;
+      const row = await env.DB.prepare(
+        `INSERT INTO campaigns (id, name, slug, owner_user_id, company_id, kind, status, authorized, scope, description, data)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         RETURNING *`
+      ).bind(
+        id, input.name, input.slug || slugify(input.name), owner, input.company_id || null,
+        input.kind || 'engagement', input.status || 'prospect', input.authorized ? 1 : 0,
+        JSON.stringify(input.scope || {}), input.description || null, JSON.stringify(input.data || {})
+      ).first();
+      // Owner becomes the campaign lead.
+      if (owner) {
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO campaign_members (campaign_id, user_id, role) VALUES (?, ?, 'lead')"
+        ).bind(id, owner).run();
+      }
+      return row;
+    },
+    updateCampaign: async (_, { id, input }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM campaigns WHERE id = ?").bind(id).first();
+      if (!existing) throw new GraphQLError('Campaign not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      let patch = "";
+      const binds = [
+        input.name ?? null, input.slug ?? null, input.company_id ?? null,
+        input.kind ?? null, input.status ?? null,
+        (input.authorized === undefined || input.authorized === null) ? null : (input.authorized ? 1 : 0),
+        input.description ?? null,
+      ];
+      if (input.scope) { patch += ", scope = json_patch(COALESCE(scope,'{}'), ?)"; binds.push(JSON.stringify(input.scope)); }
+      if (input.data) { patch += ", data = json_patch(COALESCE(data,'{}'), ?)"; binds.push(JSON.stringify(input.data)); }
+      binds.push(id);
+      return await ctx.env.DB.prepare(
+        `UPDATE campaigns SET
+           name = COALESCE(?, name), slug = COALESCE(?, slug), company_id = COALESCE(?, company_id),
+           kind = COALESCE(?, kind), status = COALESCE(?, status), authorized = COALESCE(?, authorized),
+           description = COALESCE(?, description)${patch},
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ? RETURNING *`
+      ).bind(...binds).first();
+    },
+    deleteCampaign: async (_, { id }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM campaigns WHERE id = ?").bind(id).first();
+      if (!existing) return false;
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      const res = await ctx.env.DB.prepare("DELETE FROM campaigns WHERE id = ? RETURNING id").bind(id).first();
+      return !!res;
+    },
+    setCampaignStatus: async (_, { id, status }, ctx) => {
+      requireRole(ctx, 'member');
+      return await ctx.env.DB.prepare(
+        "UPDATE campaigns SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? RETURNING *"
+      ).bind(status, id).first();
+    },
+    addCampaignMember: async (_, { campaignId, userId, role }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM campaigns WHERE id = ?").bind(campaignId).first();
+      if (!existing) throw new GraphQLError('Campaign not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      return await ctx.env.DB.prepare(
+        `INSERT INTO campaign_members (campaign_id, user_id, role) VALUES (?, ?, ?)
+         ON CONFLICT(campaign_id, user_id) DO UPDATE SET role = excluded.role
+         RETURNING *`
+      ).bind(campaignId, userId, role || 'member').first();
+    },
+    removeCampaignMember: async (_, { campaignId, userId }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM campaigns WHERE id = ?").bind(campaignId).first();
+      if (!existing) return false;
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      const res = await ctx.env.DB.prepare(
+        "DELETE FROM campaign_members WHERE campaign_id = ? AND user_id = ? RETURNING user_id"
+      ).bind(campaignId, userId).first();
+      return !!res;
+    },
+
+    // ---- Target groups ----
+    createTargetGroup: async (_, { input }, ctx) => {
+      requireRole(ctx, 'member');
+      const id = crypto.randomUUID();
+      const owner = input.owner_user_id || ctx.auth?.userId || null;
+      return await ctx.env.DB.prepare(
+        `INSERT INTO target_groups (id, campaign_id, name, owner_user_id, visibility, description, data)
+         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`
+      ).bind(id, input.campaign_id || null, input.name, owner, input.visibility || 'team',
+             input.description || null, JSON.stringify(input.data || {})).first();
+    },
+    updateTargetGroup: async (_, { id, input }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM target_groups WHERE id = ?").bind(id).first();
+      if (!existing) throw new GraphQLError('Target group not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      let patch = "";
+      const binds = [input.name ?? null, input.campaign_id ?? null, input.visibility ?? null, input.description ?? null];
+      if (input.data) { patch += ", data = json_patch(COALESCE(data,'{}'), ?)"; binds.push(JSON.stringify(input.data)); }
+      binds.push(id);
+      return await ctx.env.DB.prepare(
+        `UPDATE target_groups SET
+           name = COALESCE(?, name), campaign_id = COALESCE(?, campaign_id),
+           visibility = COALESCE(?, visibility), description = COALESCE(?, description)${patch},
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ? RETURNING *`
+      ).bind(...binds).first();
+    },
+    deleteTargetGroup: async (_, { id }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM target_groups WHERE id = ?").bind(id).first();
+      if (!existing) return false;
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      const res = await ctx.env.DB.prepare("DELETE FROM target_groups WHERE id = ? RETURNING id").bind(id).first();
+      return !!res;
+    },
+    addDomainToGroup: async (_, { groupId, domainId }, ctx) => {
+      requireRole(ctx, 'member');
+      await ctx.env.DB.prepare(
+        "INSERT OR IGNORE INTO target_group_members (group_id, domain_id, added_by) VALUES (?, ?, ?)"
+      ).bind(groupId, domainId, ctx.auth?.userId || null).run();
+      return true;
+    },
+    removeDomainFromGroup: async (_, { groupId, domainId }, ctx) => {
+      requireRole(ctx, 'member');
+      const res = await ctx.env.DB.prepare(
+        "DELETE FROM target_group_members WHERE group_id = ? AND domain_id = ? RETURNING domain_id"
+      ).bind(groupId, domainId).first();
+      return !!res;
+    },
+
+    // ---- Job templates ----
+    createJobTemplate: async (_, { input }, ctx) => {
+      requireRole(ctx, 'member');
+      const id = crypto.randomUUID();
+      const owner = ctx.auth?.userId || null;
+      return await ctx.env.DB.prepare(
+        `INSERT INTO job_templates (id, name, slug, owner_user_id, visibility, command_template, phases, default_flags, runner, description, data)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
+      ).bind(
+        id, input.name, input.slug || slugify(input.name), owner, input.visibility || 'team',
+        input.command_template, JSON.stringify(input.phases || []), JSON.stringify(input.default_flags || {}),
+        input.runner || 'default', input.description || null, JSON.stringify(input.data || {})
+      ).first();
+    },
+    updateJobTemplate: async (_, { id, input }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM job_templates WHERE id = ?").bind(id).first();
+      if (!existing) throw new GraphQLError('Job template not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      let patch = "";
+      const binds = [input.name ?? null, input.slug ?? null, input.visibility ?? null,
+                     input.command_template ?? null, input.runner ?? null, input.description ?? null];
+      if (input.phases) { patch += ", phases = ?"; binds.push(JSON.stringify(input.phases)); }
+      if (input.default_flags) { patch += ", default_flags = json_patch(COALESCE(default_flags,'{}'), ?)"; binds.push(JSON.stringify(input.default_flags)); }
+      if (input.data) { patch += ", data = json_patch(COALESCE(data,'{}'), ?)"; binds.push(JSON.stringify(input.data)); }
+      binds.push(id);
+      return await ctx.env.DB.prepare(
+        `UPDATE job_templates SET
+           name = COALESCE(?, name), slug = COALESCE(?, slug), visibility = COALESCE(?, visibility),
+           command_template = COALESCE(?, command_template), runner = COALESCE(?, runner),
+           description = COALESCE(?, description)${patch},
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ? RETURNING *`
+      ).bind(...binds).first();
+    },
+    deleteJobTemplate: async (_, { id }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM job_templates WHERE id = ?").bind(id).first();
+      if (!existing) return false;
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      const res = await ctx.env.DB.prepare("DELETE FROM job_templates WHERE id = ? RETURNING id").bind(id).first();
+      return !!res;
+    },
+
+    // ---- Playbooks ----
+    createPlaybook: async (_, { input }, ctx) => {
+      requireRole(ctx, 'member');
+      const id = crypto.randomUUID();
+      const owner = ctx.auth?.userId || null;
+      return await ctx.env.DB.prepare(
+        `INSERT INTO playbooks (id, name, slug, campaign_id, owner_user_id, visibility, description, data)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
+      ).bind(id, input.name, input.slug || slugify(input.name), input.campaign_id || null, owner,
+             input.visibility || 'team', input.description || null, JSON.stringify(input.data || {})).first();
+    },
+    updatePlaybook: async (_, { id, input }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM playbooks WHERE id = ?").bind(id).first();
+      if (!existing) throw new GraphQLError('Playbook not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      let patch = "";
+      const binds = [input.name ?? null, input.slug ?? null, input.campaign_id ?? null, input.visibility ?? null, input.description ?? null];
+      if (input.data) { patch += ", data = json_patch(COALESCE(data,'{}'), ?)"; binds.push(JSON.stringify(input.data)); }
+      binds.push(id);
+      return await ctx.env.DB.prepare(
+        `UPDATE playbooks SET
+           name = COALESCE(?, name), slug = COALESCE(?, slug), campaign_id = COALESCE(?, campaign_id),
+           visibility = COALESCE(?, visibility), description = COALESCE(?, description)${patch},
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ? RETURNING *`
+      ).bind(...binds).first();
+    },
+    deletePlaybook: async (_, { id }, ctx) => {
+      requireRole(ctx, 'member');
+      const existing = await ctx.env.DB.prepare("SELECT owner_user_id FROM playbooks WHERE id = ?").bind(id).first();
+      if (!existing) return false;
+      requireOwnerOrAdmin(ctx, existing.owner_user_id);
+      const res = await ctx.env.DB.prepare("DELETE FROM playbooks WHERE id = ? RETURNING id").bind(id).first();
+      return !!res;
+    },
+    setPlaybookSteps: async (_, { playbookId, steps }, ctx) => {
+      requireRole(ctx, 'member');
+      const pb = await ctx.env.DB.prepare("SELECT * FROM playbooks WHERE id = ?").bind(playbookId).first();
+      if (!pb) throw new GraphQLError('Playbook not found', { extensions: { code: 'NOT_FOUND' } });
+      requireOwnerOrAdmin(ctx, pb.owner_user_id);
+      const statements = [ctx.env.DB.prepare("DELETE FROM playbook_steps WHERE playbook_id = ?").bind(playbookId)];
+      for (const s of steps) {
+        statements.push(ctx.env.DB.prepare(
+          `INSERT INTO playbook_steps (id, playbook_id, step_order, template_id, phase, params)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).bind(crypto.randomUUID(), playbookId, Number(s.step_order), s.template_id || null,
+               s.phase || null, JSON.stringify(s.params || {})));
+      }
+      await ctx.env.DB.batch(statements);
+      return pb;
+    },
+    bindPlaybookToTarget: async (_, { playbookId, domainId, groupId }, ctx) => {
+      requireRole(ctx, 'member');
+      if (!domainId && !groupId) {
+        throw new GraphQLError('Provide domainId or groupId', { extensions: { code: 'BAD_USER_INPUT' } });
+      }
+      await ctx.env.DB.prepare(
+        "INSERT INTO target_playbooks (id, playbook_id, domain_id, group_id, created_by) VALUES (?, ?, ?, ?, ?)"
+      ).bind(crypto.randomUUID(), playbookId, domainId || null, groupId || null, ctx.auth?.userId || null).run();
+      return true;
+    },
+
+    // ---- Execution: expand templates/playbooks into scan_jobs ----
+    runTemplate: async (_, { templateId, target, runner, senderId }, ctx) => {
+      requireRole(ctx, 'member');
+      const tpl = await ctx.env.DB.prepare("SELECT * FROM job_templates WHERE id = ?").bind(templateId).first();
+      if (!tpl) throw new GraphQLError('Job template not found', { extensions: { code: 'NOT_FOUND' } });
+      const safe = assertSafeTarget(target);
+      const command = expandCommandTemplate(tpl.command_template, safe, senderId != null ? String(senderId) : '');
+      const jobId = await queueJob(ctx.env, command, safe, runner || tpl.runner || 'default');
+      return { jobIds: [jobId], count: 1 };
+    },
+    runPlaybook: async (_, { playbookId, target, groupId, runner, senderId }, ctx) => {
+      requireRole(ctx, 'member');
+      const pb = await ctx.env.DB.prepare("SELECT * FROM playbooks WHERE id = ?").bind(playbookId).first();
+      if (!pb) throw new GraphQLError('Playbook not found', { extensions: { code: 'NOT_FOUND' } });
+
+      // Authorization gate: a playbook tied to a campaign only runs once that
+      // campaign is explicitly marked authorized (signed/in-scope).
+      if (pb.campaign_id) {
+        const camp = await ctx.env.DB.prepare("SELECT authorized FROM campaigns WHERE id = ?").bind(pb.campaign_id).first();
+        if (camp && !camp.authorized) {
+          throw new GraphQLError('Campaign is not marked authorized; refuse to launch scans', { extensions: { code: 'FORBIDDEN' } });
+        }
+      }
+
+      // Resolve the set of targets.
+      let targets = [];
+      if (target) {
+        targets = [assertSafeTarget(target)];
+      } else if (groupId) {
+        const { results } = await ctx.env.DB.prepare(
+          `SELECT d.host FROM target_group_members m JOIN domains d ON d.id = m.domain_id WHERE m.group_id = ?`
+        ).bind(groupId).all();
+        targets = results.map((r) => r.host).filter(Boolean).map(assertSafeTarget);
+      } else {
+        // Fall back to the playbook's bound targets (per-target playbooks).
+        const { results: boundDomains } = await ctx.env.DB.prepare(
+          `SELECT d.host FROM target_playbooks tp JOIN domains d ON d.id = tp.domain_id WHERE tp.playbook_id = ? AND tp.domain_id IS NOT NULL`
+        ).bind(playbookId).all();
+        const { results: boundGroupDomains } = await ctx.env.DB.prepare(
+          `SELECT DISTINCT d.host FROM target_playbooks tp
+             JOIN target_group_members m ON m.group_id = tp.group_id
+             JOIN domains d ON d.id = m.domain_id
+           WHERE tp.playbook_id = ? AND tp.group_id IS NOT NULL`
+        ).bind(playbookId).all();
+        targets = [...boundDomains, ...boundGroupDomains].map((r) => r.host).filter(Boolean).map(assertSafeTarget);
+      }
+
+      if (targets.length === 0) {
+        throw new GraphQLError('No targets resolved for this playbook', { extensions: { code: 'BAD_USER_INPUT' } });
+      }
+
+      const { results: stepRows } = await ctx.env.DB.prepare(
+        "SELECT * FROM playbook_steps WHERE playbook_id = ? ORDER BY step_order ASC"
+      ).bind(playbookId).all();
+      if (stepRows.length === 0) {
+        throw new GraphQLError('Playbook has no steps', { extensions: { code: 'BAD_USER_INPUT' } });
+      }
+
+      // Pre-load any templates referenced by steps.
+      const tplCache = {};
+      for (const st of stepRows) {
+        if (st.template_id && !tplCache[st.template_id]) {
+          tplCache[st.template_id] = await ctx.env.DB.prepare("SELECT * FROM job_templates WHERE id = ?").bind(st.template_id).first();
+        }
+      }
+
+      const sender = senderId != null ? String(senderId) : '';
+      const jobIds = [];
+      for (const t of targets) {
+        for (const st of stepRows) {
+          let command;
+          let stepRunner = runner || 'default';
+          if (st.template_id && tplCache[st.template_id]) {
+            const tpl = tplCache[st.template_id];
+            command = expandCommandTemplate(tpl.command_template, t, sender);
+            stepRunner = runner || tpl.runner || 'default';
+          } else {
+            command = commandForPhase(st.phase, t, sender);
+          }
+          jobIds.push(await queueJob(ctx.env, command, t, stepRunner));
+        }
+      }
+      return { jobIds, count: jobIds.length };
     }
   },
 
@@ -1160,6 +1893,84 @@ const resolvers = {
     creator: async (parent, __, { env }) => {
       if (!parent.created_by) return null;
       return await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(parent.created_by).first();
+    },
+  },
+
+  // ---- Team-workflow relationship resolvers ----
+  ApiToken: {
+    revoked: (parent) => !!parent.revoked,
+    user: async (parent, __, { env }) => {
+      if (!parent.user_id) return null;
+      return await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(parent.user_id).first();
+    },
+  },
+  Campaign: {
+    authorized: (parent) => !!parent.authorized,
+    scope: (parent) => parseJson(parent.scope),
+    data: (parent) => parseJson(parent.data),
+    owner: async (parent, __, { env }) => {
+      if (!parent.owner_user_id) return null;
+      return await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(parent.owner_user_id).first();
+    },
+    company: async (parent, __, { env }) => {
+      if (!parent.company_id) return null;
+      return await env.DB.prepare("SELECT * FROM companies WHERE id = ?").bind(parent.company_id).first();
+    },
+    members: async (parent, __, { env }) => {
+      const { results } = await env.DB.prepare("SELECT * FROM campaign_members WHERE campaign_id = ?").bind(parent.id).all();
+      return results;
+    },
+    targetGroups: async (parent, __, { env }) => {
+      const { results } = await env.DB.prepare("SELECT * FROM target_groups WHERE campaign_id = ? ORDER BY created_at DESC").bind(parent.id).all();
+      return results;
+    },
+    playbooks: async (parent, __, { env }) => {
+      const { results } = await env.DB.prepare("SELECT * FROM playbooks WHERE campaign_id = ? ORDER BY created_at DESC").bind(parent.id).all();
+      return results;
+    },
+  },
+  CampaignMember: {
+    user: async (parent, __, { env }) => {
+      if (!parent.user_id) return null;
+      return await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(parent.user_id).first();
+    },
+  },
+  TargetGroup: {
+    data: (parent) => parseJson(parent.data),
+    domains: async (parent, __, { env }) => {
+      const { results } = await env.DB.prepare(
+        `SELECT d.* FROM target_group_members m JOIN domains d ON d.id = m.domain_id WHERE m.group_id = ?`
+      ).bind(parent.id).all();
+      return results;
+    },
+    campaign: async (parent, __, { env }) => {
+      if (!parent.campaign_id) return null;
+      return await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(parent.campaign_id).first();
+    },
+  },
+  JobTemplate: {
+    phases: (parent) => parseJsonArray(parent.phases),
+    default_flags: (parent) => parseJson(parent.default_flags),
+    data: (parent) => parseJson(parent.data),
+  },
+  Playbook: {
+    data: (parent) => parseJson(parent.data),
+    steps: async (parent, __, { env }) => {
+      const { results } = await env.DB.prepare(
+        "SELECT * FROM playbook_steps WHERE playbook_id = ? ORDER BY step_order ASC"
+      ).bind(parent.id).all();
+      return results;
+    },
+    campaign: async (parent, __, { env }) => {
+      if (!parent.campaign_id) return null;
+      return await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(parent.campaign_id).first();
+    },
+  },
+  PlaybookStep: {
+    params: (parent) => parseJson(parent.params),
+    template: async (parent, __, { env }) => {
+      if (!parent.template_id) return null;
+      return await env.DB.prepare("SELECT * FROM job_templates WHERE id = ?").bind(parent.template_id).first();
     },
   },
   Subscription: {
@@ -1199,8 +2010,71 @@ const schema = makeExecutableSchema({ typeDefs, resolvers });
 const yoga = createYoga({
   schema,
   landingPage: false,
-  graphqlEndpoint: '/graphql'
+  graphqlEndpoint: '/graphql',
+  // Resolve the caller's API token (if any) into ctx.auth for every operation.
+  context: async (initialContext) => {
+    const env = initialContext.env;
+    const request = initialContext.request;
+    const auth = env ? await resolveAuth(env, request) : null;
+    return { ...initialContext, env, auth };
+  }
 });
+
+// ----------------------------------------------------
+// Continuous Attack-Surface Monitoring helpers
+// ----------------------------------------------------
+
+// Parse a human cadence ("30m", "6h", "2d", or a bare number of minutes)
+// into minutes. Returns null if unparseable.
+const parseInterval = (raw) => {
+  if (!raw) return null;
+  const m = String(raw).trim().toLowerCase().match(/^(\d+)\s*(m|min|h|hr|hour|d|day)?s?$/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!n || n <= 0) return null;
+  const unit = m[2] || 'm';
+  if (unit.startsWith('d')) return n * 1440;
+  if (unit.startsWith('h')) return n * 60;
+  return n; // minutes
+};
+
+const formatInterval = (minutes) => {
+  if (minutes % 1440 === 0) return `${minutes / 1440}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+};
+
+// Classify a monitor target: IP/CIDR -> network, FQDN -> domain, else company.
+const inferTargetType = (target) => {
+  const t = (target || '').trim();
+  if (/^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(t)) return 'network';
+  if (/\/\d{1,2}$/.test(t)) return 'network';
+  if (/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(t)) return 'domain';
+  return 'company';
+};
+
+// Registrable base (eTLD+1 approximation by last two labels). Note: does not
+// special-case multi-part TLDs such as co.uk.
+const registrableBase = (host) => {
+  const parts = (host || '').toLowerCase().split('.').filter(Boolean);
+  if (parts.length <= 2) return parts.join('.');
+  return parts.slice(-2).join('.');
+};
+
+// Build the cHack.sh CLI command string for a monitored scan. Mirrors the
+// interactive triggerScan() command format and always carries --sender-id so
+// the runner can route drift alerts back to the monitor owner.
+const buildMonitorCommand = (monitor, target) => {
+  const t = target || monitor.target;
+  const sender = monitor.owner_chat_id;
+  switch (monitor.scan_type) {
+    case 'recon':   return `-d ${t} --sender-id ${sender}`;
+    case 'web':     return `--web ${t} --sender-id ${sender}`;
+    case 'network': return `--network ${t} --sender-id ${sender}`;
+    case 'infogather':
+    default:        return `--info-gather ${t} --sender-id ${sender}`;
+  }
+};
 
 // ----------------------------------------------------
 // Telegram Bot Component (grammY)
@@ -1232,6 +2106,157 @@ const escapeHtml = (str) => {
     .replace(/'/g, '&#039;');
 };
 
+// ===========================================================================
+// RBAC & Audit helpers (role-based access and audit controls)
+// ===========================================================================
+
+// Global role hierarchy. Higher rank = more privilege. "superadmin" is granted
+// out-of-band via the ADMIN_IDS secret and is never stored in the DB.
+const ROLE_RANK = { pending: 0, viewer: 1, operator: 2, admin: 3, superadmin: 4 };
+const roleRank = (role) => ROLE_RANK[role] ?? 0;
+
+const parseAdminIds = (env) => (env.ADMIN_IDS || "")
+  .split(",")
+  .map((id) => Number(String(id).trim()))
+  .filter((id) => Number.isFinite(id) && id !== 0);
+
+// Resolve the acting user into an authorization context. Pure read; never
+// mutates. `legacyOpen` reproduces the pre-RBAC behaviour: when no ADMIN_IDS
+// are configured the bot is wide open and every caller is treated as admin, so
+// existing single-tenant deployments keep working unchanged.
+const resolveActor = async (env, from) => {
+  const numberId = from?.id || 0;
+  const adminIds = parseAdminIds(env);
+  const legacyOpen = adminIds.length === 0;
+  const isSuperadmin = adminIds.includes(numberId);
+
+  let user = null;
+  try {
+    user = await env.DB.prepare(
+      "SELECT id, username, role FROM users WHERE number_id = ?"
+    ).bind(numberId).first();
+  } catch (_) { /* table may be mid-migration */ }
+
+  let memberships = [];
+  if (user?.id) {
+    try {
+      const res = await env.DB.prepare(
+        "SELECT company_id, role FROM team_members WHERE user_id = ?"
+      ).bind(user.id).all();
+      memberships = res?.results || [];
+    } catch (_) { /* team_members may not exist yet */ }
+  }
+
+  // Effective global role. Superadmins (ADMIN_IDS) always win. When no ADMIN_IDS
+  // are configured the deployment is single-tenant/legacy and the sole operator
+  // is treated as a superadmin, preserving pre-RBAC behaviour (including reset).
+  let role = user?.role || 'pending';
+  const effectiveSuper = isSuperadmin || legacyOpen;
+  if (effectiveSuper) role = 'superadmin';
+
+  const teamRoleFor = (companyId) => {
+    const m = memberships.find((x) => x.company_id === companyId);
+    return m ? m.role : null;
+  };
+
+  return {
+    numberId,
+    userId: user?.id || null,
+    username: user?.username || (from?.username ? `@${from.username}` : `user_${numberId}`),
+    role,
+    rank: roleRank(role),
+    isSuperadmin: effectiveSuper,
+    legacyOpen,
+    memberships,
+    teamRoleFor,
+    hasGlobal: (min) => roleRank(role) >= roleRank(min),
+  };
+};
+
+// Append-only audit write. Best-effort: a logging failure must never block or
+// crash the action being logged. Callable from both bot and runner contexts.
+const auditLog = async (env, entry) => {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO audit_log
+         (id, actor_user_id, actor_number_id, actor_label, source, action,
+          decision, target_type, target, company_id, detail)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      crypto.randomUUID(),
+      entry.actor_user_id || null,
+      entry.actor_number_id || 0,
+      entry.actor_label || null,
+      entry.source || 'telegram',
+      entry.action,
+      entry.decision || 'allow',
+      entry.target_type || null,
+      entry.target || null,
+      entry.company_id || null,
+      JSON.stringify(entry.detail || {})
+    ).run();
+  } catch (err) {
+    console.error("audit_log write failed:", err.message);
+  }
+};
+
+// Per-user/team target-scope check. Returns { allowed, companyId, reason }.
+// Policy:
+//   - viewer/pending: never allowed to scan.
+//   - admin/superadmin (global): may scan any target.
+//   - operator (global): may scan a target whose company they belong to, or a
+//     target not yet claimed by any company (first scan claims nothing by
+//     itself, but is permitted so a team can onboard new in-scope assets).
+//   - a target belonging to a company the operator is NOT a member of is denied.
+const checkScanScope = async (env, actor, targetValue) => {
+  if (!actor.hasGlobal('operator')) {
+    return { allowed: false, companyId: null, reason: 'insufficient-role' };
+  }
+  if (actor.hasGlobal('admin')) {
+    // Still resolve company for attribution, but never block.
+    const companyId = await resolveTargetCompany(env, targetValue);
+    return { allowed: true, companyId, reason: 'admin-bypass' };
+  }
+  // operator: enforce team scope.
+  const companyId = await resolveTargetCompany(env, targetValue);
+  if (!companyId) {
+    return { allowed: true, companyId: null, reason: 'unclaimed-target' };
+  }
+  const member = actor.memberships.some((m) => m.company_id === companyId);
+  return member
+    ? { allowed: true, companyId, reason: 'team-member' }
+    : { allowed: false, companyId, reason: 'out-of-scope' };
+};
+
+// Best-effort resolution of a scan target to its owning company. Matches an
+// exact domain host first, then its registrable parent (sub.example.com ->
+// example.com), then a company name/slug. Returns a company id or null.
+const resolveTargetCompany = async (env, value) => {
+  if (!value) return null;
+  const v = String(value).trim().toLowerCase();
+  try {
+    const dom = await env.DB.prepare(
+      "SELECT company_id FROM domains WHERE lower(host) = ? LIMIT 1"
+    ).bind(v).first();
+    if (dom?.company_id) return dom.company_id;
+
+    const parts = v.split('.');
+    if (parts.length > 2) {
+      const parent = parts.slice(-2).join('.');
+      const pdom = await env.DB.prepare(
+        "SELECT company_id FROM domains WHERE lower(host) = ? LIMIT 1"
+      ).bind(parent).first();
+      if (pdom?.company_id) return pdom.company_id;
+    }
+
+    const comp = await env.DB.prepare(
+      "SELECT id FROM companies WHERE lower(name) = ? OR lower(slug) = ? LIMIT 1"
+    ).bind(v, v).first();
+    if (comp?.id) return comp.id;
+  } catch (_) { /* best effort */ }
+  return null;
+};
+
 const createMainMenu = async (ctx, env) => {
   const currentRunner = ctx.session?.selected_runner || 'default';
   let runnerStatusText = `⚙️ ${currentRunner}`;
@@ -1260,28 +2285,38 @@ const createMainMenu = async (ctx, env) => {
     console.error("D1 error in createMainMenu:", err.message);
   }
 
-  return {
-    inline_keyboard: [
-      [
-        { text: "🚀 Launch Scan", callback_data: "menu_scan" },
-        { text: "📊 Dashboard", callback_data: "menu_dashboard" }
-      ],
-      [
-        { text: "🎯 Targets", callback_data: "view_targets_0" },
-        { text: "👥 Contacts", callback_data: "view_contacts_0" },
-        { text: "📜 Scan Queue", callback_data: "view_new_domains" }
-      ],
-      [
-        { text: "🛡️ Findings", callback_data: "menu_findings" },
-        { text: "🔑 Secrets", callback_data: "menu_secrets_0" },
-        { text: "🔌 Services", callback_data: "menu_services_0" }
-      ],
-      [
-        { text: `⚙️ Runner (${runnerStatusText})`, callback_data: "change_runner" },
-        { text: "⚠️ Reset DB", callback_data: "confirm_reset_db" }
-      ]
+  // Role-aware menu: everyone admitted gets the operational buttons; the
+  // destructive admin-only control (Reset DB) is shown only to admins. Per-action
+  // role/scope checks still apply when a button is tapped.
+  const isAdmin = !!(ctx.actor && typeof ctx.actor.hasGlobal === 'function' && ctx.actor.hasGlobal('admin'));
+
+  const keyboard = [
+    [
+      { text: "🚀 Launch Scan", callback_data: "menu_scan" },
+      { text: "📊 Dashboard", callback_data: "menu_dashboard" }
+    ],
+    [
+      { text: "🎯 Targets", callback_data: "view_targets_0" },
+      { text: "👥 Contacts", callback_data: "view_contacts_0" },
+      { text: "📜 Scan Queue", callback_data: "view_new_domains" }
+    ],
+    [
+      { text: "🛡️ Findings", callback_data: "menu_findings" },
+      { text: "🔑 Secrets", callback_data: "menu_secrets_0" },
+      { text: "🔌 Services", callback_data: "menu_services_0" }
     ]
-  };
+  ];
+
+  const lastRow = [{ text: `⚙️ Runner (${runnerStatusText})`, callback_data: "change_runner" }];
+  if (isAdmin) {
+    lastRow.push({ text: "⚠️ Reset DB", callback_data: "confirm_reset_db" });
+  }
+  keyboard.push(lastRow);
+  if (isAdmin) {
+    keyboard.push([{ text: "🛡️ Admin Control Center", callback_data: "admin_home" }]);
+  }
+
+  return { inline_keyboard: keyboard };
 };
 
 const getBot = (env) => {
@@ -1330,17 +2365,85 @@ const getBot = (env) => {
     }
   });
 
-  // Admin access gate middleware
+  // RBAC access gate middleware.
+  // Registers the caller (so admins can later reference/promote them), resolves
+  // their effective role, and enforces a minimum of "viewer". Unknown callers
+  // are recorded as role='pending' and denied with a friendly message rather
+  // than silently dropped. Backward compatible: with no ADMIN_IDS configured the
+  // bot stays wide open (every caller resolves to admin via legacyOpen).
   bot.use(async (ctx, next) => {
     if (!ctx.from) return;
-    const adminIdsStr = env.ADMIN_IDS || "";
-    const adminIds = adminIdsStr.split(",").map(id => Number(id.trim())).filter(id => !isNaN(id));
-    
-    if (adminIds.length > 0 && !adminIds.includes(ctx.from.id)) {
-      console.log(`Unauthorized access attempt by Telegram ID: ${ctx.from.id}`);
+    const u = ctx.from;
+    const username = u.username ? `@${u.username}` : `user_${u.id}`;
+
+    // Upsert the user row without ever clobbering an assigned role.
+    try {
+      const existing = await env.DB.prepare(
+        "SELECT id FROM users WHERE number_id = ?"
+      ).bind(u.id).first();
+      if (!existing) {
+        await env.DB.prepare(
+          `INSERT INTO users (id, username, number_id, first_name, last_name, role)
+           VALUES (?, ?, ?, ?, ?, 'pending')`
+        ).bind(crypto.randomUUID(), u.username || `user_${u.id}`, u.id,
+               u.first_name || '', u.last_name || '').run();
+      }
+    } catch (err) {
+      console.error("user upsert error:", err.message);
+    }
+
+    const actor = await resolveActor(env, u);
+    ctx.actor = actor;
+
+    // Minimum access is "viewer". A user with no global role but who belongs to
+    // at least one team is also admitted (team-scoped access).
+    const admitted = actor.hasGlobal('viewer') || actor.memberships.length > 0;
+    if (!admitted) {
+      console.log(`Access pending/denied for Telegram ID: ${u.id} (${username})`);
+      await auditLog(env, {
+        actor_user_id: actor.userId, actor_number_id: u.id, actor_label: username,
+        source: 'telegram', action: 'access.denied', decision: 'deny',
+        target_type: 'user', target: String(u.id),
+        detail: { role: actor.role, reason: 'not-provisioned' },
+      });
+      try {
+        await ctx.reply(
+          "⛔ <b>Access pending.</b>\n\nYour Telegram account is registered but has " +
+          "not been granted a role yet. Ask an administrator to run " +
+          `<code>/grant ${u.id} viewer</code> (or a higher role).\n\n` +
+          `Your ID: <code>${u.id}</code>`,
+          { parse_mode: "HTML" }
+        ).catch(() => {});
+      } catch (_) { /* ignore */ }
       return;
     }
     await next();
+  });
+
+  // Slash commands are reserved for admins. Regular (non-admin) users drive the
+  // bot through inline-keyboard buttons instead. Callback queries (button taps)
+  // and plain text (e.g. a domain typed into a button flow) always pass through;
+  // only an actual /command from a non-admin is intercepted and redirected to
+  // the menu. /start and /menu stay open to everyone so they can open the keyboard.
+  bot.use(async (ctx, next) => {
+    const text = ctx.message?.text || "";
+    const isCommand = text.startsWith("/") ||
+      (ctx.message?.entities || []).some(e => e.type === "bot_command" && e.offset === 0);
+    if (!isCommand) { await next(); return; }
+
+    const actor = ctx.actor || await resolveActor(env, ctx.from);
+    if (actor.hasGlobal("admin")) { await next(); return; } // admins: full command access
+
+    const cmd = text.replace(/^\//, "").split(/[@\s]/)[0].toLowerCase();
+    if (cmd === "start" || cmd === "menu") { await next(); return; }
+
+    const menuMarkup = await createMainMenu(ctx, env);
+    await ctx.reply(
+      "🔘 <b>Button mode.</b>\n\nSlash commands are reserved for administrators. " +
+      "Use the buttons below to navigate — everything you can do is one tap away.",
+      { parse_mode: "HTML", reply_markup: menuMarkup }
+    ).catch(() => {});
+    // Do not call next(): the command handler is skipped for non-admins.
   });
 
   // Helper: auto-register user on first bot interaction
@@ -1389,9 +2492,41 @@ const getBot = (env) => {
     return `<b><a href="http://${host}">${escapeHtml(host)}</a></b> ${statusStr} ~ <i>${escapeHtml(title)}</i> | <code>${escapeHtml(tech)}</code>`;
   };
 
-  // Queue scan helper
-  const triggerScan = async (ctx, type, value, runner = 'default') => {
+  // Map scan type -> audit action name.
+  const SCAN_ACTION = {
+    domain: 'scan.recon', person: 'scan.person', company: 'scan.company',
+    infogather: 'scan.infogather', web: 'scan.web', network: 'scan.network',
+  };
+
+  // Queue scan helper. Enforces per-user/team target scope before enqueuing,
+  // records attribution on the job row, writes an audit entry (allow/deny), and
+  // honours orchestration opts (priority, region). Returns the job id on
+  // success, or null if the scan was denied (a reply has already been sent).
+  const triggerScan = async (ctx, type, value, runner = 'default', opts = {}) => {
+    const priority = Number.isFinite(opts.priority) ? opts.priority : 0;
+    const region = opts.region || null;
+    const actor = ctx.actor || await resolveActor(env, ctx.from);
     const userId = ctx.from?.id || 0;
+    const action = SCAN_ACTION[type] || 'scan.unknown';
+
+    // Scope enforcement.
+    const scope = await checkScanScope(env, actor, value);
+    if (!scope.allowed) {
+      await auditLog(env, {
+        actor_user_id: actor.userId, actor_number_id: userId, actor_label: actor.username,
+        source: 'telegram', action, decision: 'deny',
+        target_type: type, target: value, company_id: scope.companyId,
+        detail: { reason: scope.reason, role: actor.role },
+      });
+      const msg = scope.reason === 'insufficient-role'
+        ? "⛔ <b>Not allowed.</b> Scanning requires the <code>operator</code> role or higher. " +
+          "Ask an admin to raise your role with <code>/role</code>."
+        : "⛔ <b>Out of scope.</b> That target belongs to a team you are not a member of. " +
+          "Ask an admin to add you with <code>/grant</code>, or pick an in-scope target.";
+      await ctx.reply(msg, { parse_mode: "HTML" }).catch(() => {});
+      return null;
+    }
+
     let command = "";
     if (type === 'domain') {
       command = `-d ${value} --sender-id ${userId}`;
@@ -1411,12 +2546,40 @@ const getBot = (env) => {
     } else if (type === 'network') {
       command = `--network ${value} --sender-id ${userId}`;
     }
-    
+
     const id = crypto.randomUUID();
     await env.DB.prepare(
-      "INSERT INTO scan_jobs (id, command, domain, runner, status) VALUES (?, ?, ?, ?, 'pending')"
-    ).bind(id, command, value, runner).run();
+      `INSERT INTO scan_jobs
+         (id, command, domain, runner, region, priority, status, requested_by, requested_by_number_id, company_id, source)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 'telegram')`
+    ).bind(id, command, value, runner, region, priority, actor.userId, userId, scope.companyId).run();
+
+    await auditLog(env, {
+      actor_user_id: actor.userId, actor_number_id: userId, actor_label: actor.username,
+      source: 'telegram', action, decision: 'allow',
+      target_type: type, target: value, company_id: scope.companyId,
+      detail: { job_id: id, runner, scope: scope.reason },
+    });
     return id;
+  };
+
+  // Guard a handler to a minimum global role. On failure it audits the denial,
+  // replies, and returns false so the caller can `return` early.
+  const requireRole = async (ctx, min, action, targetType = null, target = null) => {
+    const actor = ctx.actor || await resolveActor(env, ctx.from);
+    if (actor.hasGlobal(min)) return true;
+    await auditLog(env, {
+      actor_user_id: actor.userId, actor_number_id: ctx.from?.id || 0, actor_label: actor.username,
+      source: 'telegram', action, decision: 'deny', target_type: targetType, target,
+      detail: { reason: 'insufficient-role', required: min, role: actor.role },
+    });
+    const msg = `⛔ Requires the ${min} role. Ask an admin to raise your role.`;
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: msg, show_alert: true }).catch(() => {});
+    } else {
+      await ctx.reply(msg, { parse_mode: "HTML" }).catch(() => {});
+    }
+    return false;
   };
 
   const createRunnerKeyboard = async () => {
@@ -1634,12 +2797,19 @@ const getBot = (env) => {
 
   bot.command("clean", async (ctx) => {
     await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'queue.clean')) return;
     const res = await env.DB.prepare("DELETE FROM scan_jobs WHERE status IN ('completed', 'failed')").run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor?.userId, actor_number_id: ctx.from?.id || 0,
+      actor_label: ctx.actor?.username, source: 'telegram', action: 'queue.clean',
+      target_type: 'job', detail: {},
+    });
     await ctx.reply(`🧹 Cleaned up finished/failed scan jobs from queue.`);
   });
 
   bot.command("newcompany", async (ctx) => {
     await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'company.create')) return;
     ctx.session.step = 'COMPANY_INPUT';
     await ctx.reply("🏢 <b>Target: Company / Domain</b>\n\nPlease send me the company name or domain (e.g. <code>CHTH Corp</code> or <code>chth.xyz</code>):", {
       parse_mode: "HTML",
@@ -1651,6 +2821,7 @@ const getBot = (env) => {
 
   bot.command("newperson", async (ctx) => {
     await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'person.create')) return;
     ctx.session.step = 'PERSON_INPUT';
     await ctx.reply("🔍 <b>Target: Person</b>\n\nSend me the person's phone number (<code>+1555...</code>), username (<code>@che...</code>), or name (e.g. <code>Cheth Ober</code>):", {
       parse_mode: "HTML",
@@ -1661,6 +2832,8 @@ const getBot = (env) => {
   });
 
   bot.command("delcompany", async (ctx) => {
+    await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'company.delete')) return;
     const name = ctx.match?.trim();
     if (!name) {
       return await ctx.reply("❌ Usage: <code>/delcompany &lt;company name or slug&gt;</code>", { parse_mode: "HTML" });
@@ -1670,10 +2843,16 @@ const getBot = (env) => {
       return await ctx.reply(`❌ Company <code>${escapeHtml(name)}</code> not found.`, { parse_mode: "HTML" });
     }
     await env.DB.prepare("DELETE FROM companies WHERE id = ?").bind(comp.id).run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor?.userId, actor_number_id: ctx.from?.id || 0, actor_label: ctx.actor?.username,
+      source: 'telegram', action: 'company.delete', target_type: 'company', target: comp.name, company_id: comp.id, detail: {},
+    });
     await ctx.reply(`🗑️ Company <code>${escapeHtml(comp.name)}</code> and all associated domains/findings deleted.`, { parse_mode: "HTML" });
   });
 
   bot.command("deldomain", async (ctx) => {
+    await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'domain.delete')) return;
     const host = ctx.match?.trim()?.toLowerCase();
     if (!host) {
       return await ctx.reply("❌ Usage: <code>/deldomain &lt;host&gt;</code>", { parse_mode: "HTML" });
@@ -1683,10 +2862,16 @@ const getBot = (env) => {
       return await ctx.reply(`❌ Domain <code>${escapeHtml(host)}</code> not found.`, { parse_mode: "HTML" });
     }
     await env.DB.prepare("DELETE FROM domains WHERE id = ?").bind(dom.id).run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor?.userId, actor_number_id: ctx.from?.id || 0, actor_label: ctx.actor?.username,
+      source: 'telegram', action: 'domain.delete', target_type: 'domain', target: host, company_id: dom.company_id, detail: {},
+    });
     await ctx.reply(`🗑️ Domain <code>${escapeHtml(host)}</code> deleted.`, { parse_mode: "HTML" });
   });
 
   bot.command("delperson", async (ctx) => {
+    await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'person.delete')) return;
     const name = ctx.match?.trim();
     if (!name) {
       return await ctx.reply("❌ Usage: <code>/delperson &lt;first name&gt;</code>", { parse_mode: "HTML" });
@@ -1696,6 +2881,10 @@ const getBot = (env) => {
       return await ctx.reply(`❌ Person <code>${escapeHtml(name)}</code> not found.`, { parse_mode: "HTML" });
     }
     await env.DB.prepare("DELETE FROM people WHERE id = ?").bind(person.id).run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor?.userId, actor_number_id: ctx.from?.id || 0, actor_label: ctx.actor?.username,
+      source: 'telegram', action: 'person.delete', target_type: 'person', target: name, company_id: person.company_id, detail: {},
+    });
     await ctx.reply(`🗑️ Contact <code>${escapeHtml(person.given_name)} ${escapeHtml(person.family_name || '')}</code> deleted.`, { parse_mode: "HTML" });
   });
 
@@ -1872,6 +3061,7 @@ const getBot = (env) => {
     }
     const runner = ctx.session?.selected_runner || 'default';
     const jobId = await triggerScan(ctx, 'domain', domain, runner);
+    if (!jobId) return; // scan denied by scope/role (reply already sent)
     await ctx.reply(
       `🚀 <b>Full Recon Scan Queued</b>\n\n` +
       `• <b>Target:</b> <code>${escapeHtml(domain)}</code>\n` +
@@ -1897,6 +3087,7 @@ const getBot = (env) => {
     }
     const runner = ctx.session?.selected_runner || 'default';
     const jobId = await triggerScan(ctx, 'infogather', domain, runner);
+    if (!jobId) return; // scan denied by scope/role (reply already sent)
     await ctx.reply(
       `🔍 <b>Info-Gathering Scan Queued</b>\n\n` +
       `• <b>Target:</b> <code>${escapeHtml(domain)}</code>\n` +
@@ -1922,6 +3113,7 @@ const getBot = (env) => {
     }
     const runner = ctx.session?.selected_runner || 'default';
     const jobId = await triggerScan(ctx, 'web', domain, runner);
+    if (!jobId) return; // scan denied by scope/role (reply already sent)
     await ctx.reply(
       `🌐 <b>Web Recon & Crawl Queued</b>\n\n` +
       `• <b>Target:</b> <code>${escapeHtml(domain)}</code>\n` +
@@ -1947,6 +3139,7 @@ const getBot = (env) => {
     }
     const runner = ctx.session?.selected_runner || 'default';
     const jobId = await triggerScan(ctx, 'network', target, runner);
+    if (!jobId) return; // scan denied by scope/role (reply already sent)
     await ctx.reply(
       `🔌 <b>Network & Port Scan Queued</b>\n\n` +
       `• <b>Target:</b> <code>${escapeHtml(target)}</code>\n` +
@@ -1962,6 +3155,118 @@ const getBot = (env) => {
         }
       }
     );
+  });
+
+  // ----------------------------------------------------
+  // Continuous monitoring commands
+  // ----------------------------------------------------
+  bot.command("monitor", async (ctx) => {
+    await registerUser(ctx);
+    const raw = (ctx.match || "").trim();
+    if (!raw) {
+      return await ctx.reply(
+        "🛰️ <b>Schedule continuous monitoring</b>\n\n" +
+        "Usage: <code>/monitor &lt;target&gt; [interval] [scan_type]</code>\n\n" +
+        "• <b>target</b> — domain, company name, or IP/CIDR\n" +
+        "• <b>interval</b> — e.g. <code>30m</code>, <code>6h</code>, <code>1d</code> (default <code>1d</code>)\n" +
+        "• <b>scan_type</b> — <code>recon</code> | <code>infogather</code> | <code>web</code> | <code>network</code>\n\n" +
+        "Example: <code>/monitor example.com 12h infogather</code>",
+        { parse_mode: "HTML" }
+      );
+    }
+
+    const tokens = raw.split(/\s+/);
+    const target = tokens.shift();
+    const validScans = ["recon", "infogather", "web", "network"];
+    const targetType = inferTargetType(target);
+    let intervalMinutes = 1440;
+    let scanType = targetType === "network" ? "network" : "infogather";
+
+    for (const tok of tokens) {
+      if (validScans.includes(tok.toLowerCase())) {
+        scanType = tok.toLowerCase();
+      } else {
+        const parsed = parseInterval(tok);
+        if (parsed) intervalMinutes = parsed;
+      }
+    }
+
+    const id = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
+    const runner = ctx.session?.selected_runner || "default";
+    try {
+      await env.DB.prepare(
+        "INSERT INTO monitors (id, owner_chat_id, target_type, target, scan_type, runner, interval_minutes, enabled, next_run_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)"
+      ).bind(id, ctx.from.id, targetType, target, scanType, runner, intervalMinutes, nowIso).run();
+    } catch (err) {
+      return await ctx.reply(
+        "❌ Could not create monitor. Run <code>/api/db/migrate</code> once if this is a fresh deployment.\n\n" +
+        `<code>${escapeHtml(err.message || String(err))}</code>`,
+        { parse_mode: "HTML" }
+      );
+    }
+
+    await ctx.reply(
+      "🛰️ <b>Monitor Created</b>\n\n" +
+      `• <b>Target:</b> <code>${escapeHtml(target)}</code> (${targetType})\n` +
+      `• <b>Scan:</b> <code>${scanType}</code>\n` +
+      `• <b>Every:</b> <code>${formatInterval(intervalMinutes)}</code>\n` +
+      `• <b>Runner:</b> <code>${runner}</code>\n` +
+      `• <b>ID:</b> <code>${id}</code>\n\n` +
+      "First run is queued for the next scheduler tick. You'll be alerted on drift — " +
+      "new subdomains, ports, TLS certs or cloud assets.",
+      { parse_mode: "HTML" }
+    );
+  });
+
+  bot.command("monitors", async (ctx) => {
+    await registerUser(ctx);
+    let results = [];
+    try {
+      const res = await env.DB.prepare(
+        "SELECT * FROM monitors WHERE owner_chat_id = ? ORDER BY created_at DESC"
+      ).bind(ctx.from.id).all();
+      results = res.results || [];
+    } catch (err) {
+      return await ctx.reply("❌ Could not read monitors: " + escapeHtml(err.message || String(err)), { parse_mode: "HTML" });
+    }
+
+    if (results.length === 0) {
+      return await ctx.reply(
+        "🛰️ No active monitors.\n\nCreate one with <code>/monitor &lt;target&gt; [interval]</code>.",
+        { parse_mode: "HTML" }
+      );
+    }
+
+    let msg = `🛰️ <b>Your Monitors (${results.length})</b>\n`;
+    for (const m of results) {
+      const state = m.enabled ? "🟢" : "⏸️";
+      msg += `\n${state} <code>${escapeHtml(m.target)}</code> · ${m.scan_type} · every ${formatInterval(m.interval_minutes)}\n`;
+      msg += `   next: ${m.next_run_at ? escapeHtml(String(m.next_run_at).replace('T', ' ').slice(0, 16)) : 'pending'} · id: <code>${m.id}</code>\n`;
+    }
+    msg += "\nManage: <code>/unmonitor &lt;id&gt;</code>";
+    await ctx.reply(msg, { parse_mode: "HTML" });
+  });
+
+  bot.command("unmonitor", async (ctx) => {
+    await registerUser(ctx);
+    const id = (ctx.match || "").trim();
+    if (!id) {
+      return await ctx.reply("❌ Usage: <code>/unmonitor &lt;id&gt;</code> (see <code>/monitors</code>)", { parse_mode: "HTML" });
+    }
+    try {
+      const r = await env.DB.prepare(
+        "DELETE FROM monitors WHERE id = ? AND owner_chat_id = ?"
+      ).bind(id, ctx.from.id).run();
+      const removed = r.meta?.changes || r.meta?.rows_written || 0;
+      if (!removed) {
+        return await ctx.reply("⚠️ No monitor with that ID belongs to you.", { parse_mode: "HTML" });
+      }
+    } catch (err) {
+      return await ctx.reply("❌ Could not remove monitor: " + escapeHtml(err.message || String(err)), { parse_mode: "HTML" });
+    }
+    await ctx.reply(`🗑️ Monitor <code>${escapeHtml(id)}</code> removed.`, { parse_mode: "HTML" });
   });
 
   bot.command("vulns", async (ctx) => {
@@ -2155,6 +3460,7 @@ const getBot = (env) => {
 
   bot.command(["resetdb", "reset"], async (ctx) => {
     await registerUser(ctx);
+    if (!await requireRole(ctx, 'superadmin', 'db.reset')) return;
     await ctx.reply(
       `⚠️ <b>DANGER: Reset Cloudflare Database</b>\n\n` +
       `Are you sure you want to permanently delete <b>ALL</b> data in Cloudflare DB?\n\n` +
@@ -2186,6 +3492,512 @@ const getBot = (env) => {
     );
   });
 
+  // ===========================================================================
+  // RBAC management commands
+  // ===========================================================================
+
+  const VALID_GLOBAL_ROLES = ['pending', 'viewer', 'operator', 'admin'];
+  const VALID_TEAM_ROLES = ['viewer', 'operator', 'admin'];
+
+  // Resolve a company by slug or name for membership commands.
+  const findCompany = async (q) => env.DB.prepare(
+    "SELECT id, name, slug FROM companies WHERE lower(slug) = lower(?) OR lower(name) = lower(?) LIMIT 1"
+  ).bind(q, q).first();
+
+  // /whoami — show your identity, role and team memberships (viewer+).
+  bot.command("whoami", async (ctx) => {
+    const a = ctx.actor || await resolveActor(env, ctx.from);
+    let teams = "none";
+    if (a.memberships.length) {
+      const ids = a.memberships.map((m) => m.company_id);
+      const placeholders = ids.map(() => '?').join(',');
+      const rows = await env.DB.prepare(
+        `SELECT id, name FROM companies WHERE id IN (${placeholders})`
+      ).bind(...ids).all();
+      const nameById = Object.fromEntries((rows?.results || []).map((r) => [r.id, r.name]));
+      teams = a.memberships.map((m) => `${escapeHtml(nameById[m.company_id] || m.company_id)} (${m.role})`).join(", ");
+    }
+    await ctx.reply(
+      `👤 <b>Who am I</b>\n\n` +
+      `• <b>Telegram ID:</b> <code>${a.numberId}</code>\n` +
+      `• <b>Username:</b> ${escapeHtml(a.username)}\n` +
+      `• <b>Global role:</b> <code>${a.role}</code>${a.isSuperadmin ? ' (superadmin via ADMIN_IDS)' : ''}\n` +
+      `• <b>Teams:</b> ${teams}`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // /users — list registered users and their global roles (admin+).
+  bot.command("users", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'user.list')) return;
+    const res = await env.DB.prepare(
+      "SELECT username, number_id, role FROM users ORDER BY role DESC, username ASC LIMIT 50"
+    ).all();
+    const rows = res?.results || [];
+    if (!rows.length) return await ctx.reply("No users registered yet.");
+    const lines = rows.map((r) =>
+      `• <code>${r.number_id}</code> ${escapeHtml(r.username)} — <b>${r.role || 'pending'}</b>`
+    );
+    await ctx.reply(`👥 <b>Registered Users</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  // /role <telegram_id> <pending|viewer|operator|admin> — set a global role.
+  // admin+ required; only a superadmin may grant/revoke the 'admin' role.
+  bot.command("role", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'role.set')) return;
+    const args = (ctx.match || "").trim().split(/\s+/).filter(Boolean);
+    if (args.length < 2) {
+      return await ctx.reply("❌ Usage: <code>/role &lt;telegram_id&gt; &lt;pending|viewer|operator|admin&gt;</code>", { parse_mode: "HTML" });
+    }
+    const [idStr, newRole] = args;
+    const numberId = Number(idStr);
+    if (!Number.isFinite(numberId)) {
+      return await ctx.reply("❌ Telegram ID must be numeric.", { parse_mode: "HTML" });
+    }
+    if (!VALID_GLOBAL_ROLES.includes(newRole)) {
+      return await ctx.reply(`❌ Role must be one of: <code>${VALID_GLOBAL_ROLES.join(', ')}</code>`, { parse_mode: "HTML" });
+    }
+    if (newRole === 'admin' && !ctx.actor.isSuperadmin) {
+      return await ctx.reply("⛔ Only a superadmin can grant the <b>admin</b> role.", { parse_mode: "HTML" });
+    }
+    const target = await env.DB.prepare("SELECT id, username, role FROM users WHERE number_id = ?").bind(numberId).first();
+    if (!target) {
+      return await ctx.reply(`❌ No registered user with ID <code>${numberId}</code>. Ask them to message the bot once first.`, { parse_mode: "HTML" });
+    }
+    if (target.role === 'admin' && !ctx.actor.isSuperadmin) {
+      return await ctx.reply("⛔ Only a superadmin can change an existing admin's role.", { parse_mode: "HTML" });
+    }
+    await env.DB.prepare(
+      "UPDATE users SET role = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE number_id = ?"
+    ).bind(newRole, numberId).run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor.userId, actor_number_id: ctx.from.id, actor_label: ctx.actor.username,
+      source: 'telegram', action: 'role.set', target_type: 'user', target: String(numberId),
+      detail: { old_role: target.role, new_role: newRole },
+    });
+    await ctx.reply(`✅ Global role for <code>${numberId}</code> (${escapeHtml(target.username)}) set to <b>${newRole}</b>.`, { parse_mode: "HTML" });
+  });
+
+  // /grant <telegram_id> <company> [viewer|operator|admin] — add team membership.
+  bot.command("grant", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'team.grant')) return;
+    const args = (ctx.match || "").trim().split(/\s+/).filter(Boolean);
+    if (args.length < 2) {
+      return await ctx.reply("❌ Usage: <code>/grant &lt;telegram_id&gt; &lt;company&gt; [viewer|operator|admin]</code>", { parse_mode: "HTML" });
+    }
+    const numberId = Number(args[0]);
+    const role = args[2] && VALID_TEAM_ROLES.includes(args[2]) ? args[2] : 'operator';
+    const companyQ = args[1];
+    if (!Number.isFinite(numberId)) {
+      return await ctx.reply("❌ Telegram ID must be numeric.", { parse_mode: "HTML" });
+    }
+    const target = await env.DB.prepare("SELECT id, username, role FROM users WHERE number_id = ?").bind(numberId).first();
+    if (!target) {
+      return await ctx.reply(`❌ No registered user with ID <code>${numberId}</code>. Ask them to message the bot once first.`, { parse_mode: "HTML" });
+    }
+    const company = await findCompany(companyQ);
+    if (!company) {
+      return await ctx.reply(`❌ Company <code>${escapeHtml(companyQ)}</code> not found. Create it with /newcompany first.`, { parse_mode: "HTML" });
+    }
+    await env.DB.prepare(
+      `INSERT INTO team_members (id, company_id, user_id, role, created_by)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(company_id, user_id) DO UPDATE SET role = excluded.role`
+    ).bind(crypto.randomUUID(), company.id, target.id, role, ctx.actor.userId).run();
+    // A viewer/pending user who gains a team membership should be at least a
+    // viewer globally so they can sign in; never downgrade a higher role.
+    if (roleRank(target.role) < roleRank('viewer')) {
+      await env.DB.prepare("UPDATE users SET role = 'viewer' WHERE id = ?").bind(target.id).run();
+    }
+    await auditLog(env, {
+      actor_user_id: ctx.actor.userId, actor_number_id: ctx.from.id, actor_label: ctx.actor.username,
+      source: 'telegram', action: 'team.grant', target_type: 'user', target: String(numberId),
+      company_id: company.id, detail: { team_role: role, company: company.name },
+    });
+    await ctx.reply(`✅ <code>${numberId}</code> (${escapeHtml(target.username)}) added to <b>${escapeHtml(company.name)}</b> as <b>${role}</b>.`, { parse_mode: "HTML" });
+  });
+
+  // /revoke <telegram_id> <company> — remove team membership.
+  bot.command("revoke", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'team.revoke')) return;
+    const args = (ctx.match || "").trim().split(/\s+/).filter(Boolean);
+    if (args.length < 2) {
+      return await ctx.reply("❌ Usage: <code>/revoke &lt;telegram_id&gt; &lt;company&gt;</code>", { parse_mode: "HTML" });
+    }
+    const numberId = Number(args[0]);
+    const target = await env.DB.prepare("SELECT id, username FROM users WHERE number_id = ?").bind(numberId).first();
+    const company = await findCompany(args[1]);
+    if (!target || !company) {
+      return await ctx.reply("❌ User or company not found.", { parse_mode: "HTML" });
+    }
+    const res = await env.DB.prepare(
+      "DELETE FROM team_members WHERE company_id = ? AND user_id = ?"
+    ).bind(company.id, target.id).run();
+    await auditLog(env, {
+      actor_user_id: ctx.actor.userId, actor_number_id: ctx.from.id, actor_label: ctx.actor.username,
+      source: 'telegram', action: 'team.revoke', target_type: 'user', target: String(numberId),
+      company_id: company.id, detail: { company: company.name },
+    });
+    await ctx.reply(`✅ Removed <code>${numberId}</code> from <b>${escapeHtml(company.name)}</b>.`, { parse_mode: "HTML" });
+  });
+
+  // /members [company] — list team memberships (admin+).
+  bot.command("members", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'team.list')) return;
+    const q = (ctx.match || "").trim();
+    let rows;
+    if (q) {
+      const company = await findCompany(q);
+      if (!company) return await ctx.reply(`❌ Company <code>${escapeHtml(q)}</code> not found.`, { parse_mode: "HTML" });
+      const res = await env.DB.prepare(
+        `SELECT u.number_id, u.username, tm.role, ? AS cname
+           FROM team_members tm JOIN users u ON u.id = tm.user_id
+          WHERE tm.company_id = ? ORDER BY tm.role DESC`
+      ).bind(company.name, company.id).all();
+      rows = res?.results || [];
+    } else {
+      const res = await env.DB.prepare(
+        `SELECT u.number_id, u.username, tm.role, c.name AS cname
+           FROM team_members tm
+           JOIN users u ON u.id = tm.user_id
+           JOIN companies c ON c.id = tm.company_id
+          ORDER BY c.name ASC, tm.role DESC LIMIT 100`
+      ).all();
+      rows = res?.results || [];
+    }
+    if (!rows.length) return await ctx.reply("No team memberships found.");
+    const lines = rows.map((r) =>
+      `• <b>${escapeHtml(r.cname)}</b> ← <code>${r.number_id}</code> ${escapeHtml(r.username)} (${r.role})`
+    );
+    await ctx.reply(`🧩 <b>Team Memberships</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  // /audit [n] — show the last n audit entries (admin+, default 15, max 50).
+  bot.command("audit", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'audit.view')) return;
+    let n = parseInt((ctx.match || "").trim(), 10);
+    if (!Number.isFinite(n) || n <= 0) n = 15;
+    n = Math.min(n, 50);
+    const res = await env.DB.prepare(
+      "SELECT ts, actor_label, actor_number_id, source, action, decision, target_type, target FROM audit_log ORDER BY ts DESC LIMIT ?"
+    ).bind(n).all();
+    const rows = res?.results || [];
+    if (!rows.length) return await ctx.reply("Audit log is empty.");
+    const lines = rows.map((r) => {
+      const icon = r.decision === 'deny' ? '⛔' : '✅';
+      const who = r.actor_label || `id:${r.actor_number_id}`;
+      const tgt = r.target ? ` <code>${escapeHtml(String(r.target))}</code>` : '';
+      const when = String(r.ts).replace('T', ' ').replace('Z', '').slice(5, 19);
+      return `${icon} <code>${when}</code> ${escapeHtml(who)} [${r.source}] <b>${r.action}</b>${tgt}`;
+    });
+    await ctx.reply(`📜 <b>Audit Log</b> (last ${rows.length})\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  // ---- Team workflows ----
+  bot.command(["campaigns", "engagements"], async (ctx) => {
+    await registerUser(ctx);
+    const { results } = await env.DB.prepare("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 20").all();
+    if (!results.length) {
+      return await ctx.reply("📋 <b>Campaigns</b>\n\nNone yet. Create one with:\n<code>/newcampaign Acme Pentest | engagement</code>", { parse_mode: "HTML" });
+    }
+    const statusBadge = { prospect: "🔆", active: "🟢", paused: "⏸️", won: "🏆", lost: "💤", closed: "📦" };
+    const lines = results.map((c) => {
+      const b = statusBadge[c.status] || "•";
+      const auth = c.authorized ? "🔓 authorized" : "🔒 unauthorized";
+      return `${b} <b>${escapeHtml(c.name)}</b> <code>${escapeHtml(c.slug || c.id)}</code>\n   ${escapeHtml(c.kind)} · ${escapeHtml(c.status)} · ${auth}`;
+    });
+    await ctx.reply(`📋 <b>Campaigns (${results.length})</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  bot.command(["newcampaign", "newengagement"], async (ctx) => {
+    await registerUser(ctx);
+    const raw = (ctx.match || "").trim();
+    if (!raw) {
+      return await ctx.reply("Usage: <code>/newcampaign &lt;name&gt; | &lt;engagement|acquisition&gt;</code>", { parse_mode: "HTML" });
+    }
+    const [namePart, kindPart] = raw.split("|").map((s) => s.trim());
+    const kind = (kindPart || "engagement").toLowerCase() === "acquisition" ? "acquisition" : "engagement";
+    const userRow = await env.DB.prepare("SELECT id FROM users WHERE number_id = ?").bind(ctx.from.id).first();
+    const id = crypto.randomUUID();
+    const slug = slugify(namePart);
+    await env.DB.prepare(
+      `INSERT INTO campaigns (id, name, slug, owner_user_id, kind, status) VALUES (?, ?, ?, ?, ?, 'prospect')`
+    ).bind(id, namePart, slug, userRow?.id || null, kind).run();
+    if (userRow?.id) {
+      await env.DB.prepare("INSERT OR IGNORE INTO campaign_members (campaign_id, user_id, role) VALUES (?, ?, 'lead')").bind(id, userRow.id).run();
+    }
+    await ctx.reply(`✅ Campaign created: <b>${escapeHtml(namePart)}</b> (<code>${escapeHtml(slug)}</code>, ${kind}).\n\n⚠️ Mark it authorized before running playbooks against its scope.`, { parse_mode: "HTML" });
+  });
+
+  bot.command(["groups", "targetgroups"], async (ctx) => {
+    await registerUser(ctx);
+    const { results } = await env.DB.prepare(
+      `SELECT g.*, (SELECT COUNT(*) FROM target_group_members m WHERE m.group_id = g.id) AS n
+       FROM target_groups g ORDER BY g.created_at DESC LIMIT 20`
+    ).all();
+    if (!results.length) return await ctx.reply("🎯 <b>Target groups</b>\n\nNone yet.", { parse_mode: "HTML" });
+    const lines = results.map((g) => `🎯 <b>${escapeHtml(g.name)}</b> <code>${escapeHtml(g.id)}</code>\n   ${g.n} target(s) · ${escapeHtml(g.visibility)}`);
+    await ctx.reply(`🎯 <b>Target groups (${results.length})</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  bot.command("templates", async (ctx) => {
+    await registerUser(ctx);
+    const { results } = await env.DB.prepare("SELECT * FROM job_templates ORDER BY created_at DESC LIMIT 20").all();
+    if (!results.length) return await ctx.reply("🧩 <b>Job templates</b>\n\nNone yet.", { parse_mode: "HTML" });
+    const lines = results.map((t) => `🧩 <b>${escapeHtml(t.name)}</b> <code>${escapeHtml(t.slug || t.id)}</code>\n   <code>${escapeHtml(t.command_template)}</code>`);
+    await ctx.reply(`🧩 <b>Job templates (${results.length})</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  bot.command("playbooks", async (ctx) => {
+    await registerUser(ctx);
+    const { results } = await env.DB.prepare(
+      `SELECT p.*, (SELECT COUNT(*) FROM playbook_steps s WHERE s.playbook_id = p.id) AS steps
+       FROM playbooks p ORDER BY p.created_at DESC LIMIT 20`
+    ).all();
+    if (!results.length) return await ctx.reply("📘 <b>Playbooks</b>\n\nNone yet.", { parse_mode: "HTML" });
+    const lines = results.map((p) => `📘 <b>${escapeHtml(p.name)}</b> <code>${escapeHtml(p.slug || p.id)}</code>\n   ${p.steps} step(s)`);
+    await ctx.reply(`📘 <b>Playbooks (${results.length})</b>\n\nRun one with <code>/runplaybook &lt;slug&gt; &lt;target&gt;</code>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
+  });
+
+  bot.command("runplaybook", async (ctx) => {
+    await registerUser(ctx);
+    const parts = (ctx.match || "").trim().split(/\s+/).filter(Boolean);
+    if (parts.length < 2) {
+      return await ctx.reply("Usage: <code>/runplaybook &lt;playbook-slug-or-id&gt; &lt;target&gt;</code>", { parse_mode: "HTML" });
+    }
+    const [ref, target] = parts;
+    let safeTarget;
+    try {
+      safeTarget = assertSafeTarget(target);
+    } catch (e) {
+      return await ctx.reply("🛑 Invalid target: it must be a bare host/domain with no spaces or shell characters.");
+    }
+    const pb = await env.DB.prepare("SELECT * FROM playbooks WHERE id = ? OR slug = ?").bind(ref, ref).first();
+    if (!pb) return await ctx.reply(`🛑 Playbook not found: <code>${escapeHtml(ref)}</code>`, { parse_mode: "HTML" });
+
+    if (pb.campaign_id) {
+      const camp = await env.DB.prepare("SELECT name, authorized FROM campaigns WHERE id = ?").bind(pb.campaign_id).first();
+      if (camp && !camp.authorized) {
+        return await ctx.reply(`🔒 Campaign <b>${escapeHtml(camp.name)}</b> is not marked authorized. Refusing to launch scans until scope is confirmed.`, { parse_mode: "HTML" });
+      }
+    }
+
+    const { results: steps } = await env.DB.prepare(
+      "SELECT * FROM playbook_steps WHERE playbook_id = ? ORDER BY step_order ASC"
+    ).bind(pb.id).all();
+    if (!steps.length) return await ctx.reply("🛑 This playbook has no steps yet.");
+
+    const sender = String(ctx.from.id);
+    const jobIds = [];
+    for (const st of steps) {
+      let command;
+      let runner = 'default';
+      if (st.template_id) {
+        const tpl = await env.DB.prepare("SELECT * FROM job_templates WHERE id = ?").bind(st.template_id).first();
+        if (tpl) { command = expandCommandTemplate(tpl.command_template, safeTarget, sender); runner = tpl.runner || 'default'; }
+      }
+      if (!command) command = commandForPhase(st.phase, safeTarget, sender);
+      jobIds.push(await queueJob(env, command, safeTarget, runner));
+    }
+    await ctx.reply(`🚀 Queued <b>${jobIds.length}</b> job(s) from <b>${escapeHtml(pb.name)}</b> against <code>${escapeHtml(safeTarget)}</code>.\n\nTrack them with /queue.`, { parse_mode: "HTML" });
+  });
+
+  // ---- Admin Control Center (/admin) ----
+  const roleIcon = (r) => ({ superadmin: '👑', admin: '🛡️', operator: '🔧', viewer: '👁️', pending: '⏳' }[r] || '•');
+
+  const ADMIN_MENU_TEXT =
+    "🛡️ <b>Admin Control Center</b>\n\n" +
+    "Full management surface — access control, operations, assets, workflows and audit. " +
+    "Every action is role-checked and written to the tamper-evident audit log.";
+
+  const buildAdminMenu = () => ({
+    inline_keyboard: [
+      [{ text: "👥 Users & Roles", callback_data: "admin_users" },
+       { text: "🧑‍🤝‍🧑 Team Memberships", callback_data: "admin_members" }],
+      [{ text: "📊 Dashboard", callback_data: "menu_dashboard" },
+       { text: "📜 Scan Queue", callback_data: "view_new_domains" },
+       { text: "🖥️ Runners", callback_data: "change_runner" }],
+      [{ text: "🎯 Targets", callback_data: "view_targets_0" },
+       { text: "👤 Contacts", callback_data: "view_contacts_0" }],
+      [{ text: "🛡️ Findings", callback_data: "menu_findings" },
+       { text: "🔑 Secrets", callback_data: "menu_secrets_0" },
+       { text: "🔌 Services", callback_data: "menu_services_0" }],
+      [{ text: "📋 Campaigns", callback_data: "admin_campaigns" },
+       { text: "🧩 Templates", callback_data: "admin_templates" },
+       { text: "📘 Playbooks", callback_data: "admin_playbooks" }],
+      [{ text: "🧾 Audit Log", callback_data: "admin_audit" }],
+      [{ text: "⚠️ Reset Database", callback_data: "confirm_reset_db" }],
+      [{ text: "🔙 Main Menu", callback_data: "main_menu" }],
+    ],
+  });
+
+  // Callbacks only clear the "viewer" gate, so every admin-only panel must
+  // re-check the role here. Returns the actor when allowed, else null (and
+  // replaces the message with a denial).
+  const ensureAdminCallback = async (ctx) => {
+    const actor = ctx.actor || await resolveActor(env, ctx.from);
+    if (actor.hasGlobal('admin')) return actor;
+    await auditLog(env, {
+      actor_user_id: actor.userId, actor_number_id: ctx.from?.id || 0, actor_label: actor.username,
+      source: 'telegram', action: 'admin.panel', decision: 'deny',
+      target_type: 'callback', target: ctx.callbackQuery?.data || null,
+      detail: { role: actor.role },
+    });
+    await safeEditMessageText(ctx, "⛔ <b>Admins only.</b>\n\nThis panel requires the <b>admin</b> role.", {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "🔙 Main Menu", callback_data: "main_menu" }]] },
+    }).catch(() => {});
+    return null;
+  };
+
+  const renderAdminUsers = async (ctx) => {
+    const res = await env.DB.prepare(
+      "SELECT username, number_id, role FROM users ORDER BY role DESC, username ASC LIMIT 50"
+    ).all();
+    const rows = res?.results || [];
+    const kb = rows.slice(0, 20).map((r) => ([{
+      text: `${roleIcon(r.role)} ${r.username} · ${r.role || 'pending'}`,
+      callback_data: `admin_user:${r.number_id}`,
+    }]));
+    kb.push([{ text: "🔄 Refresh", callback_data: "admin_users" }, { text: "🔙 Admin", callback_data: "admin_home" }]);
+    const text = rows.length
+      ? `👥 <b>Users &amp; Roles (${rows.length})</b>\n\nTap a user to change their global role.`
+      : "👥 <b>Users &amp; Roles</b>\n\nNo users registered yet.";
+    await safeEditMessageText(ctx, text, { parse_mode: "HTML", reply_markup: { inline_keyboard: kb } });
+  };
+
+  const renderAdminUserPanel = async (ctx, numberId) => {
+    const u = await env.DB.prepare("SELECT username, number_id, role FROM users WHERE number_id = ?").bind(numberId).first();
+    if (!u) {
+      return await safeEditMessageText(ctx, "User not found.", {
+        parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: "🔙 Users", callback_data: "admin_users" }]] },
+      });
+    }
+    const roleBtns = VALID_GLOBAL_ROLES.map((r) => ({
+      text: (u.role === r ? "✅ " : "") + roleIcon(r) + " " + r,
+      callback_data: `admin_setrole:${numberId}:${r}`,
+    }));
+    const kb = [];
+    for (let i = 0; i < roleBtns.length; i += 2) kb.push(roleBtns.slice(i, i + 2));
+    kb.push([{ text: "🔙 Users", callback_data: "admin_users" }]);
+    const text =
+      `👤 <b>${escapeHtml(u.username)}</b>\n` +
+      `• Telegram ID: <code>${u.number_id}</code>\n` +
+      `• Current role: <b>${u.role || 'pending'}</b>\n\n` +
+      `Select a new global role (only a superadmin may grant/change <b>admin</b>):`;
+    await safeEditMessageText(ctx, text, { parse_mode: "HTML", reply_markup: { inline_keyboard: kb } });
+  };
+
+  // Shared with /role: same validation, superadmin guard and audit trail.
+  const applyAdminSetRole = async (ctx, actor, numberId, newRole) => {
+    if (!VALID_GLOBAL_ROLES.includes(newRole)) {
+      return await ctx.answerCallbackQuery({ text: "Invalid role.", show_alert: true }).catch(() => {});
+    }
+    if (newRole === 'admin' && !actor.isSuperadmin) {
+      return await safeEditMessageText(ctx, "⛔ Only a superadmin can grant the <b>admin</b> role.", {
+        parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: "🔙 Users", callback_data: "admin_users" }]] },
+      });
+    }
+    const target = await env.DB.prepare("SELECT id, username, role FROM users WHERE number_id = ?").bind(numberId).first();
+    if (!target) {
+      return await safeEditMessageText(ctx, "❌ User no longer exists.", {
+        parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: "🔙 Users", callback_data: "admin_users" }]] },
+      });
+    }
+    if (target.role === 'admin' && !actor.isSuperadmin) {
+      return await safeEditMessageText(ctx, "⛔ Only a superadmin can change an existing admin's role.", {
+        parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: "🔙 Users", callback_data: "admin_users" }]] },
+      });
+    }
+    await env.DB.prepare(
+      "UPDATE users SET role = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE number_id = ?"
+    ).bind(newRole, numberId).run();
+    await auditLog(env, {
+      actor_user_id: actor.userId, actor_number_id: ctx.from.id, actor_label: actor.username,
+      source: 'telegram', action: 'role.set', target_type: 'user', target: String(numberId),
+      detail: { old_role: target.role, new_role: newRole, via: 'admin-dashboard' },
+    });
+    await renderAdminUserPanel(ctx, numberId);
+  };
+
+  const renderAdminAudit = async (ctx) => {
+    const res = await env.DB.prepare(
+      "SELECT ts, actor_label, actor_number_id, source, action, decision, target_type, target FROM audit_log ORDER BY ts DESC LIMIT 15"
+    ).all();
+    const rows = res?.results || [];
+    const body = rows.length
+      ? rows.map((r) => {
+          const icon = r.decision === 'deny' ? '⛔' : '✅';
+          const who = r.actor_label || `id:${r.actor_number_id}`;
+          const tgt = r.target ? ` <code>${escapeHtml(String(r.target))}</code>` : '';
+          const when = String(r.ts).replace('T', ' ').replace('Z', '').slice(5, 19);
+          return `${icon} <code>${when}</code> ${escapeHtml(who)} [${r.source}] <b>${r.action}</b>${tgt}`;
+        }).join("\n")
+      : "Audit log is empty.";
+    await safeEditMessageText(ctx, `🧾 <b>Audit Log</b> (last ${rows.length})\n\n${body}`, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "🔄 Refresh", callback_data: "admin_audit" }, { text: "🔙 Admin", callback_data: "admin_home" }]] },
+    });
+  };
+
+  const renderAdminMembers = async (ctx) => {
+    const res = await env.DB.prepare(
+      `SELECT u.number_id, u.username, tm.role, c.name AS cname
+         FROM team_members tm
+         JOIN users u ON u.id = tm.user_id
+         JOIN companies c ON c.id = tm.company_id
+        ORDER BY c.name ASC, tm.role DESC LIMIT 100`
+    ).all();
+    const rows = res?.results || [];
+    const body = rows.length
+      ? rows.map((r) => `• <b>${escapeHtml(r.cname)}</b> ← <code>${r.number_id}</code> ${escapeHtml(r.username)} (${r.role})`).join("\n")
+      : "No team memberships yet. Grant one with <code>/grant &lt;id&gt; &lt;company&gt; [role]</code>.";
+    await safeEditMessageText(ctx, `🧑‍🤝‍🧑 <b>Team Memberships</b>\n\n${body}`, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "🔄 Refresh", callback_data: "admin_members" }, { text: "🔙 Admin", callback_data: "admin_home" }]] },
+    });
+  };
+
+  const renderAdminList = async (ctx, kind) => {
+    let text;
+    if (kind === 'campaigns') {
+      const { results } = await env.DB.prepare("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 20").all();
+      const badge = { prospect: "🔆", active: "🟢", paused: "⏸️", won: "🏆", lost: "💤", closed: "📦" };
+      text = results.length
+        ? `📋 <b>Campaigns (${results.length})</b>\n\n` + results.map((c) =>
+            `${badge[c.status] || "•"} <b>${escapeHtml(c.name)}</b> <code>${escapeHtml(c.slug || c.id)}</code>\n   ${escapeHtml(c.kind)} · ${escapeHtml(c.status)} · ${c.authorized ? "🔓 authorized" : "🔒 unauthorized"}`
+          ).join("\n")
+        : "📋 <b>Campaigns</b>\n\nNone yet. Create one with <code>/newcampaign &lt;name&gt; | &lt;kind&gt;</code>.";
+    } else if (kind === 'templates') {
+      const { results } = await env.DB.prepare("SELECT * FROM job_templates ORDER BY created_at DESC LIMIT 20").all();
+      text = results.length
+        ? `🧩 <b>Job Templates (${results.length})</b>\n\n` + results.map((t) =>
+            `🧩 <b>${escapeHtml(t.name)}</b> <code>${escapeHtml(t.slug || t.id)}</code>\n   <code>${escapeHtml(t.command_template)}</code>`
+          ).join("\n")
+        : "🧩 <b>Job Templates</b>\n\nNone yet.";
+    } else {
+      const { results } = await env.DB.prepare(
+        `SELECT p.*, (SELECT COUNT(*) FROM playbook_steps s WHERE s.playbook_id = p.id) AS steps
+         FROM playbooks p ORDER BY p.created_at DESC LIMIT 20`
+      ).all();
+      text = results.length
+        ? `📘 <b>Playbooks (${results.length})</b>\n\nRun with <code>/runplaybook &lt;slug&gt; &lt;target&gt;</code>\n\n` + results.map((p) =>
+            `📘 <b>${escapeHtml(p.name)}</b> <code>${escapeHtml(p.slug || p.id)}</code>\n   ${p.steps} step(s)`
+          ).join("\n")
+        : "📘 <b>Playbooks</b>\n\nNone yet.";
+    }
+    await safeEditMessageText(ctx, text, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "🔙 Admin", callback_data: "admin_home" }]] },
+    });
+  };
+
+  // /admin — open the Admin Control Center. Admin role required.
+  bot.command("admin", async (ctx) => {
+    if (!await requireRole(ctx, 'admin', 'admin.dashboard')) return;
+    await ctx.reply(ADMIN_MENU_TEXT, { parse_mode: "HTML", reply_markup: buildAdminMenu() });
+  });
+
   bot.command("help", async (ctx) => {
     await ctx.reply(
       `📖 <b>cHack Bot Command & Management Guide</b>\n\n` +
@@ -2214,7 +4026,28 @@ const getBot = (env) => {
       `• <code>/vulns [domain] [severity]</code> - Search vulnerabilities\n` +
       `• <code>/secrets [domain]</code> - Search discovered secrets\n` +
       `• <code>/ports [domain]</code> - Search open services\n` +
-      `• <code>/report &lt;domain&gt;</code> - Executive summary report`,
+      `• <code>/report &lt;domain&gt;</code> - Executive summary report\n\n` +
+      `<b>Continuous Monitoring:</b>\n` +
+      `• <code>/monitor &lt;target&gt; [interval] [type]</code> - Schedule recurring scans\n` +
+      `• <code>/monitors</code> - List your active monitors\n` +
+      `• <code>/unmonitor &lt;id&gt;</code> - Remove a monitor\n\n` +
+      `<b>Access Control & Audit:</b>\n` +
+      `• <code>/admin</code> - Open the Admin Control Center dashboard <i>(admin)</i>\n` +
+      `• <code>/whoami</code> - Your ID, role & team memberships\n` +
+      `• <code>/users</code> - List users & roles <i>(admin)</i>\n` +
+      `• <code>/role &lt;id&gt; &lt;role&gt;</code> - Set global role <i>(admin)</i>\n` +
+      `• <code>/grant &lt;id&gt; &lt;company&gt; [role]</code> - Add to team <i>(admin)</i>\n` +
+      `• <code>/revoke &lt;id&gt; &lt;company&gt;</code> - Remove from team <i>(admin)</i>\n` +
+      `• <code>/members [company]</code> - List team memberships <i>(admin)</i>\n` +
+      `• <code>/audit [n]</code> - Recent audit log <i>(admin)</i>\n\n` +
+      `<b>Team Workflows:</b>\n` +
+      `• <code>/campaigns</code> - List client/acquisition campaigns\n` +
+      `• <code>/newcampaign &lt;name&gt; | &lt;kind&gt;</code> - Create a campaign\n` +
+      `• <code>/groups</code> - List shared target groups\n` +
+      `• <code>/templates</code> - List job templates\n` +
+      `• <code>/playbooks</code> - List per-target playbooks\n` +
+      `• <code>/runplaybook &lt;slug&gt; &lt;target&gt;</code> - Expand a playbook into jobs\n\n` +
+      `<i>Roles: viewer (read) → operator (scan in-scope) → admin (manage) → superadmin (ADMIN_IDS).</i>`,
       { parse_mode: "HTML" }
     );
   });
@@ -2241,6 +4074,37 @@ const getBot = (env) => {
         parse_mode: "HTML",
         reply_markup: menuMarkup
       });
+    } else if (data === "admin_home") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await safeEditMessageText(ctx, ADMIN_MENU_TEXT, { parse_mode: "HTML", reply_markup: buildAdminMenu() });
+    } else if (data === "admin_users") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminUsers(ctx);
+    } else if (data.startsWith("admin_user:")) {
+      if (!await ensureAdminCallback(ctx)) return;
+      const numberId = Number(data.split(":")[1]);
+      if (Number.isFinite(numberId)) await renderAdminUserPanel(ctx, numberId);
+    } else if (data.startsWith("admin_setrole:")) {
+      const actor = await ensureAdminCallback(ctx);
+      if (!actor) return;
+      const [, idStr, newRole] = data.split(":");
+      const numberId = Number(idStr);
+      if (Number.isFinite(numberId)) await applyAdminSetRole(ctx, actor, numberId, newRole);
+    } else if (data === "admin_members") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminMembers(ctx);
+    } else if (data === "admin_audit") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminAudit(ctx);
+    } else if (data === "admin_campaigns") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminList(ctx, 'campaigns');
+    } else if (data === "admin_templates") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminList(ctx, 'templates');
+    } else if (data === "admin_playbooks") {
+      if (!await ensureAdminCallback(ctx)) return;
+      await renderAdminList(ctx, 'playbooks');
     } else if (data === "menu_dashboard") {
       try {
         const compCount = (await env.DB.prepare("SELECT count(*) as cnt FROM companies").first())?.cnt || 0;
@@ -2487,6 +4351,7 @@ const getBot = (env) => {
       if (!comp) return;
       const runner = ctx.session?.selected_runner || 'default';
       const jobId = await triggerScan(ctx, 'company', comp.name, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       await safeEditMessageText(ctx, `🚀 <b>Full Recon Scan Queued for ${escapeHtml(comp.name)}</b>\n\n• <b>Runner:</b> <code>${runner}</code>\n• <b>Job ID:</b> <code>${jobId}</code>`, {
         parse_mode: "HTML",
         reply_markup: {
@@ -2643,6 +4508,7 @@ const getBot = (env) => {
       else if (scanType === 'net') typeKey = 'network';
 
       const jobId = await triggerScan(ctx, typeKey, dom.host, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       await safeEditMessageText(ctx, `🚀 <b>Scan Queued for ${escapeHtml(dom.host)}</b>\n\n• <b>Type:</b> <code>${scanType.toUpperCase()}</code>\n• <b>Runner:</b> <code>${runner}</code>\n• <b>Job ID:</b> <code>${jobId}</code>`, {
         parse_mode: "HTML",
         reply_markup: {
@@ -2761,6 +4627,7 @@ const getBot = (env) => {
       const fullName = `${person.given_name} ${person.family_name || ''}`.trim();
       const runner = ctx.session?.selected_runner || 'default';
       const jobId = await triggerScan(ctx, 'person', fullName, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       await safeEditMessageText(ctx, `🚀 <b>OSINT Scan Queued for ${escapeHtml(fullName)}</b>\n\n• <b>Runner:</b> <code>${runner}</code>\n• <b>Job ID:</b> <code>${jobId}</code>`, {
         parse_mode: "HTML",
         reply_markup: {
@@ -3304,6 +5171,7 @@ const getBot = (env) => {
         console.error("D1 error in remove_runner:", err.message);
       }
     } else if (data === "confirm_reset_db") {
+      if (!await requireRole(ctx, 'superadmin', 'db.reset')) return;
       await safeEditMessageText(
         ctx,
         `⚠️ <b>DANGER: Reset Cloudflare Database</b>\n\n` +
@@ -3335,7 +5203,10 @@ const getBot = (env) => {
         }
       );
     } else if (data === "do_reset_db") {
+      if (!await requireRole(ctx, 'superadmin', 'db.reset')) return;
       try {
+        // Note: audit_log is intentionally NOT wiped — the audit trail must
+        // survive a database reset. team_members is cleared with its users.
         const tables = [
           "findings",
           "secrets",
@@ -3347,10 +5218,16 @@ const getBot = (env) => {
           "scan_jobs",
           "runners",
           "sessions",
+          "team_members",
           "users"
         ];
         const statements = tables.map(t => env.DB.prepare(`DELETE FROM ${t}`));
         await env.DB.batch(statements);
+        await auditLog(env, {
+          actor_user_id: ctx.actor?.userId, actor_number_id: ctx.from?.id || 0,
+          actor_label: ctx.actor?.username, source: 'telegram', action: 'db.reset',
+          target_type: 'db', target: 'all', detail: { tables },
+        });
 
         ctx.session = {
           selected_runner: 'default',
@@ -3400,6 +5277,7 @@ const getBot = (env) => {
         return await ctx.reply("❌ Invalid domain format. Try again or type /menu to reset.");
       }
       const jobId = await triggerScan(ctx, 'domain', text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
         `🚀 <b>Full Recon Scan Queued!</b>\n\n` +
@@ -3419,6 +5297,7 @@ const getBot = (env) => {
     } 
     else if (step === 'PERSON_INPUT') {
       const jobId = await triggerScan(ctx, 'person', text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
         `🔍 <b>Person OSINT Scan Queued!</b>\n\n` +
@@ -3440,6 +5319,7 @@ const getBot = (env) => {
       const isDomain = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(text);
       const targetType = isDomain ? 'domain' : 'company';
       const jobId = await triggerScan(ctx, targetType, text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       
       await ctx.reply(
@@ -3460,6 +5340,7 @@ const getBot = (env) => {
     }
     else if (step === 'INFOGATHER_INPUT') {
       const jobId = await triggerScan(ctx, 'infogather', text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
         `🔍 <b>Info-Gathering Scan Queued!</b>\n\n` +
@@ -3479,6 +5360,7 @@ const getBot = (env) => {
     }
     else if (step === 'WEB_INPUT') {
       const jobId = await triggerScan(ctx, 'web', text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
         `🌐 <b>Web Recon & Crawl Queued!</b>\n\n` +
@@ -3498,6 +5380,7 @@ const getBot = (env) => {
     }
     else if (step === 'NET_INPUT') {
       const jobId = await triggerScan(ctx, 'network', text, runner);
+      if (!jobId) return; // scan denied by scope/role (reply already sent)
       ctx.session.step = 'MAIN_MENU';
       await ctx.reply(
         `🔌 <b>Network & Port Scan Queued!</b>\n\n` +
@@ -3580,6 +5463,7 @@ const getBot = (env) => {
       const isDomain = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(text);
       if (isDomain) {
         const jobId = await triggerScan(ctx, 'domain', text, runner);
+        if (!jobId) return; // scan denied by scope/role (reply already sent)
         await ctx.reply(
           `🚀 <b>Full Recon Scan Queued!</b>\n\n` +
           `• <b>Target:</b> <code>${escapeHtml(text)}</code>\n` +
@@ -3637,37 +5521,46 @@ const safeEqual = (a, b) => {
   return diff === 0;
 };
 
-// Gate the runner/GraphQL/DB control plane behind RUNNER_TOKEN.
-// Fails closed: if the secret is not configured, all protected routes are
-// rejected until the operator sets it (wrangler secret put RUNNER_TOKEN).
-const requireToken = async (c, next) => {
-  const expected = c.env.RUNNER_TOKEN;
-  if (!expected) {
-    return c.json({ error: 'Server auth not configured (RUNNER_TOKEN unset)' }, 503);
-  }
-  const header = c.req.header('Authorization') || '';
-  const presented = header.startsWith('Bearer ') ? header.slice(7) : '';
-  if (!presented || !safeEqual(presented, expected)) {
-    return c.json({ error: 'Unauthorized' }, 401);
-  }
-  await next();
-};
+// Control-plane auth model (reconciled):
+//   * GraphQL is role-enforced inside resolvers via requireRole(), active when
+//     AUTH_ENFORCED=true (per-user API tokens); open in single-operator mode.
+//   * Runner + DB admin endpoints are gated by the RUNNER_TOKEN shared secret
+//     through runnerTokenOk() below (bootstrap-open until the token is set).
+//   * No wildcard CORS: these endpoints are server-to-server + the Telegram
+//     webhook, so no browser origin should be able to read them.
 
-// No wildcard CORS: these endpoints are server-to-server (runners) + the
-// Telegram webhook, so no browser origin should be able to read them. The
-// bearer guard below protects the data/control routes.
-app.use('/graphql', requireToken);
-app.use('/api/db/*', requireToken);
-app.use('/api/runner/*', requireToken);
+// Runner endpoints accept a shared secret when RUNNER_TOKEN is configured.
+// When it is unset, access stays open so existing deployments keep working.
+const runnerTokenOk = (c) => {
+  const expected = c.env.RUNNER_TOKEN;
+  if (!expected) return true; // bootstrap mode
+  const hdr = c.req.header('x-runner-token') || '';
+  const auth = c.req.header('authorization') || '';
+  const bearer = /^Bearer\s+/i.test(auth) ? auth.replace(/^Bearer\s+/i, '').trim() : '';
+  return hdr === expected || bearer === expected;
+};
 
 // Health Check & DB Migration
 app.get('/', (c) => c.text('cHack Serverless Backend & Bot Running!'));
 app.get('/api/db/migrate', async (c) => {
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
   try {
     // Add ip/country columns to runners table
     await c.env.DB.prepare("ALTER TABLE runners ADD COLUMN ip TEXT").run().catch(() => {});
     await c.env.DB.prepare("ALTER TABLE runners ADD COLUMN country TEXT").run().catch(() => {});
-    
+
+    // Runner orchestration columns on scan_jobs (idempotent; each fails harmlessly if present)
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN region TEXT").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN next_eligible_at INTEGER NOT NULL DEFAULT 0").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN assigned_runner TEXT").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN started_at INTEGER").run().catch(() => {});
+    await c.env.DB.prepare(
+      "CREATE INDEX IF NOT EXISTS idx_scan_jobs_dispatch ON scan_jobs(status, priority DESC, created_at ASC)"
+    ).run().catch(() => {});
+
     // Create new Reconner tables if not exist
     await c.env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS findings (
@@ -3732,6 +5625,188 @@ app.get('/api/db/migrate', async (c) => {
       )
     `).run().catch(() => {});
 
+    // Task dependency graph (DAG) columns on scan_jobs
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN job_type TEXT").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN pipeline_id TEXT").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN parent_id TEXT").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN result TEXT DEFAULT '{}'").run().catch(() => {});
+    await c.env.DB.prepare("ALTER TABLE scan_jobs ADD COLUMN depends_on TEXT DEFAULT '[]'").run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_scan_jobs_pipeline ON scan_jobs(pipeline_id)").run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(status)").run().catch(() => {});
+
+    // Trigger rules table (the dependency graph, stored as editable data)
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS trigger_rules (
+        id TEXT PRIMARY KEY,
+        on_job_type TEXT NOT NULL,
+        cond_key TEXT NOT NULL DEFAULT '',
+        cond_op TEXT NOT NULL DEFAULT 'always',
+        cond_value TEXT DEFAULT '',
+        spawn_job_type TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_trigger_rules_on ON trigger_rules(on_job_type)").run().catch(() => {});
+
+    // Seed the default dependency graph (idempotent)
+    await c.env.DB.batch([
+      c.env.DB.prepare("INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES (?,?,?,?,?,?)").bind('rule_sub_httpx',    'subdomain_enum', 'subdomains', 'gt',       '0',   'httpx'),
+      c.env.DB.prepare("INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES (?,?,?,?,?,?)").bind('rule_httpx_naabu',  'httpx',          'live_hosts', 'gt',       '0',   'naabu'),
+      c.env.DB.prepare("INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES (?,?,?,?,?,?)").bind('rule_httpx_katana', 'httpx',          'live_hosts', 'gt',       '0',   'katana'),
+      c.env.DB.prepare("INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES (?,?,?,?,?,?)").bind('rule_naabu_fp',     'naabu',          'open_ports', 'contains', '443', 'httpx_fingerprint'),
+      c.env.DB.prepare("INSERT OR IGNORE INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type) VALUES (?,?,?,?,?,?)").bind('rule_katana_nuclei','katana',         'endpoints',  'gt',       '0',   'nuclei'),
+    ]);
+
+    // Continuous attack-surface monitoring: recurring scan schedules
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS monitors (
+        id TEXT PRIMARY KEY,
+        owner_chat_id INTEGER NOT NULL,
+        target_type TEXT NOT NULL DEFAULT 'domain',
+        target TEXT NOT NULL,
+        scan_type TEXT NOT NULL DEFAULT 'infogather',
+        runner TEXT NOT NULL DEFAULT 'default',
+        interval_minutes INTEGER NOT NULL DEFAULT 1440,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        last_run_at TEXT,
+        next_run_at TEXT,
+        last_job_id TEXT,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_monitors_due ON monitors(enabled, next_run_at)").run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_monitors_owner ON monitors(owner_chat_id)").run().catch(() => {});
+
+    // Team workflows: roles, tokens, campaigns, groups, templates, playbooks.
+    // users.role is unified with the Telegram RBAC model (pending/viewer/
+    // operator/admin + ADMIN_IDS superadmin); API-token auth ranks unknown
+    // roles lowest, so this stays fail-closed.
+    await c.env.DB.prepare("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'pending'").run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS api_tokens (
+        id TEXT PRIMARY KEY,
+        user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        role TEXT NOT NULL DEFAULT 'member',
+        revoked INTEGER NOT NULL DEFAULT 0,
+        last_used_at TEXT,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+    await c.env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash)").run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS campaigns (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT UNIQUE,
+        owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        company_id TEXT REFERENCES companies(id) ON DELETE SET NULL,
+        kind TEXT NOT NULL DEFAULT 'engagement',
+        status TEXT NOT NULL DEFAULT 'prospect',
+        authorized INTEGER NOT NULL DEFAULT 0,
+        scope TEXT DEFAULT '{}',
+        description TEXT,
+        data TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS campaign_members (
+        campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL DEFAULT 'member',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (campaign_id, user_id)
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS target_groups (
+        id TEXT PRIMARY KEY,
+        campaign_id TEXT REFERENCES campaigns(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        visibility TEXT NOT NULL DEFAULT 'team',
+        description TEXT,
+        data TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS target_group_members (
+        group_id TEXT NOT NULL REFERENCES target_groups(id) ON DELETE CASCADE,
+        domain_id TEXT NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+        added_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (group_id, domain_id)
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS job_templates (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT UNIQUE,
+        owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        visibility TEXT NOT NULL DEFAULT 'team',
+        command_template TEXT NOT NULL,
+        phases TEXT DEFAULT '[]',
+        default_flags TEXT DEFAULT '{}',
+        runner TEXT DEFAULT 'default',
+        description TEXT,
+        data TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS playbooks (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT UNIQUE,
+        campaign_id TEXT REFERENCES campaigns(id) ON DELETE SET NULL,
+        owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        visibility TEXT NOT NULL DEFAULT 'team',
+        description TEXT,
+        data TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS playbook_steps (
+        id TEXT PRIMARY KEY,
+        playbook_id TEXT NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+        step_order INTEGER NOT NULL,
+        template_id TEXT REFERENCES job_templates(id) ON DELETE SET NULL,
+        phase TEXT,
+        params TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        UNIQUE (playbook_id, step_order)
+      )
+    `).run().catch(() => {});
+
+    await c.env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS target_playbooks (
+        id TEXT PRIMARY KEY,
+        playbook_id TEXT NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+        domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+        group_id TEXT REFERENCES target_groups(id) ON DELETE CASCADE,
+        created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+    `).run().catch(() => {});
+
     return c.text("D1 Database Migrations applied successfully!");
   } catch (e) {
     return c.text("Migration failed: " + e.message, 500);
@@ -3739,6 +5814,7 @@ app.get('/api/db/migrate', async (c) => {
 });
 
 app.post('/api/db/reset', async (c) => {
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
   // Destructive: wipes every table. Require an explicit confirmation field in
   // addition to the bearer token, so a leaked token alone can't trivially wipe
   // the central database by accident or replay.
@@ -3749,6 +5825,15 @@ app.post('/api/db/reset', async (c) => {
   }
   try {
     const tables = [
+      "target_playbooks",
+      "playbook_steps",
+      "playbooks",
+      "job_templates",
+      "target_group_members",
+      "target_groups",
+      "campaign_members",
+      "campaigns",
+      "api_tokens",
       "findings",
       "secrets",
       "network_services",
@@ -3798,9 +5883,62 @@ app.post('/webhook', async (c) => {
 });
 
 // Runner APIs (Background Scan Executer)
+
+// --- Orchestration tunables -------------------------------------------------
+// A runner that has not sent next-job/heartbeat within this window is treated as
+// offline; its in-flight jobs become eligible for reclaim.
+const RUNNER_STALE_SECS = 180;
+// Hard ceiling on a single run regardless of heartbeats — a wedged job past this
+// lease is reclaimed so it cannot occupy a slot forever. Set well above a normal
+// full-pipeline scan so a legitimately long job is never double-dispatched.
+const JOB_LEASE_SECS = 21600; // 6h
+// Retry backoff: delay = min(cap, base * 2^attempts), plus up to +50% jitter.
+const RETRY_BASE_SECS = 30;
+const RETRY_CAP_SECS = 1800;
+
+// Seconds to wait before a failed/reclaimed job may run again, with jitter so a
+// fleet-wide outage doesn't requeue everything into one synchronized wave.
+function retryDelaySecs(attempts) {
+  const base = Math.min(RETRY_CAP_SECS, RETRY_BASE_SECS * Math.pow(2, Math.max(0, attempts)));
+  return Math.round(base + Math.random() * base * 0.5);
+}
+
+// Requeue (or fail) jobs stranded on a runner that has gone offline or blown its
+// lease. Runs opportunistically on each poll; cheap and idempotent.
+async function reclaimStaleJobs(env, nowSecs) {
+  const runnerCutoff = nowSecs - RUNNER_STALE_SECS;
+  const leaseCutoff = nowSecs - JOB_LEASE_SECS;
+  // Condition: the job is running, but its holder is unknown/offline, or the
+  // lease has expired outright.
+  const staleWhere =
+    "status = 'running' AND (" +
+    "  (started_at IS NOT NULL AND started_at < ?) " +
+    "  OR assigned_runner IS NULL " +
+    "  OR assigned_runner NOT IN (SELECT name FROM runners WHERE last_seen >= ?)" +
+    ")";
+
+  // Out of attempts -> give up.
+  await env.DB.prepare(
+    "UPDATE scan_jobs SET status = 'failed', assigned_runner = NULL, " +
+    "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') " +
+    "WHERE attempts >= max_attempts AND " + staleWhere
+  ).bind(leaseCutoff, runnerCutoff).run().catch(() => {});
+
+  // Still has attempts left -> back to the queue after a jittered backoff.
+  await env.DB.prepare(
+    "UPDATE scan_jobs SET status = 'pending', assigned_runner = NULL, started_at = NULL, " +
+    "next_eligible_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') " +
+    "WHERE attempts < max_attempts AND " + staleWhere
+  ).bind(nowSecs + retryDelaySecs(1), leaseCutoff, runnerCutoff).run().catch(() => {});
+}
+
 app.get('/api/runner/next-job', async (c) => {
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
   const runner = c.req.query('runner') || 'default';
-  
+  // How many jobs this runner may hold at once (auto-balance: don't pile work on
+  // a node that is already busy — let idle nodes pick it up instead).
+  const slots = Math.max(1, parseInt(c.req.query('slots') || '1', 10) || 1);
+
   // Register runner heartbeat (Unix timestamp in seconds)
   const nowSecs = Math.floor(Date.now() / 1000);
   const ip = c.req.header('CF-Connecting-IP') || c.req.header('x-real-ip') || '127.0.0.1';
@@ -3811,24 +5949,82 @@ app.get('/api/runner/next-job', async (c) => {
     "ON CONFLICT(name) DO UPDATE SET ip = excluded.ip, country = excluded.country, last_seen = excluded.last_seen"
   ).bind(runner, ip, country, nowSecs).run();
 
-  // Fetch next pending job for this runner or default
-  const job = await c.env.DB.prepare(
-    "SELECT * FROM scan_jobs WHERE status = 'pending' AND (runner = ? OR runner = 'default' OR runner IS NULL OR runner = '') ORDER BY created_at ASC LIMIT 1"
+  // Recover work stranded on offline runners before handing out anything new.
+  // (reclaimStaleJobs requeues jobs whose runner went silent, up to max_attempts,
+  // then fails them — a failed job never spawns DAG children.)
+  await reclaimStaleJobs(c.env, nowSecs);
+
+  // Load balancing: refuse a new job if this runner is already at capacity.
+  const load = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM scan_jobs WHERE status = 'running' AND assigned_runner = ?"
   ).bind(runner).first();
-  
+  if (load && load.n >= slots) {
+    return c.json({ job: null, reason: 'at_capacity' });
+  }
+
+  // Pick the next dispatchable job:
+  //  - eligible now (retry backoff elapsed),
+  //  - addressed to this runner or unpinned,
+  //  - region matches this runner's country or is unpinned,
+  //  - ordered by priority, then region-locality, then age.
+  const job = await c.env.DB.prepare(
+    "SELECT * FROM scan_jobs WHERE status = 'pending' " +
+    "AND next_eligible_at <= ? " +
+    "AND (runner = ? OR runner = 'default' OR runner IS NULL OR runner = '') " +
+    "AND (region IS NULL OR region = '' OR region = ?) " +
+    "ORDER BY priority DESC, CASE WHEN region = ? THEN 0 ELSE 1 END, created_at ASC LIMIT 1"
+  ).bind(nowSecs, runner, country, country).first();
+
   if (!job) {
     return c.json({ job: null });
   }
 
-  // Mark as running
-  await c.env.DB.prepare(
-    "UPDATE scan_jobs SET status = 'running', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
-  ).bind(job.id).run();
+  // Atomic claim: only succeeds if the row is still pending, so two runners
+  // racing for the same job cannot both win it.
+  const claim = await c.env.DB.prepare(
+    "UPDATE scan_jobs SET status = 'running', assigned_runner = ?, started_at = ?, " +
+    "attempts = attempts + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') " +
+    "WHERE id = ? AND status = 'pending'"
+  ).bind(runner, nowSecs, job.id).run();
+
+  if (!claim.meta || claim.meta.changes !== 1) {
+    // Lost the race; the runner will poll again shortly.
+    return c.json({ job: null, reason: 'contended' });
+  }
+
+  job.status = 'running';
+  job.assigned_runner = runner;
+  job.attempts = (job.attempts || 0) + 1;
+
+  // Audit the dispatch so execution is traceable to the requester and runner.
+  await auditLog(c.env, {
+    actor_user_id: job.requested_by || null,
+    actor_number_id: job.requested_by_number_id || 0,
+    actor_label: `runner:${runner}`,
+    source: 'daemon', action: 'job.dispatch', target_type: 'job', target: job.domain,
+    company_id: job.company_id || null,
+    detail: { job_id: job.id, runner, command: job.command },
+  });
 
   return c.json({ job });
 });
 
+// Lightweight keepalive so a runner busy on a long job stays "online" and its
+// in-flight work is not wrongly reclaimed. Also refreshes the running job's lease.
+app.get('/api/runner/heartbeat', async (c) => {
+  const runner = c.req.query('runner') || 'default';
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('x-real-ip') || '127.0.0.1';
+  const country = c.req.header('cf-ipcountry') || 'US';
+  await c.env.DB.prepare(
+    "INSERT INTO runners (name, ip, country, last_seen) VALUES (?, ?, ?, ?) " +
+    "ON CONFLICT(name) DO UPDATE SET ip = excluded.ip, country = excluded.country, last_seen = excluded.last_seen"
+  ).bind(runner, ip, country, nowSecs).run();
+  return c.json({ success: true, ts: nowSecs });
+});
+
 app.post('/api/runner/log', async (c) => {
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
   const { id, log } = await c.req.json();
   await c.env.DB.prepare(
     "UPDATE scan_jobs SET stdout = stdout || ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
@@ -3836,12 +6032,287 @@ app.post('/api/runner/log', async (c) => {
   return c.json({ success: true });
 });
 
+// ==========================================================================
+// Task dependency graph (DAG) orchestration
+// ==========================================================================
+
+// Evaluate one trigger rule's condition against a parent job's result JSON.
+function evalCondition(rule, result) {
+  const op = rule.cond_op || 'always';
+  if (op === 'always') return true;
+  const actual = result ? result[rule.cond_key] : undefined;
+  const val = rule.cond_value;
+  switch (op) {
+    case 'exists':
+      return actual !== undefined && actual !== null;
+    case 'eq':
+      return String(actual) === String(val);
+    case 'gt':
+      return Number(actual) > Number(val);
+    case 'gte':
+      return Number(actual) >= Number(val);
+    case 'contains':
+      if (Array.isArray(actual)) return actual.map(String).includes(String(val));
+      return String(actual ?? '').includes(String(val));
+    default:
+      return false;
+  }
+}
+
+// Build the runner command for a spawned child phase, carrying the sender id
+// through from the parent so Telegram notifications still route correctly.
+function buildPhaseCommand(jobType, domain, parentCommand) {
+  const m = (parentCommand || '').match(/--sender-id\s+(\S+)/);
+  const senderPart = m ? ` --sender-id ${m[1]}` : '';
+  return `--phase ${jobType} ${domain}${senderPart}`;
+}
+
+// When a job completes, enqueue the child jobs its result triggers.
+// Dedupe by (pipeline_id, job_type): every phase runs at most once per
+// pipeline, which also makes cycles in the rule set impossible.
+async function spawnTriggeredJobs(env, job) {
+  let result = {};
+  try { result = JSON.parse(job.result || '{}'); } catch { result = {}; }
+
+  const { results: rules } = await env.DB.prepare(
+    "SELECT * FROM trigger_rules WHERE on_job_type = ? AND enabled = 1"
+  ).bind(job.job_type || '').all();
+
+  for (const rule of rules || []) {
+    if (!evalCondition(rule, result)) continue;
+
+    // Skip if this phase already exists in the pipeline (dedupe / anti-cycle).
+    if (job.pipeline_id) {
+      const existing = await env.DB.prepare(
+        "SELECT id FROM scan_jobs WHERE pipeline_id = ? AND job_type = ? LIMIT 1"
+      ).bind(job.pipeline_id, rule.spawn_job_type).first();
+      if (existing) continue;
+    }
+
+    const childId = crypto.randomUUID();
+    const command = buildPhaseCommand(rule.spawn_job_type, job.domain, job.command);
+    await env.DB.prepare(
+      "INSERT INTO scan_jobs (id, command, domain, runner, status, job_type, pipeline_id, parent_id) " +
+      "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)"
+    ).bind(
+      childId, command, job.domain, job.runner || 'default',
+      rule.spawn_job_type, job.pipeline_id || job.id, job.id
+    ).run();
+  }
+}
+
+// Release any 'blocked' jobs in the pipeline whose dependencies are all done.
+async function releaseBlockedJobs(env, pipelineId) {
+  if (!pipelineId) return;
+  const { results: blocked } = await env.DB.prepare(
+    "SELECT * FROM scan_jobs WHERE pipeline_id = ? AND status = 'blocked'"
+  ).bind(pipelineId).all();
+
+  for (const b of blocked || []) {
+    let deps = [];
+    try { deps = JSON.parse(b.depends_on || '[]'); } catch { deps = []; }
+    if (!deps.length) { // no deps recorded -> nothing holds it
+      await env.DB.prepare("UPDATE scan_jobs SET status = 'pending', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").bind(b.id).run();
+      continue;
+    }
+    const placeholders = deps.map(() => '?').join(',');
+    const { results: unmet } = await env.DB.prepare(
+      `SELECT id FROM scan_jobs WHERE id IN (${placeholders}) AND status != 'completed'`
+    ).bind(...deps).all();
+    if (!unmet || unmet.length === 0) {
+      await env.DB.prepare("UPDATE scan_jobs SET status = 'pending', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?").bind(b.id).run();
+    }
+  }
+}
+
 app.post('/api/runner/status', async (c) => {
-  const { id, status } = await c.req.json();
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
+  const { id, status, result } = await c.req.json();
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const resultJson = (result === undefined || result === null)
+    ? null
+    : (typeof result === 'string' ? result : JSON.stringify(result));
+
+  // On failure, retry with jittered backoff until max_attempts is exhausted.
+  // A requeued job is not terminal, so it does not drive the dependency graph.
+  if (status === 'failed') {
+    const job = await c.env.DB.prepare(
+      "SELECT attempts, max_attempts FROM scan_jobs WHERE id = ?"
+    ).bind(id).first();
+
+    if (job && job.attempts < job.max_attempts) {
+      await c.env.DB.prepare(
+        "UPDATE scan_jobs SET status = 'pending', assigned_runner = NULL, started_at = NULL, " +
+        "next_eligible_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
+      ).bind(nowSecs + retryDelaySecs(job.attempts), id).run();
+      return c.json({ success: true, requeued: true, attempts: job.attempts, max_attempts: job.max_attempts });
+    }
+  }
+
+  // Terminal state (completed, or failed with no attempts left): record the
+  // result, release the lease.
   await c.env.DB.prepare(
-    "UPDATE scan_jobs SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
-  ).bind(status, id).run();
+    "UPDATE scan_jobs SET status = ?, result = COALESCE(?, result), assigned_runner = NULL, " +
+    "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
+  ).bind(status, resultJson, id).run();
+
+  // On successful completion, drive the dependency graph forward.
+  if (status === 'completed') {
+    const job = await c.env.DB.prepare("SELECT * FROM scan_jobs WHERE id = ?").bind(id).first();
+    if (job) {
+      try {
+        await spawnTriggeredJobs(c.env, job);
+        await releaseBlockedJobs(c.env, job.pipeline_id);
+      } catch (e) {
+        // Orchestration failure must not fail the status update itself.
+        console.error("DAG orchestration error:", e.message);
+      }
+    }
+  }
   return c.json({ success: true });
 });
 
-export default app;
+// Start a new pipeline: seed a single root job and let triggers cascade.
+app.post('/api/pipeline/start', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const domain = body.domain;
+  if (!domain) return c.json({ success: false, error: "domain required" }, 400);
+  const runner = body.runner || 'default';
+  const rootType = body.job_type || 'subdomain_enum';
+  const senderId = body.sender_id;
+
+  const id = crypto.randomUUID();
+  const command = buildPhaseCommand(rootType, domain, senderId ? `--sender-id ${senderId}` : '');
+  // pipeline_id = the root job's own id, so every descendant shares it.
+  await c.env.DB.prepare(
+    "INSERT INTO scan_jobs (id, command, domain, runner, status, job_type, pipeline_id) " +
+    "VALUES (?, ?, ?, ?, 'pending', ?, ?)"
+  ).bind(id, command, domain, runner, rootType, id).run();
+
+  return c.json({ success: true, pipeline_id: id, job_id: id });
+});
+
+// Inspect every job in a pipeline (for rendering the DAG + per-node status).
+app.get('/api/pipeline/:id', async (c) => {
+  const pipelineId = c.req.param('id');
+  const { results } = await c.env.DB.prepare(
+    "SELECT id, job_type, parent_id, status, result, created_at, updated_at FROM scan_jobs WHERE pipeline_id = ? ORDER BY created_at ASC"
+  ).bind(pipelineId).all();
+  return c.json({ pipeline_id: pipelineId, jobs: results || [] });
+});
+
+// List / create trigger rules (the editable dependency graph).
+app.get('/api/rules', async (c) => {
+  const { results } = await c.env.DB.prepare(
+    "SELECT * FROM trigger_rules ORDER BY on_job_type, spawn_job_type"
+  ).all();
+  return c.json({ rules: results || [] });
+});
+
+app.post('/api/rules', async (c) => {
+  const b = await c.req.json().catch(() => ({}));
+  if (!b.on_job_type || !b.spawn_job_type) {
+    return c.json({ success: false, error: "on_job_type and spawn_job_type required" }, 400);
+  }
+  const id = b.id || crypto.randomUUID();
+  await c.env.DB.prepare(
+    "INSERT INTO trigger_rules (id, on_job_type, cond_key, cond_op, cond_value, spawn_job_type, enabled) " +
+    "VALUES (?, ?, ?, ?, ?, ?, ?) " +
+    "ON CONFLICT(id) DO UPDATE SET on_job_type=excluded.on_job_type, cond_key=excluded.cond_key, " +
+    "cond_op=excluded.cond_op, cond_value=excluded.cond_value, spawn_job_type=excluded.spawn_job_type, enabled=excluded.enabled"
+  ).bind(
+    id, b.on_job_type, b.cond_key || '', b.cond_op || 'always',
+    b.cond_value != null ? String(b.cond_value) : '', b.spawn_job_type,
+    b.enabled === false ? 0 : 1
+  ).run();
+  return c.json({ success: true, id });
+});
+
+app.delete('/api/rules/:id', async (c) => {
+  await c.env.DB.prepare("DELETE FROM trigger_rules WHERE id = ?").bind(c.req.param('id')).run();
+  return c.json({ success: true });
+});
+
+// ----------------------------------------------------
+// Scheduled (Cron Trigger): dispatch due monitors
+// ----------------------------------------------------
+// Runs on the Worker cron schedule (see wrangler.json). Finds monitors whose
+// next_run_at has elapsed, enqueues scan jobs into the shared runner queue,
+// and rolls their schedule forward. Company monitors fan out to one scan per
+// distinct registrable domain known for that company.
+const scheduled = async (event, env, ctx) => {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  let due = [];
+  try {
+    const res = await env.DB.prepare(
+      "SELECT * FROM monitors WHERE enabled = 1 AND (next_run_at IS NULL OR next_run_at <= ?) ORDER BY next_run_at ASC LIMIT 50"
+    ).bind(nowIso).all();
+    due = res.results || [];
+  } catch (err) {
+    console.error("scheduled: monitor query failed:", err.message);
+    return;
+  }
+
+  if (due.length === 0) return;
+
+  let bot = null;
+  try { bot = getBot(env); } catch { /* alerts are best-effort */ }
+
+  for (const m of due) {
+    try {
+      // Resolve the concrete scan targets for this monitor.
+      let targets = [m.target];
+      if (m.target_type === "company") {
+        try {
+          const dres = await env.DB.prepare(
+            "SELECT d.host FROM domains d " +
+            "JOIN companies c ON d.company_id = c.id " +
+            "WHERE lower(c.slug) = lower(?) OR lower(c.name) = lower(?)"
+          ).bind(m.target, m.target).all();
+          const bases = new Set();
+          for (const row of (dres.results || [])) {
+            if (row.host) bases.add(registrableBase(row.host));
+          }
+          if (bases.size > 0) targets = Array.from(bases);
+        } catch (err) {
+          console.error("scheduled: company expansion failed:", err.message);
+        }
+      }
+
+      const jobIds = [];
+      for (const t of targets) {
+        const command = buildMonitorCommand(m, t);
+        const jobId = crypto.randomUUID();
+        await env.DB.prepare(
+          "INSERT INTO scan_jobs (id, command, domain, runner, status) VALUES (?, ?, ?, ?, 'pending')"
+        ).bind(jobId, command, t, m.runner || "default").run();
+        jobIds.push(jobId);
+      }
+
+      const nextIso = new Date(nowMs + (m.interval_minutes || 1440) * 60000).toISOString();
+      await env.DB.prepare(
+        "UPDATE monitors SET last_run_at = ?, next_run_at = ?, last_job_id = ? WHERE id = ?"
+      ).bind(nowIso, nextIso, jobIds[0] || null, m.id).run();
+
+      if (bot) {
+        const scope = targets.length > 1 ? ` (${targets.length} domains)` : "";
+        await bot.api.sendMessage(
+          m.owner_chat_id,
+          `🛰️ <b>Scheduled scan queued</b> for <code>${escapeHtml(m.target)}</code>${scope}\n` +
+          `• Scan: <code>${m.scan_type}</code>\n` +
+          `• Next run: ${nextIso.replace("T", " ").slice(0, 16)}`,
+          { parse_mode: "HTML" }
+        ).catch(() => {});
+      }
+    } catch (err) {
+      console.error(`scheduled: failed to dispatch monitor ${m.id}:`, err.message);
+    }
+  }
+};
+
+export default {
+  fetch: app.fetch,
+  scheduled,
+};

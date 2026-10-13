@@ -25,10 +25,86 @@ def init_db():
     with open(schema_path, "r") as f:
         schema_sql = f.read()
     
+    # Migrate FIRST: CREATE TABLE IF NOT EXISTS never alters an already-present
+    # table, and schema.sql builds indexes on the new scan_jobs columns — those
+    # CREATE INDEX statements would fail on a legacy table whose columns haven't
+    # been backfilled yet. On a fresh DB the tables don't exist, so migrate_db
+    # is a no-op and executescript creates everything (columns included).
+    migrate_db(conn)
+
     cursor.executescript(schema_sql)
+
+    # Idempotent upgrade of pre-existing local.db to the DAG schema.
+    # CREATE TABLE IF NOT EXISTS above is a no-op on an existing table, so
+    # the new columns must be added explicitly.
+    for ddl in (
+        "ALTER TABLE scan_jobs ADD COLUMN job_type TEXT",
+        "ALTER TABLE scan_jobs ADD COLUMN pipeline_id TEXT",
+        "ALTER TABLE scan_jobs ADD COLUMN parent_id TEXT",
+        "ALTER TABLE scan_jobs ADD COLUMN result TEXT DEFAULT '{}'",
+        "ALTER TABLE scan_jobs ADD COLUMN depends_on TEXT DEFAULT '[]'",
+    ):
+        try:
+            cursor.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # column already present
+
     conn.commit()
     conn.close()
     print("Database initialized successfully.")
+
+def _columns(cursor, table):
+    try:
+        cursor.execute(f"PRAGMA table_info({table})")
+        return {row[1] for row in cursor.fetchall()}
+    except sqlite3.Error:
+        return set()
+
+def migrate_db(conn):
+    """Idempotently add columns introduced after a DB was first created."""
+    cursor = conn.cursor()
+    additions = {
+        "users": [("role", "TEXT DEFAULT 'pending'")],
+        "scan_jobs": [
+            ("requested_by", "TEXT"),
+            ("requested_by_number_id", "INTEGER"),
+            ("company_id", "TEXT"),
+            ("source", "TEXT DEFAULT 'telegram'"),
+        ],
+    }
+    for table, cols in additions.items():
+        existing = _columns(cursor, table)
+        if not existing:
+            continue  # table doesn't exist yet; executescript will have made it
+        for name, decl in cols:
+            if name not in existing:
+                try:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                except sqlite3.Error as e:
+                    print(f"migration warning ({table}.{name}): {e}")
+    conn.commit()
+
+def write_audit(action, actor_label=None, actor_number_id=0, source='cli',
+                decision='allow', target_type=None, target=None, company_id=None,
+                detail=None):
+    """Append one row to the local audit_log. Best-effort; never raises."""
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO audit_log
+                 (id, actor_user_id, actor_number_id, actor_label, source, action,
+                  decision, target_type, target, company_id, detail)
+               VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(uuid.uuid4()), int(actor_number_id or 0), actor_label, source, action,
+             decision, target_type, target, company_id,
+             json.dumps(detail or {})),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        # Audit failures must not break a scan.
+        sys.stderr.write(f"audit write failed: {e}\n")
 
 def save_job(job_file):
     try:
@@ -51,14 +127,18 @@ def save_job(job_file):
     if row:
         cursor.execute("""
             UPDATE scan_jobs
-            SET command = ?, domain = ?, runner = ?, status = ?, updated_at = ?
+            SET command = ?, domain = ?, runner = ?, status = ?,
+                job_type = ?, pipeline_id = ?, parent_id = ?, updated_at = ?
             WHERE id = ?
-        """, (job['command'], job['domain'], job.get('runner', 'default'), job['status'], now, job['id']))
+        """, (job['command'], job['domain'], job.get('runner', 'default'), job['status'],
+              job.get('job_type'), job.get('pipeline_id'), job.get('parent_id'), now, job['id']))
     else:
         cursor.execute("""
-            INSERT INTO scan_jobs (id, command, domain, runner, status, stdout, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (job['id'], job['command'], job['domain'], job.get('runner', 'default'), job['status'], job.get('stdout', ''), now, now))
+            INSERT INTO scan_jobs (id, command, domain, runner, status, stdout,
+                                   job_type, pipeline_id, parent_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (job['id'], job['command'], job['domain'], job.get('runner', 'default'), job['status'],
+              job.get('stdout', ''), job.get('job_type'), job.get('pipeline_id'), job.get('parent_id'), now, now))
     
     conn.commit()
     conn.close()
@@ -81,15 +161,26 @@ def append_log(job_id, log_base64):
     conn.commit()
     conn.close()
 
-def update_status(job_id, status):
+def update_status(job_id, status, result=None):
     conn = get_db()
     cursor = conn.cursor()
     now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
-    cursor.execute("""
-        UPDATE scan_jobs
-        SET status = ?, updated_at = ?
-        WHERE id = ?
-    """, (status, now, job_id))
+    if result:
+        try:
+            cursor.execute("""
+                UPDATE scan_jobs
+                SET status = ?, result = ?, updated_at = ?
+                WHERE id = ?
+            """, (status, result, now, job_id))
+        except sqlite3.OperationalError:
+            # 'result' column missing on a stale db; fall back to status only.
+            cursor.execute("UPDATE scan_jobs SET status = ?, updated_at = ? WHERE id = ?", (status, now, job_id))
+    else:
+        cursor.execute("""
+            UPDATE scan_jobs
+            SET status = ?, updated_at = ?
+            WHERE id = ?
+        """, (status, now, job_id))
     conn.commit()
     conn.close()
 
@@ -1250,6 +1341,597 @@ def get_db_summary():
     conn.close()
     return summary
 
+# Risk scoring: weighted contribution of each open finding/secret by severity.
+SEVERITY_WEIGHTS = {'critical': 10, 'high': 6, 'medium': 3, 'low': 1, 'info': 0}
+
+
+def _redact_secret(snippet):
+    """Mask the middle of a credential match so search results don't leak the
+    raw value. Keeps a few leading/trailing chars for recognisability."""
+    if not snippet:
+        return ""
+    s = str(snippet)
+    if len(s) <= 12:
+        return s[:2] + "***"
+    return s[:4] + "***" + s[-4:]
+
+
+def _risk_scores(conn, min_score=0.0):
+    """Derive a per-target (company) risk score from open findings and secrets.
+
+    No risk column is stored; the score is aggregated on demand as the weighted
+    sum of open findings and secrets by severity. Returns targets ordered by
+    score descending, filtered to score >= min_score.
+    """
+    cursor = conn.cursor()
+    scores = {}  # company_id -> dict
+
+    cursor.execute("SELECT id, name, slug FROM companies")
+    for r in cursor.fetchall():
+        scores[r['id']] = {
+            "company_id": r['id'], "name": r['name'], "slug": r['slug'],
+            "score": 0.0, "findings": 0, "secrets": 0,
+            "by_severity": {k: 0 for k in SEVERITY_WEIGHTS},
+        }
+
+    cursor.execute("SELECT company_id, severity, COUNT(*) AS n FROM findings WHERE status = 'open' AND company_id IS NOT NULL GROUP BY company_id, severity")
+    for r in cursor.fetchall():
+        t = scores.get(r['company_id'])
+        if not t:
+            continue
+        sev = (r['severity'] or 'info').lower()
+        t['score'] += SEVERITY_WEIGHTS.get(sev, 0) * r['n']
+        t['findings'] += r['n']
+        if sev in t['by_severity']:
+            t['by_severity'][sev] += r['n']
+
+    # Secrets have no company_id column; join through the owning domain.
+    cursor.execute("""
+        SELECT d.company_id AS cid, s.severity AS severity, COUNT(*) AS n
+        FROM secrets s JOIN domains d ON s.domain_id = d.id
+        WHERE s.status = 'open' AND d.company_id IS NOT NULL
+        GROUP BY d.company_id, s.severity
+    """)
+    for r in cursor.fetchall():
+        t = scores.get(r['cid'])
+        if not t:
+            continue
+        sev = (r['severity'] or 'high').lower()
+        t['score'] += SEVERITY_WEIGHTS.get(sev, 0) * r['n']
+        t['secrets'] += r['n']
+
+    results = [t for t in scores.values() if t['score'] >= min_score]
+    results.sort(key=lambda t: t['score'], reverse=True)
+    return results
+
+
+def search_results(term, kind='all', limit=100):
+    """Search stored recon results across hosts, services, tech stack, exposed
+    credential patterns, findings, and derived risk score.
+
+    kind: all | domain | service | tech | secret | finding | risk | asn
+      - risk: `term` is a minimum risk score (number); returns ranked targets.
+      - asn: not captured by the pipeline yet; falls back to a service/host
+        keyword match and flags the gap in the response.
+
+    Credential match snippets are redacted in results. Returns a dict with a
+    `results` map keyed by category plus a `counts` summary.
+    """
+    kind = (kind or 'all').lower()
+    like = f"%{term}%"
+    out = {}
+    conn = get_db()
+    cursor = conn.cursor()
+
+    if kind == 'risk':
+        try:
+            min_score = float(term)
+        except (TypeError, ValueError):
+            min_score = 0.0
+        out['risk'] = _risk_scores(conn, min_score)[:limit]
+        conn.close()
+        return {"query": term, "kind": kind, "counts": {"risk": len(out['risk'])}, "results": out}
+
+    note = None
+    if kind == 'asn':
+        note = ("ASN is not captured by the recon pipeline yet; matching hosts "
+                "and network services on the term instead.")
+        kind = 'all'
+
+    if kind in ('all', 'domain'):
+        cursor.execute("""
+            SELECT d.host, d.canonical_url, d.data, c.slug AS company
+            FROM domains d LEFT JOIN companies c ON d.company_id = c.id
+            WHERE lower(d.host) LIKE lower(?) OR lower(d.data) LIKE lower(?)
+            ORDER BY d.host LIMIT ?
+        """, (like, like, limit))
+        hits = []
+        for r in cursor.fetchall():
+            try:
+                data = json.loads(r['data'] or '{}')
+            except Exception:
+                data = {}
+            hits.append({
+                "host": r['host'], "company": r['company'],
+                "webserver": data.get('webserver', ''),
+                "status_code": data.get('status_code'),
+                "tech": data.get('tech', []),
+                "title": data.get('title', ''),
+            })
+        out['domains'] = hits
+
+    if kind in ('all', 'tech'):
+        # tech stack lives in domains.data.tech (JSON array)
+        cursor.execute("""
+            SELECT d.host, d.data, c.slug AS company
+            FROM domains d LEFT JOIN companies c ON d.company_id = c.id
+            WHERE lower(d.data) LIKE lower(?)
+            ORDER BY d.host LIMIT ?
+        """, (f'%"tech"%{term}%', limit))
+        hits = []
+        for r in cursor.fetchall():
+            try:
+                tech = json.loads(r['data'] or '{}').get('tech', [])
+            except Exception:
+                tech = []
+            matched = [t for t in tech if term.lower() in str(t).lower()]
+            if matched:
+                hits.append({"host": r['host'], "company": r['company'], "tech": tech, "matched": matched})
+        out['tech'] = hits
+
+    if kind in ('all', 'service'):
+        cursor.execute("""
+            SELECT d.host, ns.ip, ns.port, ns.protocol, ns.service, ns.product, ns.version, ns.banner
+            FROM network_services ns JOIN domains d ON ns.domain_id = d.id
+            WHERE lower(ns.service) LIKE lower(?) OR lower(ns.product) LIKE lower(?)
+               OR lower(ns.version) LIKE lower(?) OR lower(ns.banner) LIKE lower(?)
+               OR lower(ns.ip) LIKE lower(?) OR lower(d.host) LIKE lower(?)
+            ORDER BY ns.port LIMIT ?
+        """, (like, like, like, like, like, like, limit))
+        out['services'] = [dict(r) for r in cursor.fetchall()]
+
+    if kind in ('all', 'secret'):
+        cursor.execute("""
+            SELECT s.rule_name, s.secret_type, s.match_snippet, s.file_url, s.severity, s.status, d.host
+            FROM secrets s JOIN domains d ON s.domain_id = d.id
+            WHERE lower(s.rule_name) LIKE lower(?) OR lower(s.secret_type) LIKE lower(?)
+            ORDER BY s.created_at DESC LIMIT ?
+        """, (like, like, limit))
+        hits = []
+        for r in cursor.fetchall():
+            row = dict(r)
+            row['match_snippet'] = _redact_secret(row.get('match_snippet'))
+            hits.append(row)
+        out['secrets'] = hits
+
+    if kind in ('all', 'finding'):
+        cursor.execute("""
+            SELECT f.tool, f.severity, f.vuln_type, f.title, f.url, f.cve, f.status, d.host
+            FROM findings f JOIN domains d ON f.domain_id = d.id
+            WHERE lower(f.title) LIKE lower(?) OR lower(f.vuln_type) LIKE lower(?)
+               OR lower(f.cve) LIKE lower(?) OR lower(f.tool) LIKE lower(?)
+            ORDER BY CASE lower(f.severity) WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END, f.created_at DESC
+            LIMIT ?
+        """, (like, like, like, like, limit))
+        out['findings'] = [dict(r) for r in cursor.fetchall()]
+
+    conn.close()
+    resp = {
+        "query": term, "kind": kind,
+        "counts": {k: len(v) for k, v in out.items()},
+        "results": out,
+    }
+    if note:
+        resp['note'] = note
+    return resp
+
+
+# ======================================================================
+# Continuous Attack-Surface Monitoring — Drift Detection
+# ======================================================================
+#
+# After a (re)scan completes, detect_drift() compares the current attack
+# surface of a target against a rolling, runner-local baseline stored in
+# `surface_assets`. Newly appeared assets are recorded in `drift_events`
+# and, when a Telegram chat id is supplied, pushed as an alert.
+#
+# Four asset kinds are tracked:
+#   subdomain   — hosts synced into the local `domains` table
+#   port        — ip:port pairs from `network_services`
+#   tls_cert    — certificates seen in Certificate Transparency (crt.sh)
+#   cloud_asset — subdomains CNAME-pointing at known cloud providers
+#
+# The first time a kind is seen for a target it only seeds the baseline
+# (no alert); subsequent runs alert on genuinely new assets.
+
+# Ordered (most-specific first) CNAME substring -> cloud provider map.
+_CLOUD_CNAME_PROVIDERS = [
+    ("blob.core.windows.net", "Azure Blob Storage"),
+    ("azurewebsites.net", "Azure App Service"),
+    ("trafficmanager.net", "Azure Traffic Manager"),
+    ("azureedge.net", "Azure CDN"),
+    ("cloudapp.azure.com", "Azure"),
+    ("cloudapp.net", "Azure"),
+    ("s3-website", "AWS S3 Website"),
+    ("s3.amazonaws.com", "AWS S3"),
+    ("elb.amazonaws.com", "AWS ELB"),
+    ("cloudfront.net", "AWS CloudFront"),
+    ("amazonaws.com", "AWS"),
+    ("storage.googleapis.com", "GCP Cloud Storage"),
+    ("appspot.com", "GCP App Engine"),
+    ("run.app", "GCP Cloud Run"),
+    ("ghs.google", "Google"),
+    ("googleusercontent.com", "Google"),
+    ("herokudns.com", "Heroku"),
+    ("herokuapp.com", "Heroku"),
+    ("github.io", "GitHub Pages"),
+    ("pages.dev", "Cloudflare Pages"),
+    ("workers.dev", "Cloudflare Workers"),
+    ("cloudflare.net", "Cloudflare"),
+    ("netlify.app", "Netlify"),
+    ("netlify.com", "Netlify"),
+    ("vercel.app", "Vercel"),
+    ("vercel-dns.com", "Vercel"),
+    ("fastly.net", "Fastly"),
+    ("fastlylb.net", "Fastly"),
+    ("digitaloceanspaces.com", "DigitalOcean Spaces"),
+    ("ondigitalocean.app", "DigitalOcean"),
+    ("readthedocs.io", "ReadTheDocs"),
+]
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+
+
+def _normalize_target(target):
+    t = (target or "").strip().lower()
+    t = re.sub(r'^[a-z]+://', '', t)   # strip scheme
+    t = t.rstrip('/')
+    # Strip a URL path but preserve a CIDR suffix (/<digits> at end).
+    t = re.sub(r'/(?!\d+$).*$', '', t)
+    return t
+
+
+def _looks_like_domain(target):
+    return bool(re.match(r'^[a-z0-9.-]+\.[a-z]{2,}$', target or ''))
+
+
+def _resolve_company_id(conn, target):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT c.id FROM companies c
+        LEFT JOIN domains d ON d.company_id = c.id
+        WHERE lower(c.slug) = ? OR lower(c.name) = ? OR lower(d.host) = ?
+        LIMIT 1
+        """,
+        (target, target, target),
+    )
+    row = cur.fetchone()
+    return row['id'] if row else None
+
+
+def _collect_subdomains(conn, target):
+    """Return {host: meta} for every host under the target's company."""
+    assets = {}
+    company_id = _resolve_company_id(conn, target)
+    cur = conn.cursor()
+    if company_id:
+        cur.execute("SELECT host, canonical_url FROM domains WHERE company_id = ?", (company_id,))
+    else:
+        cur.execute("SELECT host, canonical_url FROM domains WHERE lower(host) = ?", (target,))
+    for r in cur.fetchall():
+        host = (r['host'] or '').strip().lower()
+        if host:
+            assets[host] = {"canonical_url": r['canonical_url']}
+    return assets
+
+
+def _collect_ports(conn, target):
+    """Return {'ip:port': meta} for the target (by company, host, or IP)."""
+    assets = {}
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT ns.ip, ns.port, ns.protocol, ns.service, ns.product, ns.version
+        FROM network_services ns
+        JOIN domains d ON ns.domain_id = d.id
+        LEFT JOIN companies c ON d.company_id = c.id
+        WHERE lower(d.host) = ? OR lower(c.slug) = ? OR lower(c.name) = ? OR ns.ip = ?
+        """,
+        (target, target, target, target),
+    )
+    for r in cur.fetchall():
+        ip = (r['ip'] or '').strip()
+        port = r['port']
+        if not ip or port is None:
+            continue
+        key = f"{ip}:{port}"
+        assets[key] = {
+            "ip": ip,
+            "port": port,
+            "protocol": r['protocol'],
+            "service": r['service'],
+            "product": r['product'],
+            "version": r['version'],
+        }
+    return assets
+
+
+def _collect_tls_certs(target):
+    """Best-effort Certificate Transparency lookup via crt.sh. {serial: meta}."""
+    if not _looks_like_domain(target):
+        return {}
+    import urllib.request
+    import urllib.parse
+
+    assets = {}
+    url = "https://crt.sh/?q=" + urllib.parse.quote("%." + target) + "&output=json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "cHack-monitor"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        entries = json.loads(raw)
+    except Exception:
+        return {}
+
+    for e in entries[:800]:
+        try:
+            serial = (e.get("serial_number") or "").strip()
+            key = serial or f"crtsh-{e.get('id')}"
+            if not key or key in assets:
+                continue
+            names = (e.get("name_value") or "").replace("\n", ",")
+            assets[key] = {
+                "cn": e.get("common_name") or "",
+                "sans": names[:300],
+                "not_after": e.get("not_after") or "",
+                "issuer": (e.get("issuer_name") or "")[:120],
+            }
+        except Exception:
+            continue
+    return assets
+
+
+def _doh_cname(host):
+    """Resolve the CNAME target for host via DNS-over-HTTPS. Returns str or ''."""
+    import urllib.request
+    import urllib.parse
+
+    url = "https://dns.google/resolve?name=" + urllib.parse.quote(host) + "&type=CNAME"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "cHack-monitor"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return ""
+    for ans in (data.get("Answer") or []):
+        if ans.get("type") == 5:  # CNAME
+            return (ans.get("data") or "").rstrip(".").lower()
+    return ""
+
+
+def _classify_cloud(cname):
+    if not cname:
+        return None
+    for needle, provider in _CLOUD_CNAME_PROVIDERS:
+        if needle in cname:
+            return provider
+    return None
+
+
+def _collect_cloud_assets(hosts):
+    """Classify hosts whose CNAME points at a known cloud provider.
+
+    Returns {'host -> provider': meta}. Best-effort; disabled when
+    CHACK_DRIFT_CLOUD=0. Capped to keep DoH volume bounded.
+    """
+    if os.environ.get("CHACK_DRIFT_CLOUD", "1") == "0":
+        return {}
+    hosts = sorted(hosts)[:200]
+    if not hosts:
+        return {}
+
+    assets = {}
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            cnames = list(pool.map(_doh_cname, hosts))
+    except Exception:
+        cnames = [_doh_cname(h) for h in hosts]
+
+    for host, cname in zip(hosts, cnames):
+        provider = _classify_cloud(cname)
+        if provider:
+            assets[f"{host} -> {provider}"] = {"host": host, "cname": cname, "provider": provider}
+    return assets
+
+
+def _send_telegram(chat_id, html):
+    """Best-effort Telegram push. Token read from TELEGRAM_BOT_TOKEN env."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token or not chat_id:
+        return False
+    import urllib.request
+    import urllib.parse
+
+    payload = urllib.parse.urlencode({
+        "chat_id": str(chat_id),
+        "text": html,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=payload)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+        return True
+    except Exception:
+        return False
+
+
+def _esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _diff_kind(conn, target, scan_type, kind, current):
+    """Diff `current` {key: meta} against the baseline for (target, kind).
+
+    Returns (new_items, is_baseline). Updates surface_assets and
+    drift_events. On a baseline (first time this kind is seen for the
+    target) nothing is reported as new.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) AS n FROM surface_assets WHERE target = ? AND asset_kind = ?",
+        (target, kind),
+    )
+    had_baseline = cur.fetchone()['n'] > 0
+
+    # Existing keys for this (target, kind)
+    cur.execute(
+        "SELECT asset_key FROM surface_assets WHERE target = ? AND asset_kind = ?",
+        (target, kind),
+    )
+    known = {r['asset_key'] for r in cur.fetchall()}
+
+    now = _now_iso()
+    new_items = []
+    for key, meta in current.items():
+        meta_json = json.dumps(meta, default=str)
+        if key in known:
+            cur.execute(
+                "UPDATE surface_assets SET last_seen = ?, asset_meta = ? "
+                "WHERE target = ? AND asset_kind = ? AND asset_key = ?",
+                (now, meta_json, target, kind, key),
+            )
+            continue
+        # Insert into inventory
+        cur.execute(
+            "INSERT OR IGNORE INTO surface_assets "
+            "(id, target, asset_kind, asset_key, asset_meta, first_seen, last_seen) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), target, kind, key, meta_json, now, now),
+        )
+        if had_baseline:
+            new_items.append((key, meta))
+            cur.execute(
+                "INSERT INTO drift_events "
+                "(id, target, scan_type, asset_kind, change_type, asset_key, asset_meta, alerted, detected_at) "
+                "VALUES (?, ?, ?, ?, 'new', ?, ?, 0, ?)",
+                (str(uuid.uuid4()), target, scan_type, kind, key, meta_json, now),
+            )
+    return new_items, (not had_baseline)
+
+
+def _format_drift_alert(target, scan_type, buckets):
+    labels = {
+        "subdomain": ("🌐", "New subdomains"),
+        "port": ("🔌", "Newly exposed ports"),
+        "tls_cert": ("📜", "New TLS certificates"),
+        "cloud_asset": ("☁️", "New cloud assets"),
+    }
+    lines = [
+        "🛰️ <b>Attack Surface Drift Detected</b>",
+        f"Target: <code>{_esc(target)}</code> · scan: <code>{_esc(scan_type)}</code>",
+    ]
+    for kind in ("subdomain", "port", "tls_cert", "cloud_asset"):
+        items = buckets.get(kind) or []
+        if not items:
+            continue
+        icon, label = labels[kind]
+        lines.append(f"\n{icon} <b>{label} ({len(items)})</b>")
+        for key, meta in items[:15]:
+            if kind == "port":
+                svc = meta.get("service") or ""
+                lines.append(f"• <code>{_esc(key)}</code>" + (f" ({_esc(svc)})" if svc else ""))
+            elif kind == "tls_cert":
+                cn = meta.get("cn") or (meta.get("sans") or "").split(",")[0]
+                exp = meta.get("not_after") or ""
+                extra = f" (exp {_esc(exp[:10])})" if exp else ""
+                lines.append(f"• {_esc(cn) or _esc(key)}{extra}")
+            else:
+                lines.append(f"• <code>{_esc(key)}</code>")
+        if len(items) > 15:
+            lines.append(f"  …and {len(items) - 15} more")
+    return "\n".join(lines)
+
+
+def detect_drift(target, scan_type="scan", sender_id=None):
+    """Compare current attack surface to the baseline and alert on drift.
+
+    Returns a summary dict. Alerts via Telegram when sender_id is set and
+    genuine (non-baseline) drift is found.
+    """
+    norm = _normalize_target(target)
+    conn = get_db()
+    # Ensure monitoring tables exist even on older databases.
+    try:
+        init_tables = conn.cursor()
+        init_tables.executescript(
+            "CREATE TABLE IF NOT EXISTS surface_assets (id TEXT PRIMARY KEY, target TEXT NOT NULL, "
+            "asset_kind TEXT NOT NULL, asset_key TEXT NOT NULL, asset_meta TEXT DEFAULT '{}', "
+            "first_seen TEXT, last_seen TEXT);"
+            "CREATE UNIQUE INDEX IF NOT EXISTS surface_assets_uq ON surface_assets(target, asset_kind, asset_key);"
+            "CREATE TABLE IF NOT EXISTS drift_events (id TEXT PRIMARY KEY, target TEXT NOT NULL, "
+            "scan_type TEXT, asset_kind TEXT NOT NULL, change_type TEXT NOT NULL DEFAULT 'new', "
+            "asset_key TEXT NOT NULL, asset_meta TEXT DEFAULT '{}', alerted INTEGER NOT NULL DEFAULT 0, "
+            "detected_at TEXT);"
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+    subdomains = _collect_subdomains(conn, norm)
+    ports = _collect_ports(conn, norm)
+    certs = _collect_tls_certs(norm)
+    cloud = _collect_cloud_assets(set(subdomains.keys()))
+
+    buckets = {}
+    baseline_kinds = []
+    for kind, current in (
+        ("subdomain", subdomains),
+        ("port", ports),
+        ("tls_cert", certs),
+        ("cloud_asset", cloud),
+    ):
+        if not current:
+            continue  # nothing collected this run → never a removal, skip
+        new_items, is_baseline = _diff_kind(conn, norm, scan_type, kind, current)
+        if is_baseline:
+            baseline_kinds.append(kind)
+        if new_items:
+            buckets[kind] = new_items
+
+    conn.commit()
+
+    total_new = sum(len(v) for v in buckets.values())
+    alerted = False
+    if sender_id and total_new > 0:
+        msg = _format_drift_alert(norm, scan_type, buckets)
+        if _send_telegram(sender_id, msg):
+            alerted = True
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE drift_events SET alerted = 1 WHERE target = ? AND alerted = 0",
+                (norm,),
+            )
+            conn.commit()
+    conn.close()
+
+    summary = {
+        "target": norm,
+        "scan_type": scan_type,
+        "baseline_seeded": baseline_kinds,
+        "new": {k: len(v) for k, v in buckets.items()},
+        "total_new": total_new,
+        "alerted": alerted,
+    }
+    return summary
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: db_sqlite.py <command> [args...]")
@@ -1259,6 +1941,22 @@ def main():
 
     if cmd == 'init':
         init_db()
+    elif cmd == 'audit':
+        # Usage: db_sqlite.py audit <action> <source> <actor_label> <actor_number_id> \
+        #                          [target_type] [target] [decision]
+        if len(sys.argv) < 6:
+            print("Usage: db_sqlite.py audit <action> <source> <actor_label> <actor_number_id> "
+                  "[target_type] [target] [decision]")
+            sys.exit(1)
+        write_audit(
+            action=sys.argv[2],
+            source=sys.argv[3],
+            actor_label=sys.argv[4],
+            actor_number_id=sys.argv[5],
+            target_type=(sys.argv[6] if len(sys.argv) > 6 else None),
+            target=(sys.argv[7] if len(sys.argv) > 7 else None),
+            decision=(sys.argv[8] if len(sys.argv) > 8 else 'allow'),
+        )
     elif cmd == 'save_job':
         if len(sys.argv) < 3:
             print("Usage: db_sqlite.py save_job <job_file>")
@@ -1271,9 +1969,10 @@ def main():
         append_log(sys.argv[2], sys.argv[3])
     elif cmd == 'update_status':
         if len(sys.argv) < 4:
-            print("Usage: db_sqlite.py update_status <job_id> <status>")
+            print("Usage: db_sqlite.py update_status <job_id> <status> [result_json]")
             sys.exit(1)
-        update_status(sys.argv[2], sys.argv[3])
+        result_arg = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+        update_status(sys.argv[2], sys.argv[3], result_arg)
     elif cmd == 'graphql':
         if len(sys.argv) < 4:
             print("Usage: db_sqlite.py graphql <in_file> <res_file>")
@@ -1336,6 +2035,21 @@ def main():
             print(json.dumps(report_sarif(rep, include_secrets), indent=2))
         else:
             print(json.dumps(report_stix(rep, include_secrets), indent=2))
+    elif cmd == 'search':
+        if len(sys.argv) < 3:
+            print("Usage: db_sqlite.py search <term> [kind]")
+            print("  kind: all (default) | domain | service | tech | secret | finding | risk | asn")
+            print("  risk: <term> is a minimum risk score, e.g. 'search 10 risk'")
+            sys.exit(1)
+        kind = sys.argv[3] if len(sys.argv) > 3 else 'all'
+        print(json.dumps(search_results(sys.argv[2], kind), indent=2))
+    elif cmd == 'drift':
+        if len(sys.argv) < 3:
+            print("Usage: db_sqlite.py drift <target> [scan_type] [sender_id]")
+            sys.exit(1)
+        scan_type = sys.argv[3] if len(sys.argv) > 3 else 'scan'
+        sender_id = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+        print(json.dumps(detect_drift(sys.argv[2], scan_type, sender_id), indent=2))
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)

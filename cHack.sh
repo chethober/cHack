@@ -18,6 +18,14 @@ export BACKEND_URL
 export GRAPHQL_ENDPOINT
 export RUNNER_TOKEN
 
+# Optional runner auth: when RUNNER_TOKEN is set in .env it is sent with every
+# call to the central queue so the backend can reject unregistered runners.
+# Left empty, the runner stays compatible with backends that don't enforce it.
+RUNNER_AUTH_HEADER=()
+if [ -n "$RUNNER_TOKEN" ]; then
+    RUNNER_AUTH_HEADER=(-H "X-Runner-Token: $RUNNER_TOKEN")
+fi
+
 # Concurrency & thread settings (can be overridden by env, .env, or -t/--threads)
 THREADS="${THREADS:-50}"
 
@@ -28,6 +36,14 @@ ALLOW_OUT_OF_SCOPE="${ALLOW_OUT_OF_SCOPE:-false}"
 
 # Supply chain: tool updates are opt-in (--update-tools), never silent.
 UPDATE_TOOLS="${UPDATE_TOOLS:-false}"
+
+# Opt-in active secret verification. When enabled, the JS scanner pings each
+# provider's read-only API to confirm which matched credentials are actually
+# live, promoting them to "confirmed-live" and discarding dead ones. This sends
+# captured tokens to third parties, so it is OFF by default — only enable it for
+# targets you are explicitly authorized to test. Set VERIFY_SECRETS=1 to enable.
+VERIFY_SECRETS="${VERIFY_SECRETS:-0}"
+export VERIFY_SECRETS
 
 # Ensure extended PATH includes all Go, Python, and local binaries
 if command -v go >/dev/null 2>&1; then
@@ -257,6 +273,33 @@ send_telegram_notification() {
 # NOTE: there is intentionally no manual SQL-escaping helper. All GraphQL
 # payloads are built with `jq -n --arg` (parameterized) and the Worker uses D1
 # bound parameters, so scan-derived text is never interpolated into SQL.
+
+# Continuous monitoring: compare the freshly-scanned attack surface against
+# the rolling baseline and (when a Telegram sender is set) alert on drift —
+# new subdomains, newly exposed ports, new TLS certs, new cloud assets.
+run_drift_detection() {
+    local target="$1"
+    local scan_type="$2"
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+    # Allow background local-DB mirror writes (execute_graphql uses &) to settle.
+    wait 2>/dev/null
+    log_info "Analyzing attack-surface drift for '$target' ($scan_type)..."
+    local summary
+    summary=$(TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
+        python3 "$SCRIPT_DIR/db_sqlite.py" drift "$target" "$scan_type" "${SENDER_ID:-}" 2>/dev/null)
+    if [ -z "$summary" ]; then
+        return 0
+    fi
+    local total_new
+    total_new=$(echo "$summary" | jq -r '.total_new // 0' 2>/dev/null)
+    if [ "${total_new:-0}" -gt 0 ] 2>/dev/null; then
+        log_info "🛰️  Drift detected: ${total_new} new asset(s) — $(echo "$summary" | jq -c '.new' 2>/dev/null)"
+    else
+        log_info "No attack-surface drift detected (baseline up to date)."
+    fi
+}
 
 strip_scheme() {
     echo "$1" | sed -E 's|^https?://||'
@@ -1122,7 +1165,12 @@ run_katana() {
     # 5. Deep JS Secret & Endpoint Analysis (Multi-threaded)
     if [ -s "$output_dir/js_links" ] && [ -f "$SCRIPT_DIR/js_secrets.py" ]; then
         log_info "Scanning JavaScript bundles & inline scripts for leaked secrets & API keys (concurrency: $THREADS)..."
-        python3 "$SCRIPT_DIR/js_secrets.py" "$output_dir/js_links" "$output_dir/js_findings.json" "$THREADS" 2>/dev/null || true
+        local verify_flag=""
+        if [ "$VERIFY_SECRETS" = "1" ] || [ "$VERIFY_SECRETS" = "true" ]; then
+            verify_flag="--verify"
+            log_info "Active secret verification enabled — confirming which matched credentials are live."
+        fi
+        python3 "$SCRIPT_DIR/js_secrets.py" "$output_dir/js_links" "$output_dir/js_findings.json" "$THREADS" $verify_flag 2>/dev/null || true
         
         if [ -s "$output_dir/js_findings.json" ]; then
             jq '.secrets // []' "$output_dir/js_findings.json" > "$output_dir/all_secrets.json"
@@ -1443,6 +1491,8 @@ run_info_gathering() {
     local duration=$(( $(date +%s) - start_time ))
     log_phase "Information Gathering Workflow Completed in $duration seconds."
     send_telegram_notification "🏁 <b>Info-Gathering Completed</b> for <code>$domain</code> in <b>$duration</b>s."
+
+    run_drift_detection "$domain" "infogather"
 }
 
 run_web_recon() {
@@ -1462,6 +1512,8 @@ run_web_recon() {
     run_content_discovery "$domain"
     run_nuclei "$domain"
     update_findings_results "$domain"
+
+    run_drift_detection "$domain" "web"
 }
 
 run_network_recon() {
@@ -1474,6 +1526,70 @@ run_network_recon() {
     run_naabu "$target"
     update_port_scan_results "$target"
     update_network_services_results "$target"
+
+    run_drift_detection "$target" "network"
+}
+
+# ==============================================================================
+# DAG Phase Runner — each node of the task dependency graph is one phase.
+# Emits a single machine-readable result line the runner forwards to the
+# backend, where trigger rules decide which child phases to enqueue.
+# ==============================================================================
+emit_result() {
+    # $1 = compact JSON object describing this phase's outcome
+    printf '##CHACK_RESULT## %s\n' "$1"
+}
+
+run_phase() {
+    local phase=$1
+    local domain=$2
+    local output_dir="$TARGETS_DIR/$domain"
+    mkdir -p "$output_dir"
+
+    case "$phase" in
+        subdomain_enum)
+            run_subdomain_enum "$domain"
+            emit_result "{\"job_type\":\"subdomain_enum\",\"subdomains\":$(count_lines "$output_dir/subdomains")}"
+            ;;
+        httpx|httpx_fingerprint)
+            run_httpx "$domain"
+            insert_company_and_domains "$domain"
+            update_httpx_results "$domain"
+            emit_result "{\"job_type\":\"$phase\",\"live_hosts\":$(count_lines "$output_dir/live_hosts")}"
+            ;;
+        naabu)
+            run_naabu "$domain"
+            update_port_scan_results "$domain"
+            update_network_services_results "$domain"
+            local ports_csv
+            ports_csv=$(awk -F: 'NF>1{print $2}' "$output_dir/ports" 2>/dev/null | grep -E '^[0-9]+$' | sort -un | paste -sd, -)
+            emit_result "{\"job_type\":\"naabu\",\"open_ports\":[${ports_csv}],\"ports_count\":$(count_lines "$output_dir/ports")}"
+            ;;
+        katana)
+            run_katana "$domain"
+            update_endpoints_results "$domain"
+            update_secrets_results "$domain"
+            update_js_results "$domain"
+            local js_count
+            js_count=$(jq 'length' "$output_dir/js_findings.json" 2>/dev/null || echo 0)
+            emit_result "{\"job_type\":\"katana\",\"endpoints\":$(count_lines "$output_dir/katana_raw"),\"js_files\":${js_count:-0}}"
+            ;;
+        nuclei)
+            run_nuclei "$domain"
+            update_findings_results "$domain"
+            local find_count
+            find_count=$(jq 'length' "$output_dir/all_findings.json" 2>/dev/null || echo 0)
+            emit_result "{\"job_type\":\"nuclei\",\"findings\":${find_count:-0}}"
+            ;;
+        content_discovery)
+            run_content_discovery "$domain"
+            emit_result "{\"job_type\":\"content_discovery\"}"
+            ;;
+        *)
+            log_error "Unknown phase: $phase"
+            return 1
+            ;;
+    esac
 }
 
 run_client_recon() {
@@ -1582,6 +1698,8 @@ recon() {
     send_telegram_notification "🏁 <b>Full Recon Completed</b> for <code>$domain</code>
 • Duration: <b>$duration</b>s
 • All findings, endpoints, and secrets synchronized."
+
+    run_drift_detection "$domain" "recon"
 }
 
 # ==========================================
@@ -1957,8 +2075,8 @@ tui_tool_diagnostics() {
 }
 
 tui_db_explorer() {
-    local db_keys=("1" "2" "3" "4" "5" "6" "7" "8" "0")
-    local db_icons=("🏢" "📋" "🔑" "🛡️ " "🔌" "📜" "☁️ " "🔄" "⬅️ ")
+    local db_keys=("1" "2" "3" "4" "5" "6" "7" "8" "9" "0")
+    local db_icons=("🏢" "📋" "🔑" "🛡️ " "🔌" "📜" "☁️ " "🔄" "🔍" "⬅️ ")
     local db_titles=(
         "List Targets & Companies"
         "Generate Domain Report"
@@ -1968,6 +2086,7 @@ tui_db_explorer() {
         "View Recent Scan Jobs & Logs"
         "Sync Targets to Cloudflare & SQLite"
         "Initialize / Reset SQLite Database"
+        "Search & Analytics"
         "Back to Main Menu"
     )
     local db_descs=(
@@ -1979,6 +2098,7 @@ tui_db_explorer() {
         "Inspect background runner jobs and stdout"
         "Sync on-disk targets to Cloudflare D1 & local SQLite"
         "Re-run schema.sql on local SQLite"
+        "Search hosts, services, tech, secrets, findings, risk"
         ""
     )
 
@@ -2097,6 +2217,23 @@ tui_db_explorer() {
                 tui_input "Initialize local SQLite database with schema? (y/N)" "N" "confirm_init"
                 if [[ "$confirm_init" =~ ^[Yy]$ ]]; then
                     python3 "$SCRIPT_DIR/db_sqlite.py" init
+                fi
+                tui_pause
+                ;;
+            9)
+                tui_banner
+                tui_section_header "Search & Analytics"
+                echo -e "  Search across hosts, services, tech stack, exposed credentials, and findings."
+                echo -e "  Kinds: ${TUI_CYAN}all${TUI_RESET} (default) | domain | service | tech | secret | finding | risk | asn"
+                echo -e "  For ${TUI_CYAN}risk${TUI_RESET}, enter a minimum score as the term (e.g. term=10, kind=risk)."
+                echo ""
+                local search_term search_kind
+                tui_input "Search term" "" "search_term"
+                if [ -n "$search_term" ]; then
+                    tui_input "Kind (blank = all)" "all" "search_kind"
+                    [ -z "$search_kind" ] && search_kind="all"
+                    echo ""
+                    python3 "$SCRIPT_DIR/db_sqlite.py" search "$search_term" "$search_kind" | jq '.'
                 fi
                 tui_pause
                 ;;
@@ -2261,12 +2398,14 @@ tui_daemon_runner() {
 
     python3 "$SCRIPT_DIR/db_sqlite.py" init >/dev/null 2>&1
     local keep_running=true
-    trap 'keep_running=false; log_info "\nDaemon stopped by user."; return' INT
+    runner_start_heartbeat
+    trap 'keep_running=false; runner_stop_heartbeat; log_info "\nDaemon stopped by user."; return' INT
 
     while [ "$keep_running" = true ]; do
         runner_poll_for_jobs
         sleep 5
     done
+    runner_stop_heartbeat
     trap - INT
 }
 
@@ -2476,6 +2615,7 @@ runner_send_log() {
         curl -s -X POST "$BACKEND_URL/api/runner/log" \
             -H "Authorization: Bearer $RUNNER_TOKEN" \
             -H "Content-Type: application/json" \
+            "${RUNNER_AUTH_HEADER[@]}" \
             -d "$payload" >/dev/null 2>&1
     fi
 
@@ -2487,23 +2627,72 @@ runner_send_log() {
 runner_update_status() {
     local job_id="$1"
     local status="$2"
+    local result="$3"  # optional compact JSON emitted by the phase
 
     if [ -n "$BACKEND_URL" ]; then
         local payload
-        payload=$(jq -n --arg id "$job_id" --arg status "$status" '{id: $id, status: $status}')
+        if [ -n "$result" ]; then
+            # --argjson so the result is sent as a JSON object, not a string;
+            # fall back to a plain status payload if it isn't valid JSON.
+            payload=$(jq -n --arg id "$job_id" --arg status "$status" --argjson result "$result" \
+                '{id: $id, status: $status, result: $result}' 2>/dev/null) \
+                || payload=$(jq -n --arg id "$job_id" --arg status "$status" '{id: $id, status: $status}')
+        else
+            payload=$(jq -n --arg id "$job_id" --arg status "$status" '{id: $id, status: $status}')
+        fi
         curl -s -X POST "$BACKEND_URL/api/runner/status" \
             -H "Authorization: Bearer $RUNNER_TOKEN" \
             -H "Content-Type: application/json" \
+            "${RUNNER_AUTH_HEADER[@]}" \
             -d "$payload" >/dev/null 2>&1
     fi
 
-    python3 "$SCRIPT_DIR/db_sqlite.py" update_status "$job_id" "$status" >/dev/null 2>&1
+    python3 "$SCRIPT_DIR/db_sqlite.py" update_status "$job_id" "$status" "$result" >/dev/null 2>&1
+}
+
+# Background keepalive: while the daemon is up (including during a long-running
+# job that blocks the poll loop), ping the backend so this runner stays marked
+# online and its in-flight job is not reclaimed and re-dispatched elsewhere.
+HEARTBEAT_PID=""
+runner_start_heartbeat() {
+    [ -z "$BACKEND_URL" ] && return
+    (
+        while true; do
+            curl -s "${BACKEND_URL}/api/runner/heartbeat?runner=${RUNNER_NAME}" >/dev/null 2>&1
+            sleep 30
+        done
+    ) &
+    HEARTBEAT_PID=$!
+}
+runner_stop_heartbeat() {
+    if [ -n "$HEARTBEAT_PID" ]; then
+        kill "$HEARTBEAT_PID" >/dev/null 2>&1
+        wait "$HEARTBEAT_PID" 2>/dev/null
+        HEARTBEAT_PID=""
+    fi
+}
+
+# Write a local audit entry for a scan as it begins. Source is derived from the
+# invocation context: a job carrying --sender-id originated from Telegram (and is
+# being executed by this runner); an interactive invocation is the TUI; anything
+# else is a direct CLI run. Best-effort — a failing audit never aborts a scan.
+audit_scan_start() {
+    local action="$1" target="$2"
+    local src actor num
+    if [ -n "$SENDER_ID" ]; then
+        src="telegram"; actor="tg:${SENDER_ID}"; num="$SENDER_ID"
+    elif [ -t 0 ]; then
+        src="tui"; actor="${USER:-$(id -un 2>/dev/null || echo unknown)}"; num=0
+    else
+        src="cli"; actor="${USER:-$(id -un 2>/dev/null || echo unknown)}"; num=0
+    fi
+    python3 "$SCRIPT_DIR/db_sqlite.py" audit "$action" "$src" "$actor" "$num" domain "$target" allow >/dev/null 2>&1 || true
 }
 
 runner_poll_for_jobs() {
     local url="${BACKEND_URL}/api/runner/next-job?runner=${RUNNER_NAME}"
     local res
-    res=$(curl -s -H "Authorization: Bearer $RUNNER_TOKEN" "$url")
+    res=$(curl -s "${RUNNER_AUTH_HEADER[@]}" "$url")
     if [ -z "$res" ]; then
         return
     fi
@@ -2548,21 +2737,30 @@ runner_poll_for_jobs() {
 
     python3 "$SCRIPT_DIR/db_sqlite.py" update_status "$job_id" "running" >/dev/null 2>&1
 
+    local out_file
+    out_file=$(mktemp "/tmp/chack_out_XXXXXX" 2>/dev/null || mktemp)
+
     local log_line
     eval "\"$SCRIPT_DIR/cHack.sh\" $command_str" 2>&1 | while IFS= read -r log_line || [ -n "$log_line" ]; do
         echo "$log_line"
+        printf '%s\n' "$log_line" >> "$out_file"
         runner_send_log "$job_id" "$log_line"$'\n'
     done
 
     local exit_code=${PIPESTATUS[0]}
     log_info "🏁 [Job $job_id] Process exited with code: $exit_code"
 
+    # Extract the phase result line (last one wins) for DAG trigger evaluation.
+    local result_json=""
+    result_json=$(grep -a '##CHACK_RESULT##' "$out_file" 2>/dev/null | tail -n1 | sed 's/.*##CHACK_RESULT##[[:space:]]*//')
+    rm -f "$out_file"
+
     local final_status="completed"
     if [ $exit_code -ne 0 ]; then
         final_status="failed"
     fi
 
-    runner_update_status "$job_id" "$final_status"
+    runner_update_status "$job_id" "$final_status" "$result_json"
 }
 
 main() {
@@ -2573,6 +2771,8 @@ main() {
     local FUZZ_TARGET=""
     local VULN_TARGET=""
     local CLIENT_TARGET=""
+    local PHASE=""
+    local PHASE_TARGET=""
     local PERSON=""
     local COMPANY=""
     local USERNAME=""
@@ -2668,6 +2868,12 @@ main() {
                 CLIENT_TARGET="$2"
                 shift 2
                 ;;
+            --phase)
+                if [ $# -lt 3 ]; then log_error "Option --phase requires <type> <domain>."; exit 1; fi
+                PHASE="$2"
+                PHASE_TARGET="$3"
+                shift 3
+                ;;
             -p|--person)
                 if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
                 PERSON="$2"
@@ -2755,20 +2961,29 @@ main() {
         exit 0
     fi
 
+    # Single DAG phase (dispatched by the backend dependency graph)
+    if [ -n "$PHASE" ]; then
+        run_phase "$PHASE" "$PHASE_TARGET"
+        exit $?
+    fi
+
     # Targeted Info Gathering
     if [ -n "$INFO_GATHER" ]; then
+        audit_scan_start "scan.infogather" "$INFO_GATHER"
         run_info_gathering "$INFO_GATHER"
         exit 0
     fi
 
     # Web Recon
     if [ -n "$WEB_TARGET" ]; then
+        audit_scan_start "scan.web" "$WEB_TARGET"
         run_web_recon "$WEB_TARGET"
         exit 0
     fi
 
     # Network Recon
     if [ -n "$NET_TARGET" ]; then
+        audit_scan_start "scan.network" "$NET_TARGET"
         run_network_recon "$NET_TARGET"
         exit 0
     fi
@@ -2776,6 +2991,7 @@ main() {
     # Content Fuzzing
     if [ -n "$FUZZ_TARGET" ]; then
         scope_guard "$FUZZ_TARGET" || exit 1
+        audit_scan_start "scan.content" "$FUZZ_TARGET"
         run_content_discovery "$FUZZ_TARGET"
         exit 0
     fi
@@ -2783,12 +2999,14 @@ main() {
     # Vulnerability Scan
     if [ -n "$VULN_TARGET" ]; then
         scope_guard "$VULN_TARGET" || exit 1
+        audit_scan_start "scan.vuln" "$VULN_TARGET"
         run_nuclei "$VULN_TARGET"
         exit 0
     fi
 
     # Client-side bug hunt (DOM XSS, postMessage, CORS, clickjacking, open redirect)
     if [ -n "$CLIENT_TARGET" ]; then
+        audit_scan_start "scan.client" "$CLIENT_TARGET"
         run_client_recon "$CLIENT_TARGET"
         exit 0
     fi
@@ -2799,6 +3017,7 @@ main() {
             log_error "Invalid domain format: $DOMAIN"
             exit 1
         fi
+        audit_scan_start "scan.recon" "$DOMAIN"
         recon "$DOMAIN"
         exit 0
     fi
@@ -2847,7 +3066,8 @@ main() {
     log_info "Runner Name: $RUNNER_NAME"
 
     python3 "$SCRIPT_DIR/db_sqlite.py" init >/dev/null 2>&1
-    trap 'log_info "\nExiting..."; exit 0' INT
+    runner_start_heartbeat
+    trap 'runner_stop_heartbeat; log_info "\nExiting..."; exit 0' INT
 
     while true; do
         runner_poll_for_jobs
