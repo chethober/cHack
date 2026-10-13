@@ -18,6 +18,7 @@ cHack chains the best-in-class ProjectDiscovery / recon tooling into a single, r
 - **Distributed runners** — point many VPS runners at one central queue; jobs are load-shared.
 - **Parallel execution** — port scanning and web crawling run concurrently; tunable worker threads (`-t`).
 - **JS secret mining** — dedicated scanner (`js_secrets.py`) with entropy checks, vendor filtering, and false-positive suppression.
+- **Client-side bug hunting** — dedicated analyzer (`client_bugs.py`). Static: DOM-XSS source→sink, dynamic code-exec, insecure `postMessage`, prototype pollution, framework escaping bypass (`v-html`/`trustAsHtml`), sensitive web-storage, insecure WebSocket. Active: CORS misconfig, clickjacking/security headers, open redirect, JSONP hijacking, reverse tabnabbing, mixed content.
 - **Central datastore** — per-runner SQLite synced to Cloudflare D1 for a single source of truth.
 - **Self-provisioning** — missing Go tools are auto-installed and periodically updated.
 - **Live job tracking** — stream logs, status, and executive summaries straight to Telegram.
@@ -44,6 +45,7 @@ cHack is a distributed system with three cooperating parts:
   `--daemon` that polls the central queue, executes jobs, and streams results back.
 - **`db_sqlite.py`** — each runner's local SQLite store and the sync layer to D1.
 - **`js_secrets.py`** — JavaScript secret/credential scanner used by the web-recon phase.
+- **`client_bugs.py`** — client-side bug analyzer (DOM XSS, `postMessage`, prototype pollution, CORS, clickjacking, open redirect) used by the DAST phase.
 
 ---
 
@@ -58,7 +60,7 @@ A full scan (`-d <domain>`) runs six phases; individual phases are also exposed 
 | **3** | Port & service scan | Discover open ports and network services | `naabu` |
 | **4** | Web crawl & JS secrets | Crawl, mine URLs & parameters, extract secrets from JS | `katana`, `hakrawler`, `gau`, `waybackurls`, `js_secrets.py` |
 | **5** | Content discovery | Find directories, sensitive files, and backup exposures | content & backup fuzzing |
-| **6** | Vulnerability & DAST | Template-based scanning and XSS assessment | `nuclei`, `dalfox` |
+| **6** | Vulnerability & DAST | Template scanning (`nuclei`), reflected-XSS verification on parameterized URLs (`dalfox`), and client-side bug hunting (`client_bugs.py`) |
 
 Phases 3 and 4 run **in parallel** to cut wall-clock time.
 
@@ -104,6 +106,7 @@ Missing Go tools are installed automatically on first run and refreshed weekly.
 ./cHack.sh --network 192.168.1.1/24  # port & network service scan (IP / CIDR / domain)
 ./cHack.sh --fuzz example.com        # content & backup file discovery
 ./cHack.sh --vuln example.com        # vulnerability & DAST scanning
+./cHack.sh --client example.com      # client-side bugs: DOM XSS, postMessage, CORS, clickjacking, open redirect
 ./cHack.sh -t 100 -d example.com     # tune concurrency (default: 50)
 ```
 
@@ -191,6 +194,7 @@ wrangler deploy
 cHack/
 ├── cHack.sh              # recon engine — TUI, CLI, and runner daemon
 ├── js_secrets.py         # JavaScript secret/credential scanner
+├── client_bugs.py        # Client-side bug analyzer (DOM XSS, CORS, open redirect, ...)
 ├── db_sqlite.py          # local SQLite store + D1 sync layer
 ├── install.sh            # VPS provisioning (Go, toolchain, Python deps)
 ├── back/                 # Cloudflare Worker: Telegram bot + GraphQL API
@@ -210,7 +214,7 @@ CI runs [ShellCheck](https://www.shellcheck.net/) on the shell scripts and [Ruff
 ```bash
 shellcheck cHack.sh install.sh
 ruff check .
-python3 -m py_compile js_secrets.py db_sqlite.py
+python3 -m py_compile js_secrets.py db_sqlite.py client_bugs.py
 ```
 
 ---

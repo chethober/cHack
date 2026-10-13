@@ -16,9 +16,18 @@ if [ -z "$GRAPHQL_ENDPOINT" ] && [ -n "$BACKEND_URL" ]; then
 fi
 export BACKEND_URL
 export GRAPHQL_ENDPOINT
+export RUNNER_TOKEN
 
 # Concurrency & thread settings (can be overridden by env, .env, or -t/--threads)
 THREADS="${THREADS:-50}"
+
+# Scope enforcement: refuse to scan targets outside an authorized allowlist.
+# scope.txt holds in-scope domains / IPs / CIDRs (see scope.example.txt).
+SCOPE_FILE="${SCOPE_FILE:-$SCRIPT_DIR/scope.txt}"
+ALLOW_OUT_OF_SCOPE="${ALLOW_OUT_OF_SCOPE:-false}"
+
+# Supply chain: tool updates are opt-in (--update-tools), never silent.
+UPDATE_TOOLS="${UPDATE_TOOLS:-false}"
 
 # Ensure extended PATH includes all Go, Python, and local binaries
 if command -v go >/dev/null 2>&1; then
@@ -90,25 +99,61 @@ OPTIONAL_TOOLS=(
     "nmap"
 )
 
-get_tool_package() {
+# Pinned tool versions — single source of truth for the Go toolchain.
+# Pinning prevents a compromised upstream release from silently landing on
+# every runner via `go install ...@latest`. Bump deliberately (and review the
+# changelog) rather than tracking latest. Tools without upstream release tags
+# fall back to "latest" (documented exception) via get_tool_package.
+declare -A TOOL_VERSIONS=(
+    [httpx]="v1.6.9"
+    [naabu]="v2.3.3"
+    [subfinder]="v2.6.6"
+    [katana]="v1.1.0"
+    [nuclei]="v3.3.7"
+    [dnsx]="v1.2.1"
+    [alterx]="v0.0.4"
+    [gau]="v2.2.4"
+    [dalfox]="v2.9.2"
+    [subzy]="v1.1.0"
+    [scilla]="v1.3.0"
+    [puredns]="v2.1.1"
+    [gowitness]="v3.0.5"
+    [hakrawler]="v2.1"
+    # No upstream semver release tags — pinned to latest by necessity:
+    [assetfinder]="latest"
+    [waybackurls]="latest"
+)
+
+# Returns the Go module path (without version) for a tool.
+get_tool_module() {
     case "$1" in
-        httpx) echo "github.com/projectdiscovery/httpx/cmd/httpx@latest" ;;
-        naabu) echo "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest" ;;
-        subfinder) echo "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest" ;;
-        assetfinder) echo "github.com/tomnomnom/assetfinder@latest" ;;
-        katana) echo "github.com/projectdiscovery/katana/cmd/katana@latest" ;;
-        nuclei) echo "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest" ;;
-        dnsx) echo "github.com/projectdiscovery/dnsx/cmd/dnsx@latest" ;;
-        alterx) echo "github.com/projectdiscovery/alterx/cmd/alterx@latest" ;;
-        gau) echo "github.com/lc/gau/v2/cmd/gau@latest" ;;
-        waybackurls) echo "github.com/tomnomnom/waybackurls@latest" ;;
-        hakrawler) echo "github.com/hakluke/hakrawler@latest" ;;
-        dalfox) echo "github.com/hahwul/dalfox/v2@latest" ;;
-        subzy) echo "github.com/PentestPad/subzy@latest" ;;
-        scilla) echo "github.com/edoardottt/scilla/cmd/scilla@latest" ;;
-        puredns) echo "github.com/d3mondev/puredns/v2@latest" ;;
-        gowitness) echo "github.com/sensepost/gowitness@latest" ;;
+        httpx) echo "github.com/projectdiscovery/httpx/cmd/httpx" ;;
+        naabu) echo "github.com/projectdiscovery/naabu/v2/cmd/naabu" ;;
+        subfinder) echo "github.com/projectdiscovery/subfinder/v2/cmd/subfinder" ;;
+        assetfinder) echo "github.com/tomnomnom/assetfinder" ;;
+        katana) echo "github.com/projectdiscovery/katana/cmd/katana" ;;
+        nuclei) echo "github.com/projectdiscovery/nuclei/v3/cmd/nuclei" ;;
+        dnsx) echo "github.com/projectdiscovery/dnsx/cmd/dnsx" ;;
+        alterx) echo "github.com/projectdiscovery/alterx/cmd/alterx" ;;
+        gau) echo "github.com/lc/gau/v2/cmd/gau" ;;
+        waybackurls) echo "github.com/tomnomnom/waybackurls" ;;
+        hakrawler) echo "github.com/hakluke/hakrawler" ;;
+        dalfox) echo "github.com/hahwul/dalfox/v2" ;;
+        subzy) echo "github.com/PentestPad/subzy" ;;
+        scilla) echo "github.com/edoardottt/scilla/cmd/scilla" ;;
+        puredns) echo "github.com/d3mondev/puredns/v2" ;;
+        gowitness) echo "github.com/sensepost/gowitness" ;;
     esac
+}
+
+# Returns module@version suitable for `go install`, using the pinned version.
+get_tool_package() {
+    local tool="$1"
+    local mod ver
+    mod="$(get_tool_module "$tool")"
+    [ -z "$mod" ] && return
+    ver="${TOOL_VERSIONS[$tool]:-latest}"
+    echo "${mod}@${ver}"
 }
 
 check_requirements() {
@@ -163,28 +208,36 @@ check_requirements() {
         done
     fi
 
-    # Auto-update check: run once every 7 days in the background
+    # Tool updates are opt-in (--update-tools), never silent. Pulling new
+    # versions automatically in the background is a supply-chain risk: a
+    # compromised upstream release would land on every runner without review.
+    # We only remind the operator that a review is due (every 7 days).
     local last_check_file="$SCRIPT_DIR/.last_update_check"
-    local current_time=$(date +%s)
-    local last_check=0
-    if [ -f "$last_check_file" ]; then
-        last_check=$(cat "$last_check_file" 2>/dev/null || echo 0)
-    fi
+    local current_time
+    current_time=$(date +%s)
 
-    local elapsed=$((current_time - last_check))
-    # 604800 seconds = 7 days
-    if [ $elapsed -gt 604800 ]; then
-        log_info "Periodic tool update check scheduled in the background..."
+    if [ "$UPDATE_TOOLS" = true ]; then
+        log_info "Updating Go toolchain to pinned versions (--update-tools)..."
+        for tool in "${REQUIRED_GO_TOOLS[@]}"; do
+            local pkg
+            pkg=$(get_tool_package "$tool")
+            if [ -n "$pkg" ]; then
+                log_info "Installing $tool ($pkg)..."
+                go install "$pkg" >/dev/null 2>&1 && log_info "  updated $tool" || log_warn "  failed to update $tool"
+            fi
+        done
         echo "$current_time" > "$last_check_file"
-        (
-            for tool in "${REQUIRED_GO_TOOLS[@]}"; do
-                local pkg
-                pkg=$(get_tool_package "$tool")
-                if [ -n "$pkg" ]; then
-                    go install "$pkg" >/dev/null 2>&1
-                fi
-            done
-        ) &
+    else
+        local last_check=0
+        if [ -f "$last_check_file" ]; then
+            last_check=$(cat "$last_check_file" 2>/dev/null || echo 0)
+        fi
+        local elapsed=$((current_time - last_check))
+        # 604800 seconds = 7 days
+        if [ "$elapsed" -gt 604800 ]; then
+            log_info "Tool update review is due. Review TOOL_VERSIONS and run './cHack.sh --update-tools' to apply."
+            echo "$current_time" > "$last_check_file"
+        fi
     fi
     return 0
 }
@@ -201,12 +254,87 @@ send_telegram_notification() {
     fi
 }
 
-escape_sql() {
-    echo "$1" | sed "s/'/''/g"
-}
+# NOTE: there is intentionally no manual SQL-escaping helper. All GraphQL
+# payloads are built with `jq -n --arg` (parameterized) and the Worker uses D1
+# bound parameters, so scan-derived text is never interpolated into SQL.
 
 strip_scheme() {
     echo "$1" | sed -E 's|^https?://||'
+}
+
+# Normalize a target to a bare host/ip: strip scheme, path, port, lowercase.
+normalize_target() {
+    local t="$1"
+    t="${t#http://}"; t="${t#https://}"
+    t="${t%%/*}"          # drop path
+    t="${t%%\?*}"         # drop query
+    t="${t%%:*}"          # drop port (also harmless for bare CIDR, handled below)
+    printf '%s' "${t,,}"
+}
+
+# in_scope <target> : pure matcher. Returns 0 if target matches an allowlist
+# entry in SCOPE_FILE. Requires the scope file to exist (policy is decided by
+# scope_guard). Domain entries match the host or any subdomain; IP/CIDR entries
+# match via Python's ipaddress module.
+in_scope() {
+    local raw="$1"
+    local target
+    target="$(normalize_target "$raw")"
+    [ -z "$target" ] && return 1
+    [ -f "$SCOPE_FILE" ] || return 1
+
+    local line entry
+    while IFS= read -r line || [ -n "$line" ]; do
+        entry="${line%%#*}"                         # strip comments
+        entry="$(printf '%s' "$entry" | tr -d '[:space:]')"
+        [ -z "$entry" ] && continue
+        entry="${entry,,}"
+
+        if [[ "$entry" == */* ]] || [[ "$entry" =~ ^[0-9.]+$ ]] || [[ "$entry" == *:*:* ]]; then
+            # IP or CIDR entry — only meaningful if target is an IP literal.
+            if [[ "$target" =~ ^[0-9.]+$ ]] || [[ "$target" == *:* ]]; then
+                if python3 -c 'import ipaddress,sys
+try:
+    net=ipaddress.ip_network(sys.argv[1],strict=False)
+    sys.exit(0 if ipaddress.ip_address(sys.argv[2]) in net else 1)
+except Exception:
+    sys.exit(1)' "$entry" "$target" 2>/dev/null; then
+                    return 0
+                fi
+            fi
+        else
+            # Domain entry — exact host or any subdomain.
+            if [ "$target" = "$entry" ] || [[ "$target" == *".$entry" ]]; then
+                return 0
+            fi
+        fi
+    done < "$SCOPE_FILE"
+    return 1
+}
+
+# scope_guard <target> [context] : policy decision before an active scan.
+# context "daemon" fails closed when no scope file exists; otherwise a missing
+# scope file warns and proceeds (standalone convenience). --allow-out-of-scope
+# overrides all checks. Returns non-zero when the caller must refuse.
+scope_guard() {
+    local target="$1"
+    local context="${2:-cli}"
+    [ "$ALLOW_OUT_OF_SCOPE" = true ] && return 0
+
+    if [ ! -f "$SCOPE_FILE" ]; then
+        if [ "$context" = "daemon" ]; then
+            log_error "No scope file ($SCOPE_FILE) in daemon mode — refusing to scan '$target'. Create scope.txt or pass --allow-out-of-scope."
+            return 1
+        fi
+        log_warn "No scope file ($SCOPE_FILE); proceeding. Create one (see scope.example.txt) to enforce authorized-target scope."
+        return 0
+    fi
+
+    if in_scope "$target"; then
+        return 0
+    fi
+    log_error "Refusing: '$target' is not in scope ($SCOPE_FILE). Add it or pass --allow-out-of-scope."
+    return 1
 }
 
 execute_graphql() {
@@ -234,6 +362,7 @@ execute_graphql() {
 
     if [ -n "$GRAPHQL_ENDPOINT" ]; then
         if response=$(curl -s --connect-timeout 10 -m 15 -X POST "$GRAPHQL_ENDPOINT" \
+            -H "Authorization: Bearer $RUNNER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$payload" 2>&1); then
             if ! echo "$response" | jq -e '.errors' >/dev/null 2>&1; then
@@ -1106,6 +1235,39 @@ run_content_discovery() {
 # ==============================================================================
 # PHASE 6: Vulnerability & DAST Assessment
 # ==============================================================================
+run_client_analysis() {
+    # Client-side bug hunting: static DOM-XSS/postMessage/prototype-pollution
+    # analysis of crawled JS + live CORS / clickjacking / open-redirect probing.
+    local domain=$1
+    local output_dir="$TARGETS_DIR/$domain"
+
+    if [ ! -f "$SCRIPT_DIR/client_bugs.py" ]; then
+        return
+    fi
+    if [ ! -s "$output_dir/js_links" ] && [ ! -s "$output_dir/live_hosts" ]; then
+        log_info "No JS or live hosts available for client-side analysis. Skipping."
+        return
+    fi
+
+    log_info "🔍 Client-side bug analysis (DOM XSS, postMessage, CORS, clickjacking, open redirect)..."
+    python3 "$SCRIPT_DIR/client_bugs.py" all "$output_dir" "$THREADS" 2>/dev/null || true
+
+    if [ -s "$output_dir/client_findings.json" ]; then
+        local cc
+        cc=$(jq '. | length' "$output_dir/client_findings.json" 2>/dev/null || echo 0)
+        if [ "$cc" -gt 0 ]; then
+            log_info "🧩 Client-side analysis produced $cc finding(s)."
+            local high_cc
+            high_cc=$(jq '[.[] | select(.severity=="high" or .severity=="critical")] | length' "$output_dir/client_findings.json" 2>/dev/null || echo 0)
+            if [ "$high_cc" -gt 0 ]; then
+                send_telegram_notification "🧩 <b>Client-Side Bugs Found</b> for <code>$domain</code>
+• Total: <b>$cc</b>  (high/critical: <b>$high_cc</b>)
+• DOM XSS / postMessage / CORS / open-redirect checks"
+            fi
+        fi
+    fi
+}
+
 run_nuclei() {
     local domain=$1
     local output_dir="$TARGETS_DIR/$domain"
@@ -1115,7 +1277,11 @@ run_nuclei() {
         return
     fi
 
-    log_phase "Phase 6: Vulnerability & DAST Scanning (Nuclei + Dalfox)"
+    log_phase "Phase 6: Vulnerability & DAST Scanning (Nuclei + Dalfox + Client-Side)"
+
+    # Client-side bug hunting runs alongside the server-side DAST.
+    run_client_analysis "$domain"
+
     local host_count=$(count_lines "$output_dir/live_hosts")
     log_info "Running Nuclei against $host_count targets..."
 
@@ -1156,9 +1322,74 @@ run_nuclei() {
         done < "$output_dir/nuclei.json"
     fi
 
+    # 2. Dalfox reflected/DOM XSS verification on parameterized URLs
+    if command -v dalfox >/dev/null 2>&1 && [ -s "$output_dir/params" ]; then
+        local param_count
+        param_count=$(count_lines "$output_dir/params")
+        log_info "Running Dalfox XSS verification against $param_count parameterized URLs..."
+        : > "$output_dir/dalfox.json"
+        timeout 600 dalfox file "$output_dir/params" \
+            --format json \
+            --silence \
+            --no-spinner \
+            --skip-bav \
+            --worker "$THREADS" \
+            -o "$output_dir/dalfox.json" >/dev/null 2>&1 || true
+
+        if [ -s "$output_dir/dalfox.json" ]; then
+            # Dalfox emits either a JSON array or JSON-lines depending on version;
+            # normalise both to a stream of PoC objects.
+            local dalfox_objs
+            dalfox_objs=$(jq -c 'if type=="array" then .[] else . end' "$output_dir/dalfox.json" 2>/dev/null)
+            local dfndx=0
+            while IFS= read -r dline; do
+                [ -z "$dline" ] && continue
+                local d_url d_sev d_param d_payload d_type d_cwe d_ev d_title
+                d_url=$(echo "$dline" | jq -r '.data // .url // ""' 2>/dev/null)
+                [ -z "$d_url" ] && continue
+                d_sev=$(echo "$dline" | jq -r '(.severity // "high") | ascii_downcase' 2>/dev/null)
+                d_param=$(echo "$dline" | jq -r '.param // ""' 2>/dev/null)
+                d_payload=$(echo "$dline" | jq -r '.payload // ""' 2>/dev/null)
+                d_type=$(echo "$dline" | jq -r '.inject_type // .type // "reflected"' 2>/dev/null)
+                d_cwe=$(echo "$dline" | jq -r '.cwe // ""' 2>/dev/null)
+                d_ev=$(echo "$dline" | jq -r '.evidence // .poc // .message_str // ""' 2>/dev/null)
+                case "$d_sev" in critical|high|medium|low|info) ;; *) d_sev="high" ;; esac
+                d_title="Reflected XSS ($d_type)"
+                [ -n "$d_param" ] && d_title="Reflected XSS in '$d_param' ($d_type)"
+
+                local d_item
+                d_item=$(jq -n \
+                    --arg title "$d_title" \
+                    --arg sev "$d_sev" \
+                    --arg url "$d_url" \
+                    --arg desc "Dalfox verified a cross-site scripting vector${d_param:+ via parameter '$d_param'}. ${d_cwe:+($d_cwe) }Payload: ${d_payload}" \
+                    --arg cve "" \
+                    --arg ev "$d_ev" \
+                    --arg tool "dalfox" \
+                    --arg vt "xss" \
+                    '{title: $title, severity: $sev, url: $url, description: $desc, cve: $cve, evidence: $ev, tool: $tool, vuln_type: $vt}')
+                all_findings=$(echo "$all_findings" | jq --argjson i "$d_item" '. += [$i]')
+                dfndx=$((dfndx + 1))
+            done <<< "$dalfox_objs"
+
+            if [ "$dfndx" -gt 0 ]; then
+                log_info "🚨 Dalfox confirmed $dfndx XSS vector(s)!"
+                send_telegram_notification "🎯 <b>Dalfox Confirmed XSS</b> for <code>$domain</code>
+• Verified vectors: <b>$dfndx</b>"
+            fi
+        fi
+    elif ! command -v dalfox >/dev/null 2>&1; then
+        log_warn "dalfox not installed — skipping XSS verification (run: ./cHack.sh --update-tools)."
+    fi
+
     # Merge exposure findings if present
     if [ -s "$output_dir/exposure_findings.json" ]; then
         all_findings=$(jq -s '.[0] + .[1]' <(echo "$all_findings") "$output_dir/exposure_findings.json")
+    fi
+
+    # Merge client-side findings if present
+    if [ -s "$output_dir/client_findings.json" ]; then
+        all_findings=$(jq -s '.[0] + .[1]' <(echo "$all_findings") "$output_dir/client_findings.json")
     fi
 
     echo "$all_findings" > "$output_dir/all_findings.json"
@@ -1171,6 +1402,7 @@ run_nuclei() {
 # ==============================================================================
 run_info_gathering() {
     local domain=$1
+    scope_guard "$domain" || return 1
     local start_time=$(date +%s)
     log_phase "Starting Targeted Information Gathering Workflow"
     log_info "Target: $domain"
@@ -1215,6 +1447,7 @@ run_info_gathering() {
 
 run_web_recon() {
     local domain=$1
+    scope_guard "$domain" || return 1
     local output_dir="$TARGETS_DIR/$domain"
     mkdir -p "$output_dir"
 
@@ -1233,6 +1466,7 @@ run_web_recon() {
 
 run_network_recon() {
     local target=$1
+    scope_guard "$target" || return 1
     local output_dir="$TARGETS_DIR/$target"
     mkdir -p "$output_dir"
 
@@ -1242,8 +1476,41 @@ run_network_recon() {
     update_network_services_results "$target"
 }
 
+run_client_recon() {
+    # Standalone client-side bug hunt. Reuses prior crawl data when present,
+    # otherwise performs the minimum crawl needed to feed the analyzer.
+    local domain=$1
+    scope_guard "$domain" || return 1
+    local output_dir="$TARGETS_DIR/$domain"
+    mkdir -p "$output_dir"
+
+    if [ ! -s "$output_dir/js_links" ] && [ ! -s "$output_dir/live_hosts" ]; then
+        log_info "No prior crawl data for $domain — running subdomain + httpx + crawl first..."
+        run_subdomain_enum "$domain"
+        run_httpx "$domain"
+        insert_company_and_domains "$domain"
+        update_httpx_results "$domain"
+        run_katana "$domain"
+    fi
+
+    run_client_analysis "$domain"
+
+    # Persist client findings to the DB via the standard findings pipeline.
+    if [ -s "$output_dir/client_findings.json" ]; then
+        if [ -s "$output_dir/all_findings.json" ]; then
+            jq -s '.[0] + .[1]' "$output_dir/all_findings.json" "$output_dir/client_findings.json" \
+                > "$output_dir/all_findings.json.tmp" 2>/dev/null \
+                && mv "$output_dir/all_findings.json.tmp" "$output_dir/all_findings.json"
+        else
+            cp "$output_dir/client_findings.json" "$output_dir/all_findings.json"
+        fi
+        update_findings_results "$domain"
+    fi
+}
+
 recon() {
     local domain=$1
+    scope_guard "$domain" || return 1
     local start_time=$(date +%s)
     log_phase "Starting Full Reconnaissance & DAST Pipeline"
     log_info "Target: $domain"
@@ -2173,7 +2440,16 @@ show_usage() {
     echo "  --network TARGET          Run network & port scan on IP / CIDR / domain"
     echo "  --fuzz DOMAIN             Run content & backup file discovery"
     echo "  --vuln DOMAIN             Run Nuclei & DAST vulnerability scanning"
+    echo "  --client DOMAIN           Hunt client-side bugs (DOM XSS, postMessage,"
+    echo "                            CORS, clickjacking, open redirect)"
     echo "  -t, --threads NUM         Set concurrency / worker threads (default: 50)"
+    echo "  --allow-out-of-scope      Bypass the scope.txt allowlist (use with care)"
+    echo "  --update-tools            Install/refresh the Go toolchain at pinned versions"
+    echo ""
+    echo "Reporting:"
+    echo "  --report TARGET           Export stored results for a target"
+    echo "  --format FMT              Report format: json (default) | sarif | stix"
+    echo "  --include-secrets         Include secret values in reports (default: redacted)"
     echo ""
     echo "Target & Entity Management:"
     echo "  --sync DOMAIN             Sync on-disk scan data to Cloudflare D1 & local SQLite"
@@ -2198,6 +2474,7 @@ runner_send_log() {
         local payload
         payload=$(jq -n --arg id "$job_id" --arg log "$log_data" '{id: $id, log: $log}')
         curl -s -X POST "$BACKEND_URL/api/runner/log" \
+            -H "Authorization: Bearer $RUNNER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$payload" >/dev/null 2>&1
     fi
@@ -2215,6 +2492,7 @@ runner_update_status() {
         local payload
         payload=$(jq -n --arg id "$job_id" --arg status "$status" '{id: $id, status: $status}')
         curl -s -X POST "$BACKEND_URL/api/runner/status" \
+            -H "Authorization: Bearer $RUNNER_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$payload" >/dev/null 2>&1
     fi
@@ -2225,7 +2503,7 @@ runner_update_status() {
 runner_poll_for_jobs() {
     local url="${BACKEND_URL}/api/runner/next-job?runner=${RUNNER_NAME}"
     local res
-    res=$(curl -s "$url")
+    res=$(curl -s -H "Authorization: Bearer $RUNNER_TOKEN" "$url")
     if [ -z "$res" ]; then
         return
     fi
@@ -2243,6 +2521,25 @@ runner_poll_for_jobs() {
 
     log_info "🚀 [Job $job_id] Starting task for domain: $domain"
     log_info "   Command args: $command_str"
+
+    # Reject queue-supplied commands containing shell metacharacters — the
+    # command string is passed to eval, so a poisoned job must not be able to
+    # inject arbitrary shell (command substitution, chaining, redirection).
+    if printf '%s' "$command_str" | grep -qE '[;|&`$<>(){}]|\\\\'; then
+        log_error "[Job $job_id] command contains disallowed shell metacharacters — refusing."
+        runner_update_status "$job_id" "failed"
+        return
+    fi
+
+    # Enforce scope before executing a queue-supplied job. Fail closed (daemon
+    # context) so a poisoned/misconfigured queue can't aim the fleet off-scope.
+    if [ -n "$domain" ] && [ "$domain" != "null" ]; then
+        if ! scope_guard "$domain" "daemon"; then
+            log_error "[Job $job_id] domain '$domain' failed scope check — refusing."
+            runner_update_status "$job_id" "failed"
+            return
+        fi
+    fi
 
     local temp_job_file
     temp_job_file=$(mktemp "/tmp/temp_job_XXXXXX.json" 2>/dev/null || mktemp)
@@ -2275,6 +2572,7 @@ main() {
     local NET_TARGET=""
     local FUZZ_TARGET=""
     local VULN_TARGET=""
+    local CLIENT_TARGET=""
     local PERSON=""
     local COMPANY=""
     local USERNAME=""
@@ -2285,6 +2583,8 @@ main() {
     local FORCE_DAEMON=false
     local SYNC_TARGET=""
     local SYNC_ALL=false
+    local REPORT_TARGET=""
+    local REPORT_FORMAT="json"
     SENDER_ID=""
 
     while [[ $# -gt 0 ]]; do
@@ -2307,6 +2607,14 @@ main() {
                 THREADS="$2"
                 shift 2
                 ;;
+            --allow-out-of-scope)
+                ALLOW_OUT_OF_SCOPE=true
+                shift
+                ;;
+            --update-tools)
+                UPDATE_TOOLS=true
+                shift
+                ;;
             --info-gather)
                 if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
                 INFO_GATHER="$2"
@@ -2316,6 +2624,20 @@ main() {
                 if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
                 SYNC_TARGET="$2"
                 shift 2
+                ;;
+            --report)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                REPORT_TARGET="$2"
+                shift 2
+                ;;
+            --format)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                REPORT_FORMAT="$2"
+                shift 2
+                ;;
+            --include-secrets)
+                INCLUDE_SECRETS=true
+                shift
                 ;;
             --sync-all)
                 SYNC_ALL=true
@@ -2339,6 +2661,11 @@ main() {
             --vuln)
                 if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
                 VULN_TARGET="$2"
+                shift 2
+                ;;
+            --client)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                CLIENT_TARGET="$2"
                 shift 2
                 ;;
             -p|--person)
@@ -2399,6 +2726,19 @@ main() {
         exit 1
     fi
 
+    # Report Export (json | sarif | stix)
+    if [ -n "$REPORT_TARGET" ]; then
+        local report_args=()
+        [ "${INCLUDE_SECRETS:-false}" = true ] && report_args+=("--include-secrets")
+        case "$REPORT_FORMAT" in
+            sarif) python3 "$SCRIPT_DIR/db_sqlite.py" report_sarif "$REPORT_TARGET" "${report_args[@]}" ;;
+            stix)  python3 "$SCRIPT_DIR/db_sqlite.py" report_stix "$REPORT_TARGET" "${report_args[@]}" ;;
+            json)  python3 "$SCRIPT_DIR/db_sqlite.py" report "$REPORT_TARGET" ;;
+            *) log_error "Unknown report format: $REPORT_FORMAT (use json|sarif|stix)"; exit 1 ;;
+        esac
+        exit 0
+    fi
+
     # Target Sync Workflows
     if [ -n "$SYNC_TARGET" ]; then
         sync_target_data "$SYNC_TARGET"
@@ -2435,13 +2775,21 @@ main() {
 
     # Content Fuzzing
     if [ -n "$FUZZ_TARGET" ]; then
+        scope_guard "$FUZZ_TARGET" || exit 1
         run_content_discovery "$FUZZ_TARGET"
         exit 0
     fi
 
     # Vulnerability Scan
     if [ -n "$VULN_TARGET" ]; then
+        scope_guard "$VULN_TARGET" || exit 1
         run_nuclei "$VULN_TARGET"
+        exit 0
+    fi
+
+    # Client-side bug hunt (DOM XSS, postMessage, CORS, clickjacking, open redirect)
+    if [ -n "$CLIENT_TARGET" ]; then
+        run_client_recon "$CLIENT_TARGET"
         exit 0
     fi
 
