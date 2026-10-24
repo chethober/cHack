@@ -49,6 +49,26 @@ else
     log_warn "Unrecognized package manager. Please ensure git, curl, jq, python3, nmap, and libpcap are installed."
 fi
 
+# 2b. Python OSINT toolchain (person reconnaissance) via pipx.
+# These are passive, public-source account-existence / breach / harvest tools.
+# Versions are pinned (supply-chain hygiene); keep them in sync with
+# PY_TOOL_VERSIONS in cHack.sh. Best-effort: a failure here is non-fatal, and
+# person OSINT degrades gracefully for any tool left off PATH.
+log_info "Installing Python OSINT tools (holehe, sherlock, maigret, theHarvester) via pipx..."
+if ! command -v pipx >/dev/null 2>&1; then
+    python3 -m pip install --user pipx >/dev/null 2>&1 || log_warn "Could not install pipx via pip."
+    python3 -m pipx ensurepath >/dev/null 2>&1 || true
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+if command -v pipx >/dev/null 2>&1; then
+    for spec in "holehe==1.61" "sherlock-project==0.15.0" "maigret==0.5.0" "theHarvester==4.6.0"; do
+        log_info "  pipx install $spec"
+        pipx install "$spec" >/dev/null 2>&1 || log_warn "  failed to install $spec (person OSINT will skip it)"
+    done
+else
+    log_warn "pipx unavailable — skipping Python OSINT tools. Install pipx and run './cHack.sh --update-tools'."
+fi
+
 # 3. Setup Go Environment
 GO_VERSION="1.23.6"
 ARCH=$(uname -m)

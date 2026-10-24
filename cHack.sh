@@ -115,6 +115,58 @@ OPTIONAL_TOOLS=(
     "nmap"
 )
 
+# Python-based OSINT tools (person reconnaissance). These are installed via
+# pipx, not `go install`, so they live outside TOOL_VERSIONS/get_tool_package.
+# All are passive / public-source account-existence and breach lookups — no
+# intrusive scraping. Each call site degrades gracefully when a tool is absent.
+# Pinned the same way the Go toolchain is pinned (supply-chain hygiene); bump
+# deliberately and run `./cHack.sh --update-tools` to apply.
+declare -A PY_TOOL_VERSIONS=(
+    [holehe]="1.61"
+    [sherlock]="0.15.0"
+    [maigret]="0.5.0"
+    [theHarvester]="4.6.0"
+)
+
+# Maps the executable name to the pipx package spec installed for it.
+get_py_tool_package() {
+    local tool="$1"
+    local ver="${PY_TOOL_VERSIONS[$tool]:-}"
+    case "$tool" in
+        holehe)       echo "holehe==${ver:-1.61}" ;;
+        sherlock)     echo "sherlock-project==${ver:-0.15.0}" ;;
+        maigret)      echo "maigret==${ver:-0.5.0}" ;;
+        theHarvester) echo "theHarvester==${ver:-4.6.0}" ;;
+    esac
+}
+
+# Install/refresh the Python OSINT toolchain via pipx at pinned versions.
+# Best-effort: a missing pipx or a failed install is a warning, never fatal —
+# person OSINT skips any tool that is not on PATH.
+ensure_python_tools() {
+    local force="${1:-false}"
+    if ! command -v pipx >/dev/null 2>&1; then
+        log_warn "pipx not found — person-OSINT tools (holehe/sherlock/maigret/theHarvester) unavailable. Install pipx (see install.sh)."
+        return 0
+    fi
+    local tool
+    for tool in "${!PY_TOOL_VERSIONS[@]}"; do
+        if [ "$force" != true ] && command -v "$tool" >/dev/null 2>&1; then
+            continue
+        fi
+        local pkg
+        pkg=$(get_py_tool_package "$tool")
+        [ -z "$pkg" ] && continue
+        log_info "Installing $tool ($pkg) via pipx..."
+        if pipx install --force "$pkg" >/dev/null 2>&1; then
+            log_info "  installed $tool"
+        else
+            log_warn "  failed to install $tool (person OSINT will skip it)"
+        fi
+    done
+    return 0
+}
+
 # Pinned tool versions — single source of truth for the Go toolchain.
 # Pinning prevents a compromised upstream release from silently landing on
 # every runner via `go install ...@latest`. Bump deliberately (and review the
@@ -248,6 +300,8 @@ check_requirements() {
                 go install "$pkg" >/dev/null 2>&1 && log_info "  updated $tool" || log_warn "  failed to update $tool"
             fi
         done
+        log_info "Updating Python OSINT toolchain to pinned versions..."
+        ensure_python_tools true
         echo "$current_time" > "$last_check_file"
     else
         local last_check=0
@@ -1546,6 +1600,250 @@ emit_result() {
     printf '##CHACK_RESULT## %s\n' "$1"
 }
 
+# ==============================================================================
+# PERSON OSINT: passive, public-source reconnaissance on an individual.
+# Target may be an email, @username/handle, phone, or "First Last" name. Every
+# lookup is read-only (account-existence, breach exposure, public harvesting) —
+# no intrusive scraping. Results are consolidated to person_osint.json and then
+# pushed into the person's people.data via update_person_osint_results().
+# ==============================================================================
+
+# Classify a person target string: email | username | phone | name
+classify_person_target() {
+    local t="$1"
+    if [[ "$t" != @* ]] && [[ "$t" == *@*.* ]]; then
+        echo "email"; return
+    fi
+    if [[ "$t" =~ ^\+?[0-9][0-9\ ().-]{5,}$ ]]; then
+        echo "phone"; return
+    fi
+    if [[ "$t" == @* ]]; then
+        echo "username"; return
+    fi
+    if [[ "$t" != *" "* ]] && [[ "$t" != *@* ]]; then
+        echo "username"; return
+    fi
+    echo "name"
+}
+
+# holehe: which sites have an account registered to this email.
+run_person_email() {
+    local email="$1"
+    local output_dir="$2"
+    if command -v holehe >/dev/null 2>&1; then
+        log_info "holehe: checking account existence for $email..."
+        ( timeout 180 holehe "$email" --only-used --no-color 2>/dev/null \
+            | grep -E '^\[\+\]' | sed 's/^\[\+\][[:space:]]*//' | sort -u \
+            > "$output_dir/holehe" ) || touch "$output_dir/holehe"
+        # Each holehe hit is a site where the email is registered → an account.
+        sed 's#^#holehe://#' "$output_dir/holehe" >> "$output_dir/accounts"
+        grep -q . "$output_dir/holehe" 2>/dev/null && echo "holehe" >> "$output_dir/sources"
+    else
+        log_warn "holehe not installed — skipping email account-existence check (run: ./cHack.sh --update-tools)."
+    fi
+
+    # Optional breach intel via HaveIBeenPwned (requires HIBP_API_KEY).
+    if [ -n "${HIBP_API_KEY:-}" ]; then
+        log_info "HIBP: querying breach exposure for $email..."
+        local enc hibp_json
+        enc=$(jq -rn --arg e "$email" '$e|@uri')
+        hibp_json=$(curl -s --connect-timeout 10 -m 20 \
+            -H "hibp-api-key: $HIBP_API_KEY" \
+            -H "user-agent: cHack" \
+            "https://haveibeenpwned.com/api/v3/breachedaccount/${enc}?truncateResponse=true" 2>/dev/null)
+        if echo "$hibp_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            echo "$hibp_json" | jq -r '.[].Name' 2>/dev/null >> "$output_dir/breaches"
+            echo "hibp" >> "$output_dir/sources"
+        fi
+    fi
+}
+
+# maigret (preferred) or sherlock: social/profile presence for a username.
+run_person_username() {
+    local uname="$1"
+    local output_dir="$2"
+    if command -v maigret >/dev/null 2>&1; then
+        log_info "maigret: enumerating profiles for @$uname..."
+        ( timeout 300 maigret "$uname" --no-progressbar 2>/dev/null \
+            | grep -Eo 'https?://[^[:space:]]+' | sort -u >> "$output_dir/accounts" ) || true
+        echo "maigret" >> "$output_dir/sources"
+    elif command -v sherlock >/dev/null 2>&1; then
+        log_info "sherlock: enumerating profiles for @$uname..."
+        ( timeout 300 sherlock "$uname" --print-found --no-color 2>/dev/null \
+            | grep -Eo 'https?://[^[:space:]]+' | sort -u >> "$output_dir/accounts" ) || true
+        echo "sherlock" >> "$output_dir/sources"
+    else
+        log_warn "maigret/sherlock not installed — skipping username enumeration (run: ./cHack.sh --update-tools)."
+    fi
+}
+
+# theHarvester: harvest public emails/hosts for the person's organization.
+run_person_name() {
+    local name="$1"
+    local company="$2"
+    local output_dir="$3"
+    # Record the name for correlation/manual follow-up.
+    printf '%s\n' "$name" > "$output_dir/name"
+    if [ -z "$company" ]; then
+        log_info "No company/domain supplied for name target — nothing to passively harvest. Pass -c <company> for org-level OSINT."
+        return 0
+    fi
+    # Derive a domain-looking token from the company (slug.tld heuristic).
+    local domain="$company"
+    if [[ "$company" != *.* ]]; then
+        domain="$(echo "$company" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g').com"
+    fi
+    if command -v theHarvester >/dev/null 2>&1; then
+        log_info "theHarvester: harvesting public data for $domain..."
+        ( timeout 300 theHarvester -d "$domain" -b crtsh,duckduckgo,bing 2>/dev/null \
+            | grep -Eio '[a-z0-9._%+-]+@'"$(echo "$domain" | sed 's/\./\\./g')" | sort -u \
+            >> "$output_dir/emails" ) || true
+        echo "theHarvester" >> "$output_dir/sources"
+    else
+        log_warn "theHarvester not installed — skipping org harvest (run: ./cHack.sh --update-tools)."
+    fi
+}
+
+# Build person_osint.json from the per-tool raw artifacts in output_dir.
+consolidate_person_osint() {
+    local target="$1"
+    local ptype="$2"
+    local output_dir="$3"
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local arr='map(select(length>0)) | unique'
+    jq -n \
+        --arg target "$target" \
+        --arg type "$ptype" \
+        --arg now "$now" \
+        --argjson emails "$(tr -d '\r' < "$output_dir/emails" 2>/dev/null | jq -R . | jq -s "$arr" 2>/dev/null || echo '[]')" \
+        --argjson usernames "$(tr -d '\r' < "$output_dir/usernames" 2>/dev/null | jq -R . | jq -s "$arr" 2>/dev/null || echo '[]')" \
+        --argjson accounts "$(tr -d '\r' < "$output_dir/accounts" 2>/dev/null | jq -R . | jq -s "$arr" 2>/dev/null || echo '[]')" \
+        --argjson breaches "$(tr -d '\r' < "$output_dir/breaches" 2>/dev/null | jq -R . | jq -s "$arr" 2>/dev/null || echo '[]')" \
+        --argjson sources "$(tr -d '\r' < "$output_dir/sources" 2>/dev/null | jq -R . | jq -s "$arr" 2>/dev/null || echo '[]')" \
+        '{target: $target, type: $type, scanned_at: $now,
+          emails_found: $emails, usernames_found: $usernames,
+          accounts: $accounts, breaches: $breaches, sources: $sources}' \
+        > "$output_dir/person_osint.json"
+}
+
+run_person_osint() {
+    local target="$1"
+    local company="${2:-}"
+    local ptype
+    ptype=$(classify_person_target "$target")
+
+    local slug
+    slug=$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g; s/_\+/_/g; s/^_//; s/_$//')
+    [ -z "$slug" ] && slug="person"
+    local output_dir="$TARGETS_DIR/person/$slug"
+    mkdir -p "$output_dir"
+    : > "$output_dir/emails"; : > "$output_dir/usernames"
+    : > "$output_dir/accounts"; : > "$output_dir/breaches"; : > "$output_dir/sources"
+
+    log_phase "Person OSINT: passive reconnaissance"
+    log_info "Target: $target (type: $ptype)${company:+, company: $company}"
+    ensure_python_tools
+
+    case "$ptype" in
+        email)
+            printf '%s\n' "$target" >> "$output_dir/emails"
+            run_person_email "$target" "$output_dir"
+            ;;
+        username)
+            local uname="${target#@}"
+            printf '%s\n' "$uname" >> "$output_dir/usernames"
+            run_person_username "$uname" "$output_dir"
+            ;;
+        phone)
+            log_info "Phone target: automated passive phone OSINT is limited; recording for manual follow-up."
+            printf '%s\n' "$target" > "$output_dir/phone"
+            ;;
+        name)
+            run_person_name "$target" "$company" "$output_dir"
+            ;;
+    esac
+
+    consolidate_person_osint "$target" "$ptype" "$output_dir"
+    log_info "Person OSINT complete. Summary: $output_dir/person_osint.json"
+    update_person_osint_results "$target" "$ptype" "$company" "$output_dir"
+}
+
+# Find-or-create the person record, then merge OSINT findings into people.data.
+update_person_osint_results() {
+    local target="$1"
+    local ptype="$2"
+    local company="$3"
+    local output_dir="$4"
+    local summary="$output_dir/person_osint.json"
+    [ -s "$summary" ] || { log_warn "No OSINT summary to persist."; return 0; }
+
+    # Resolve the company (engagement) this person belongs to.
+    local company_id=""
+    if [ -n "$company" ]; then
+        local cslug
+        cslug=$(echo "$company" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/-\+/-/g')
+        company_id=$(db_get_company_by_slug "$cslug")
+        if [ -z "$company_id" ]; then
+            company_id=$(db_add_company "$company" "$cslug" "Added via person OSINT")
+        fi
+    fi
+    # Prefer the engagement company supplied by the daemon (exact id) when no
+    # -c name was given on the command line.
+    if [ -z "$company_id" ] && [ -n "${CHACK_JOB_COMPANY_ID:-}" ]; then
+        company_id="$CHACK_JOB_COMPANY_ID"
+    fi
+    if [ -z "$company_id" ]; then
+        local comp_res
+        comp_res=$(execute_graphql "query { companies { id } }")
+        company_id=$(echo "$comp_res" | jq -r '.data.companies[0].id // empty')
+    fi
+    if [ -z "$company_id" ]; then
+        company_id=$(db_add_company "Default Company" "default-company" "Default company for orphan targets")
+    fi
+
+    # Find an existing person (by email, else by name); otherwise create one.
+    local person_id=""
+    if [ "$ptype" = "email" ]; then
+        local by_email
+        by_email=$(execute_graphql "query(\$e: String!){ personByEmail(email: \$e){ id } }" "$(jq -n --arg e "$target" '{e:$e}')")
+        person_id=$(echo "$by_email" | jq -r '.data.personByEmail.id // empty')
+    elif [ "$ptype" = "name" ]; then
+        local gn fn
+        gn=$(echo "$target" | cut -d ' ' -f 1)
+        fn=$(echo "$target" | cut -d ' ' -f 2-)
+        [ "$gn" = "$fn" ] && fn=""
+        local by_name
+        by_name=$(execute_graphql "query(\$g: String,\$f: String){ peopleByName(givenName: \$g, familyName: \$f){ id } }" "$(jq -n --arg g "$gn" --arg f "$fn" '{g:$g,f:$f}')")
+        person_id=$(echo "$by_name" | jq -r '.data.peopleByName[0].id // empty')
+    fi
+
+    local emails_json
+    emails_json=$(jq -c '(.emails_found // []) + ([.target] | map(select(. | test("@"))))  | unique' "$summary" 2>/dev/null || echo '[]')
+    local data_json
+    data_json=$(jq -c '{osint: .}' "$summary" 2>/dev/null || echo '{}')
+
+    if [ -z "$person_id" ]; then
+        local gn="$target" fn=""
+        if [ "$ptype" = "name" ]; then
+            gn=$(echo "$target" | cut -d ' ' -f 1)
+            fn=$(echo "$target" | cut -d ' ' -f 2-)
+            [ "$gn" = "$fn" ] && fn=""
+        fi
+        log_info "Creating person record for '$target'..."
+        person_id=$(db_add_person "$company_id" "$gn" "$fn" "$emails_json" "[]" "OSINT target" "$data_json")
+    else
+        log_info "GraphQL: updating person $person_id with OSINT findings..."
+        local query="mutation UpdatePerson(\$id: ID!, \$input: PeopleInput!) { updatePeople(id: \$id, input: \$input){ id } }"
+        local variables
+        variables=$(jq -n --arg cid "$company_id" --argjson em "$emails_json" --argjson dt "$data_json" \
+            '{id: null, input: {company_id: $cid, emails: $em, data: $dt}}')
+        variables=$(jq -c --arg id "$person_id" '.id = $id' <<<"$variables")
+        execute_graphql "$query" "$variables" >/dev/null
+    fi
+}
+
 run_phase() {
     local phase=$1
     local domain=$2
@@ -1590,6 +1888,15 @@ run_phase() {
         content_discovery)
             run_content_discovery "$domain"
             emit_result "{\"job_type\":\"content_discovery\"}"
+            ;;
+        person_osint)
+            # For a person phase, $domain carries the person target (name/email/username).
+            run_person_osint "$domain" "$COMPANY"
+            local slug acc brc
+            slug=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g; s/_\+/_/g; s/^_//; s/_$//')
+            acc=$(jq '.accounts | length' "$TARGETS_DIR/person/$slug/person_osint.json" 2>/dev/null || echo 0)
+            brc=$(jq '.breaches | length' "$TARGETS_DIR/person/$slug/person_osint.json" 2>/dev/null || echo 0)
+            emit_result "{\"job_type\":\"person_osint\",\"accounts\":${acc:-0},\"breaches\":${brc:-0}}"
             ;;
         *)
             log_error "Unknown phase: $phase"
@@ -2599,7 +2906,10 @@ show_usage() {
     echo "Target & Entity Management:"
     echo "  --sync DOMAIN             Sync on-disk scan data to Cloudflare D1 & local SQLite"
     echo "  --sync-all                Sync all targets from disk to Cloudflare D1 & SQLite"
-    echo "  -p, --person NAME         Add a person target (GraphQL API)"
+    echo "  -p, --person TARGET       Run passive person OSINT on an email, @username,"
+    echo "                            phone, or \"First Last\" name (results saved to the"
+    echo "                            person record). Use -c to set the company/engagement."
+    echo "  --add-only                With -p: only create the person record, run no OSINT"
     echo "  -c, --company NAME        Add a company target (GraphQL API)"
     echo "  -u, --user USERNAME       Add a new user (GraphQL API)"
     echo "  --number-id ID            Telegram number ID for the new user"
@@ -2713,6 +3023,10 @@ runner_poll_for_jobs() {
     command_str=$(echo "$res" | jq -r '.job.command')
     local domain
     domain=$(echo "$res" | jq -r '.job.domain')
+    local job_type
+    job_type=$(echo "$res" | jq -r '.job.job_type // empty')
+    local job_company_id
+    job_company_id=$(echo "$res" | jq -r '.job.company_id // empty')
 
     log_info "🚀 [Job $job_id] Starting task for domain: $domain"
     log_info "   Command args: $command_str"
@@ -2726,9 +3040,18 @@ runner_poll_for_jobs() {
         return
     fi
 
-    # Enforce scope before executing a queue-supplied job. Fail closed (daemon
-    # context) so a poisoned/misconfigured queue can't aim the fleet off-scope.
-    if [ -n "$domain" ] && [ "$domain" != "null" ]; then
+    if [ "$job_type" = "person_osint" ]; then
+        # Person OSINT targets are individuals, not hosts, so host-scope_guard
+        # does not apply. Authorization is instead explicit: the job must be
+        # tied to a company (engagement). Fail closed if it is not.
+        if [ -z "$job_company_id" ] || [ "$job_company_id" = "null" ]; then
+            log_error "[Job $job_id] person_osint job has no company_id (no engagement authorization) — refusing."
+            runner_update_status "$job_id" "failed"
+            return
+        fi
+    elif [ -n "$domain" ] && [ "$domain" != "null" ]; then
+        # Enforce scope before executing a queue-supplied job. Fail closed (daemon
+        # context) so a poisoned/misconfigured queue can't aim the fleet off-scope.
         if ! scope_guard "$domain" "daemon"; then
             log_error "[Job $job_id] domain '$domain' failed scope check — refusing."
             runner_update_status "$job_id" "failed"
@@ -2745,6 +3068,14 @@ runner_poll_for_jobs() {
 
     local out_file
     out_file=$(mktemp "/tmp/chack_out_XXXXXX" 2>/dev/null || mktemp)
+
+    # Pass the job's engagement company through so person OSINT ties findings to
+    # the exact authorized company rather than falling back to the first/default.
+    if [ -n "$job_company_id" ] && [ "$job_company_id" != "null" ]; then
+        export CHACK_JOB_COMPANY_ID="$job_company_id"
+    else
+        unset CHACK_JOB_COMPANY_ID
+    fi
 
     local log_line
     eval "\"$SCRIPT_DIR/cHack.sh\" $command_str" 2>&1 | while IFS= read -r log_line || [ -n "$log_line" ]; do
@@ -2780,6 +3111,7 @@ main() {
     local PHASE=""
     local PHASE_TARGET=""
     local PERSON=""
+    local ADD_ONLY=false
     local COMPANY=""
     local USERNAME=""
     local NUMBER_ID=""
@@ -2884,6 +3216,10 @@ main() {
                 if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
                 PERSON="$2"
                 shift 2
+                ;;
+            --add-only)
+                ADD_ONLY=true
+                shift
                 ;;
             -c|--company)
                 if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
@@ -3028,23 +3364,29 @@ main() {
         exit 0
     fi
 
-    # Entity Creation
+    # Entity Creation / Person OSINT
     if [ -n "$PERSON" ]; then
-        log_info "Adding person to DB: $PERSON"
-        local company_id=""
-        local comp_q="query { companies { id } }"
-        local comp_res
-        if comp_res=$(execute_graphql "$comp_q"); then
-            company_id=$(echo "$comp_res" | jq -r '.data.companies[0].id // empty')
+        if [ "$ADD_ONLY" = true ]; then
+            # Record-only: insert the person, run no OSINT (legacy behavior).
+            log_info "Adding person to DB (record only): $PERSON"
+            local company_id=""
+            local comp_q="query { companies { id } }"
+            local comp_res
+            if comp_res=$(execute_graphql "$comp_q"); then
+                company_id=$(echo "$comp_res" | jq -r '.data.companies[0].id // empty')
+            fi
+            if [ -z "$company_id" ]; then
+                company_id=$(db_add_company "Default Company" "default-company" "Default company for orphan targets")
+            fi
+            local first_name=$(echo "$PERSON" | cut -d ' ' -f 1)
+            local last_name=$(echo "$PERSON" | cut -d ' ' -f 2-)
+            if [ "$first_name" = "$last_name" ]; then last_name=""; fi
+            db_add_person "$company_id" "$first_name" "$last_name" "" "[]" "{}"
+            exit 0
         fi
-        if [ -z "$company_id" ]; then
-            company_id=$(db_add_company "Default Company" "default-company" "Default company for orphan targets")
-        fi
-
-        local first_name=$(echo "$PERSON" | cut -d ' ' -f 1)
-        local last_name=$(echo "$PERSON" | cut -d ' ' -f 2-)
-        if [ "$first_name" = "$last_name" ]; then last_name=""; fi
-        db_add_person "$company_id" "$first_name" "$last_name" "" "[]" "{}"
+        # Default: run real passive OSINT, then find-or-create + update the record.
+        audit_scan_start "scan.person" "$PERSON"
+        run_person_osint "$PERSON" "$COMPANY"
         exit 0
     fi
 

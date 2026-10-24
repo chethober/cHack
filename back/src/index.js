@@ -2106,6 +2106,59 @@ const escapeHtml = (str) => {
     .replace(/'/g, '&#039;');
 };
 
+// Render the passive person-OSINT findings stored at people.data.osint (written
+// by cHack.sh's run_person_osint). Returns an HTML block, or "" when a person
+// has no OSINT results yet. `dataField` is the raw people.data column (string
+// or object). `max` caps how many list items are shown before a "+N more".
+const formatOsintSummary = (dataField, max = 8) => {
+  let data = dataField;
+  if (typeof data === 'string') {
+    try { data = JSON.parse(data || '{}'); } catch (e) { return ''; }
+  }
+  const o = data && typeof data === 'object' ? data.osint : null;
+  if (!o || typeof o !== 'object') return '';
+
+  const toList = (v) => (Array.isArray(v) ? v.filter((x) => x != null && String(x).length) : []);
+  const accounts = toList(o.accounts);
+  const breaches = toList(o.breaches);
+  const emails = toList(o.emails_found);
+  const sources = toList(o.sources);
+
+  if (!accounts.length && !breaches.length && !emails.length && !sources.length) {
+    return `\n\n🔎 <b>OSINT:</b> scan ran${o.scanned_at ? ` (${escapeHtml(o.scanned_at)})` : ''}, no public exposure found.`;
+  }
+
+  const renderItems = (items) => {
+    const shown = items.slice(0, max).map((i) => `   • <code>${escapeHtml(i)}</code>`);
+    if (items.length > max) shown.push(`   • <i>+${items.length - max} more</i>`);
+    return shown.join('\n');
+  };
+
+  let out = `\n\n🔎 <b>OSINT findings</b>`;
+  if (o.scanned_at) out += ` <i>(${escapeHtml(o.scanned_at)})</i>`;
+  if (sources.length) out += `\n• <b>Sources:</b> ${escapeHtml(sources.join(', '))}`;
+  if (accounts.length) out += `\n• <b>Accounts (${accounts.length}):</b>\n${renderItems(accounts)}`;
+  if (emails.length) out += `\n• <b>Emails (${emails.length}):</b>\n${renderItems(emails)}`;
+  if (breaches.length) out += `\n• <b>⚠️ Breaches (${breaches.length}):</b>\n${renderItems(breaches)}`;
+  return out;
+};
+
+// Quick flag for the contacts list: did this person's OSINT scan turn up any
+// public exposure? Returns '⚠️' when breaches are present, '🔎' for other
+// findings, or '' when there was no scan or nothing was found.
+const osintBadge = (dataField) => {
+  let data = dataField;
+  if (typeof data === 'string') {
+    try { data = JSON.parse(data || '{}'); } catch (e) { return ''; }
+  }
+  const o = data && typeof data === 'object' ? data.osint : null;
+  if (!o || typeof o !== 'object') return '';
+  const n = (v) => (Array.isArray(v) ? v.filter((x) => x != null && String(x).length).length : 0);
+  if (n(o.breaches)) return '⚠️';
+  if (n(o.accounts) || n(o.emails_found)) return '🔎';
+  return '';
+};
+
 // ===========================================================================
 // RBAC & Audit helpers (role-based access and audit controls)
 // ===========================================================================
@@ -2581,12 +2634,16 @@ const getBot = (env) => {
       command = `--network ${value} --sender-id ${userId}`;
     }
 
+    // Person targets are individuals, not hosts: tag the job so the runner
+    // routes it past host-scope_guard and authorizes it by company instead.
+    const jobType = type === 'person' ? 'person_osint' : null;
+
     const id = crypto.randomUUID();
     await env.DB.prepare(
       `INSERT INTO scan_jobs
-         (id, command, domain, runner, region, priority, status, requested_by, requested_by_number_id, company_id, source)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 'telegram')`
-    ).bind(id, command, value, runner, region, priority, actor.userId, userId, scope.companyId).run();
+         (id, command, domain, runner, region, priority, status, job_type, requested_by, requested_by_number_id, company_id, source)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, 'telegram')`
+    ).bind(id, command, value, runner, region, priority, jobType, actor.userId, userId, scope.companyId).run();
 
     await auditLog(env, {
       actor_user_id: actor.userId, actor_number_id: userId, actor_label: actor.username,
@@ -2825,7 +2882,8 @@ const getBot = (env) => {
     const keyboard = [];
     for (const p of people) {
       const name = `${p.given_name || ''} ${p.family_name || ''}`.trim() || 'Unnamed';
-      keyboard.push([{ text: `👤 ${name}`, callback_data: `view_contact_${p.id}` }]);
+      const badge = osintBadge(p.data);
+      keyboard.push([{ text: `👤 ${name}${badge ? ` ${badge}` : ''}`, callback_data: `view_contact_${p.id}` }]);
     }
     keyboard.push([{ text: "➕ Add New Person", callback_data: "target_person" }]);
     if (totalPages > 1) {
@@ -3103,7 +3161,8 @@ const getBot = (env) => {
         `• <b>Company:</b> ${comp ? escapeHtml(comp.name) : 'N/A'}\n` +
         `• <b>Emails:</b> ${escapeHtml(emails)}\n` +
         `• <b>Phones:</b> ${escapeHtml(phones)}\n` +
-        `• <b>Notes:</b> ${escapeHtml(p.notes || 'None')}`
+        `• <b>Notes:</b> ${escapeHtml(p.notes || 'None')}` +
+        formatOsintSummary(p.data)
       );
     }
     await ctx.reply(msgs.join('\n\n---\n\n'), { parse_mode: "HTML" });
@@ -4631,7 +4690,8 @@ const getBot = (env) => {
       const keyboard = [];
       for (const p of people) {
         const name = `${p.given_name || ''} ${p.family_name || ''}`.trim() || 'Unnamed';
-        keyboard.push([{ text: `👤 ${name}`, callback_data: `view_contact_${p.id}` }]);
+        const badge = osintBadge(p.data);
+        keyboard.push([{ text: `👤 ${name}${badge ? ` ${badge}` : ''}`, callback_data: `view_contact_${p.id}` }]);
       }
 
       keyboard.push([{ text: "➕ Add New Person", callback_data: "target_person" }]);
@@ -4669,7 +4729,8 @@ const getBot = (env) => {
         `• <b>Emails:</b> <code>${escapeHtml(emails)}</code>\n` +
         `• <b>Phones:</b> <code>${escapeHtml(phones)}</code>\n` +
         `• <b>Notes:</b> ${escapeHtml(person.notes || 'None')}\n` +
-        `• <b>Created At:</b> <code>${person.created_at}</code>`;
+        `• <b>Created At:</b> <code>${person.created_at}</code>` +
+        formatOsintSummary(person.data);
 
       await safeEditMessageText(ctx, text, {
         parse_mode: "HTML",
