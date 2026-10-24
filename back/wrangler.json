@@ -19,7 +19,8 @@
     ]
   },
   "vars": {
-    "GRAPHQL_ENDPOINT": "https://your-worker.workers.dev/graphql",
+    "GRAPHQL_ENDPOINT": "https://chack-back.chethober.workers.dev/graphql",
+    "PUBLIC_URL": "https://chack-back.chethober.workers.dev",
     "RUNNERS": "VPS-1,VPS-2",
     "AUTH_ENFORCED": "false"
   }

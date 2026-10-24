@@ -2316,7 +2316,41 @@ const createMainMenu = async (ctx, env) => {
     keyboard.push([{ text: "🛡️ Admin Control Center", callback_data: "admin_home" }]);
   }
 
+  const appUrl = miniAppUrl(env);
+  if (appUrl) {
+    keyboard.push([{ text: "📱 Open Mini App", web_app: { url: appUrl } }]);
+  }
+
   return { inline_keyboard: keyboard };
+};
+
+// Public https origin of this Worker, used to build the Telegram Mini App URL.
+// Prefer PUBLIC_URL; fall back to GRAPHQL_ENDPOINT (…/graphql -> origin).
+const publicOrigin = (env) => {
+  const raw = env?.PUBLIC_URL || env?.GRAPHQL_ENDPOINT || '';
+  try { return new URL(raw).origin; } catch (_) { return ''; }
+};
+
+// Mini App entry URL. Telegram only accepts https web_app buttons, so callers
+// must skip the button when this returns '' (e.g. local http dev).
+const miniAppUrl = (env) => {
+  const origin = publicOrigin(env);
+  return origin.startsWith('https://') ? `${origin}/app` : '';
+};
+
+// One-time (per isolate) bot UI setup: the product is driven entirely by the
+// interactive dashboard (inline keyboard) and the Mini App, so we clear the
+// slash-command list (removes the ☰ command menu + "/" hints, including any
+// left over from BotFather) and point the ☰ menu button at the Mini App.
+let botConfigured = false;
+const configureBotUI = async (env, bot) => {
+  await bot.api.setMyCommands([]); // no advertised commands
+  const url = miniAppUrl(env);
+  await bot.api.setChatMenuButton(
+    url
+      ? { menu_button: { type: 'web_app', text: 'Open App', web_app: { url } } }
+      : { menu_button: { type: 'default' } }
+  );
 };
 
 const getBot = (env) => {
@@ -2639,6 +2673,56 @@ const getBot = (env) => {
       parse_mode: "HTML",
       reply_markup: menuMarkup
     });
+  });
+
+  bot.command(["app", "webapp"], async (ctx) => {
+    await registerUser(ctx);
+    const appUrl = miniAppUrl(env);
+    if (!appUrl) {
+      await ctx.reply(
+        "📱 <b>Mini App not configured.</b>\n\nSet <code>PUBLIC_URL</code> (or " +
+        "<code>GRAPHQL_ENDPOINT</code>) to this Worker's public https URL and redeploy.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+    await ctx.reply("📱 <b>cHack Mini App</b>\n\nTap below to open the live dashboard inside Telegram:", {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "📱 Open Mini App", web_app: { url: appUrl } }]] },
+    });
+  });
+
+  // Replace the chat input's default "commands" (☰) menu button with one that
+  // launches the Mini App. This is a global bot setting (admin-only).
+  bot.command("setmenu", async (ctx) => {
+    await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'bot.setmenu')) return;
+    const appUrl = miniAppUrl(env);
+    if (!appUrl) {
+      await ctx.reply(
+        "❌ Set <code>PUBLIC_URL</code> to this Worker's https URL first, then run /setmenu.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+    try {
+      await configureBotUI(env, getBot(env));
+      await ctx.reply("✅ Commands cleared and the menu button now opens the Mini App. (Reopen the chat to see it.)");
+    } catch (err) {
+      await ctx.reply(`❌ Failed to update bot UI: ${escapeHtml(err.message)}`);
+    }
+  });
+
+  // Restore the default commands (☰) menu button.
+  bot.command("resetmenu", async (ctx) => {
+    await registerUser(ctx);
+    if (!await requireRole(ctx, 'admin', 'bot.resetmenu')) return;
+    try {
+      await ctx.api.setChatMenuButton({ menu_button: { type: "commands" } });
+      await ctx.reply("✅ Menu button reset to the default commands list.");
+    } catch (err) {
+      await ctx.reply(`❌ Failed to reset menu button: ${escapeHtml(err.message)}`);
+    }
   });
 
   bot.command(["dashboard", "stats"], async (ctx) => {
@@ -5540,6 +5624,497 @@ const runnerTokenOk = (c) => {
   return hdr === expected || bearer === expected;
 };
 
+// ----------------------------------------------------
+// Telegram Mini App (Web App)
+// ----------------------------------------------------
+// A Mini App is an HTML page Telegram opens inside the client. It authenticates
+// the viewer with the `initData` string Telegram injects, which we verify
+// server-side against the bot token (HMAC-SHA256) before trusting any user id.
+// Docs: https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
+
+const hmacSha256Bytes = async (keyBytes, msgBytes) => {
+  const key = await crypto.subtle.importKey(
+    'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, msgBytes));
+};
+
+// Reject initData older than this to limit replay of a leaked payload.
+const MINIAPP_MAX_AGE_SECS = 86400; // 24h
+
+// Verify a Telegram Mini App initData string. Returns { ok, user, authDate };
+// ok=false on a missing/forged hash or a stale auth_date.
+const validateInitData = async (initData, botToken) => {
+  if (!initData || !botToken) return { ok: false };
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash') || '';
+  if (!hash) return { ok: false };
+  params.delete('hash');
+
+  // data-check-string: remaining pairs, key-sorted, joined by newlines.
+  const pairs = [...params.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const dataCheckString = pairs.map(([k, v]) => `${k}=${v}`).join('\n');
+
+  const enc = new TextEncoder();
+  const secretKey = await hmacSha256Bytes(enc.encode('WebAppData'), enc.encode(botToken));
+  const sig = await hmacSha256Bytes(secretKey, enc.encode(dataCheckString));
+  const hex = [...sig].map((b) => b.toString(16).padStart(2, '0')).join('');
+  if (!safeEqual(hex, hash)) return { ok: false };
+
+  const authDate = Number(params.get('auth_date') || 0);
+  if (!authDate || (Date.now() / 1000) - authDate > MINIAPP_MAX_AGE_SECS) {
+    return { ok: false, reason: 'stale' };
+  }
+
+  let user = null;
+  try { user = JSON.parse(params.get('user') || 'null'); } catch (_) { /* ignore */ }
+  return { ok: true, user, authDate };
+};
+
+// Authorize a Mini App request: pull initData from the Authorization header
+// ("tma <initData>") or X-Telegram-Init-Data, verify it, then apply the same
+// RBAC gate the bot uses (minimum viewer, or any team membership).
+const authorizeMiniApp = async (c) => {
+  const auth = c.req.header('authorization') || '';
+  let initData = /^tma\s+/i.test(auth) ? auth.replace(/^tma\s+/i, '').trim() : '';
+  if (!initData) initData = c.req.header('x-telegram-init-data') || '';
+
+  const res = await validateInitData(initData, c.env.TELEGRAM_BOT_TOKEN);
+  if (!res.ok || !res.user) return { ok: false };
+
+  const actor = await resolveActor(c.env, res.user);
+  const admitted = actor.hasGlobal('viewer') || actor.memberships.length > 0;
+  if (!admitted) return { ok: false, actor, pending: true };
+  return { ok: true, actor, user: res.user };
+};
+
+// Gather the same figures the /dashboard bot command shows, as plain JSON.
+const collectDashboardStats = async (env) => {
+  const cnt = async (sql, ...b) =>
+    (await env.DB.prepare(sql).bind(...b).first())?.cnt || 0;
+  const companies = await cnt("SELECT count(*) as cnt FROM companies");
+  const domains = await cnt("SELECT count(*) as cnt FROM domains");
+  const people = await cnt("SELECT count(*) as cnt FROM people");
+  const { results: findings } = await env.DB.prepare("SELECT severity, status FROM findings").all();
+  const sev = (s) => findings.filter((f) => f.severity?.toLowerCase() === s).length;
+  const secrets = await cnt("SELECT count(*) as cnt FROM secrets");
+  const services = await cnt("SELECT count(*) as cnt FROM network_services");
+  const activeJobs = await cnt("SELECT count(*) as cnt FROM scan_jobs WHERE status IN ('pending','running')");
+  const cutoff = Math.floor(Date.now() / 1000) - 60;
+  const runnersOnline = await cnt("SELECT count(*) as cnt FROM runners WHERE last_seen >= ?", cutoff);
+  const runnersTotal = await cnt("SELECT count(*) as cnt FROM runners");
+
+  const rows = async (sql, ...b) =>
+    (await env.DB.prepare(sql).bind(...b).all())?.results || [];
+
+  // Findings discovered per day, last 14 days (change-over-time series). ISO
+  // created_at sorts lexically, so a date-only lower bound filters correctly.
+  const sinceDay = new Date(Date.now() - 13 * 86400000).toISOString().slice(0, 10);
+  const trend = await rows(
+    "SELECT substr(created_at,1,10) AS day, count(*) AS cnt FROM findings " +
+    "WHERE created_at >= ? GROUP BY day ORDER BY day", sinceDay
+  );
+  // Scan queue composition by state (part-to-whole).
+  const jobs = await rows("SELECT status, count(*) AS cnt FROM scan_jobs GROUP BY status");
+  // Top targets by finding count (magnitude + identity ranking).
+  const topTargets = await rows(
+    "SELECT c.name AS name, count(f.id) AS cnt FROM companies c " +
+    "LEFT JOIN findings f ON f.company_id = c.id " +
+    "GROUP BY c.id ORDER BY cnt DESC, c.name LIMIT 5"
+  );
+  // Most common open ports (magnitude ranking).
+  const topPorts = await rows(
+    "SELECT port, count(*) AS cnt FROM network_services GROUP BY port ORDER BY cnt DESC, port LIMIT 6"
+  );
+
+  return {
+    companies, domains, people,
+    findings: {
+      total: findings.length,
+      critical: sev('critical'), high: sev('high'), medium: sev('medium'),
+      low: sev('low'), info: sev('info'),
+      resolved: findings.filter((f) => f.status === 'resolved').length,
+    },
+    secrets, services, activeJobs, runnersOnline, runnersTotal,
+    trend, jobs, topTargets, topPorts, sinceDay,
+  };
+};
+
+// Self-contained Mini App shell. Verified data is loaded client-side from
+// /app/api/summary with the viewer's initData in the Authorization header.
+// Charts are hand-built inline SVG / CSS (no CDN) so the page stays one request.
+// Color: severity + job status are a STATUS palette (reserved hues, always shown
+// WITH labels + counts in ink, never color-alone); trend and ranking charts are
+// single-hue. Values/labels wear ink tokens; marks carry the only color.
+const MINIAPP_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>cHack</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    color-scheme: light dark;
+    --ink: var(--tg-theme-text-color, #ffffff);
+    --hint: var(--tg-theme-hint-color, #8a99a8);
+    --card: var(--tg-theme-secondary-bg-color, #232e3c);
+    --bg: var(--tg-theme-bg-color, #18222d);
+    --accent: #2f80ed;
+    --track: rgba(127,127,127,.18);
+    --ease-out: cubic-bezier(.23,1,.32,1);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; padding: 16px 16px 40px;
+    font: 15px/1.4 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--ink);
+  }
+  h1 { font-size: 20px; margin: 0 0 2px; letter-spacing: -.01em; }
+  .muted { color: var(--hint); font-size: 13px; }
+  .viewer { margin: 4px 0 18px; font-size: 13px; color: var(--hint); }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .card { background: var(--card); border-radius: 14px; padding: 12px 12px 11px; }
+  .card .n { font-size: 23px; font-weight: 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .card .l { font-size: 11px; color: var(--hint); margin-top: 3px; }
+  .section { margin-top: 22px; }
+  .section > h2 { font-size: 12px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--hint); font-weight: 600; }
+  .panel { background: var(--card); border-radius: 16px; padding: 14px; }
+  .chartbox { width: 100%; }
+  svg { display: block; width: 100%; height: auto; }
+  .axis { font-size: 10px; fill: var(--hint); }
+  .bars { display: flex; flex-direction: column; gap: 9px; }
+  .barrow { display: grid; grid-template-columns: 82px 1fr auto; align-items: center; gap: 10px; }
+  .barrow .bl { font-size: 13px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .track { height: 10px; background: var(--track); border-radius: 5px; overflow: hidden; }
+  .fill { height: 100%; width: 0; border-radius: 5px; transition: width 420ms var(--ease-out); }
+  .bv { font-size: 13px; font-weight: 700; color: var(--ink); min-width: 24px; text-align: right; font-variant-numeric: tabular-nums; }
+  .seg { display: flex; width: 100%; height: 16px; border-radius: 8px; overflow: hidden; background: var(--track); gap: 2px; }
+  .seg > span { height: 100%; min-width: 3px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 9px 14px; margin-top: 12px; }
+  .lg { display: flex; align-items: center; font-size: 12px; color: var(--hint); }
+  .lg .dot { width: 9px; height: 9px; border-radius: 3px; margin-right: 6px; }
+  .lg b { color: var(--ink); margin-left: 5px; font-variant-numeric: tabular-nums; }
+  .srow { display: flex; align-items: center; justify-content: space-between; }
+  .srow + .srow { margin-top: 10px; }
+  .srow .k { font-size: 13px; color: var(--hint); }
+  .srow .v { font-size: 13px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .empty { color: var(--hint); font-size: 13px; }
+  .tip {
+    position: fixed; z-index: 20; pointer-events: none;
+    background: var(--ink); color: var(--bg);
+    font-size: 12px; font-weight: 600; padding: 5px 8px; border-radius: 7px;
+    transform: translate(-50%, -132%); white-space: nowrap;
+    opacity: 0; transition: opacity 120ms ease;
+  }
+  .tip.on { opacity: 1; }
+  .err { background: rgba(229,72,77,.15); color: #ff6b72; border-radius: 12px; padding: 16px; margin-top: 16px; }
+  #loading { text-align: center; padding: 40px 0; color: var(--hint); }
+  @media (prefers-reduced-motion: no-preference) {
+    .reveal { opacity: 0; transform: translateY(8px); animation: rise 320ms var(--ease-out) forwards; animation-delay: var(--d, 0ms); }
+  }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+</style>
+</head>
+<body>
+  <h1>cHack</h1>
+  <div class="muted">Intelligence &amp; Management</div>
+  <div class="viewer" id="viewer"></div>
+  <div id="loading">Loading…</div>
+  <div id="content" hidden></div>
+  <script>
+  (function () {
+    var NS = 'http://www.w3.org/2000/svg';
+    var ACCENT = '#2f80ed';
+    // Severity = ordered warm heat ramp (status palette, always labelled).
+    var SEV = { critical:'#e5484d', high:'#f5820e', medium:'#e8b004', low:'#4c6ef5', info:'#8a99a8', resolved:'#2fa36b' };
+    // Scan job states (reserved status colors).
+    var JOB = { running:'#2f80ed', pending:'#8a99a8', completed:'#2fa36b', failed:'#e5484d', blocked:'#f5820e', skipped:'#6b7785' };
+    var REDUCE = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    var tg = window.Telegram && window.Telegram.WebApp;
+    if (tg) { try { tg.ready(); tg.expand(); } catch (_) {} }
+    var loading = document.getElementById('loading');
+    var content = document.getElementById('content');
+    var viewerEl = document.getElementById('viewer');
+    var tip = document.createElement('div'); tip.className = 'tip'; document.body.appendChild(tip);
+
+    function el(tag, cls, text) {
+      var e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text != null) e.textContent = text;
+      return e;
+    }
+    function svgEl(tag, attrs) {
+      var e = document.createElementNS(NS, tag);
+      for (var k in attrs) e.setAttribute(k, attrs[k]);
+      return e;
+    }
+    function showTip(x, y, text) { tip.textContent = text; tip.style.left = x + 'px'; tip.style.top = y + 'px'; tip.classList.add('on'); }
+    function hideTip() { tip.classList.remove('on'); }
+    function fmtDay(d) {
+      var dt = new Date(d + 'T00:00:00');
+      if (isNaN(dt.getTime())) return d;
+      return dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    }
+
+    var sidx = 0;
+    function section(title) {
+      var sec = el('div', 'section reveal');
+      sec.style.setProperty('--d', (sidx++ * 55) + 'ms');
+      if (title) sec.appendChild(el('h2', null, title));
+      content.appendChild(sec);
+      return sec;
+    }
+    function panel(sec) { var p = el('div', 'panel'); sec.appendChild(p); var b = el('div', 'chartbox'); p.appendChild(b); return b; }
+    function emptyInto(box, msg) { box.appendChild(el('div', 'empty', msg)); }
+
+    function card(n, label) {
+      var c = el('div', 'card');
+      c.appendChild(el('div', 'n', String(n)));
+      c.appendChild(el('div', 'l', label));
+      return c;
+    }
+
+    // Horizontal bars; width scaled to the largest value for easy comparison.
+    // label + value are ink; the fill carries the only color.
+    function bars(box, rows, color) {
+      var wrap = el('div', 'bars');
+      var max = 1, i;
+      for (i = 0; i < rows.length; i++) if (rows[i].value > max) max = rows[i].value;
+      box.appendChild(wrap);
+      rows.forEach(function (r) {
+        var row = el('div', 'barrow');
+        row.appendChild(el('div', 'bl', r.label));
+        var track = el('div', 'track');
+        var fill = el('div', 'fill');
+        fill.style.background = r.color || color || ACCENT;
+        track.appendChild(fill);
+        row.appendChild(track);
+        row.appendChild(el('div', 'bv', String(r.value)));
+        wrap.appendChild(row);
+        var pct = (r.value / max) * 100;
+        if (REDUCE) { fill.style.width = pct + '%'; }
+        else { requestAnimationFrame(function () { requestAnimationFrame(function () { fill.style.width = pct + '%'; }); }); }
+      });
+    }
+
+    // One part-to-whole bar + legend (status palette). Segments grow by value.
+    function segments(box, segs) {
+      var total = 0; segs.forEach(function (s) { total += s.value; });
+      var bar = el('div', 'seg');
+      if (total === 0) {
+        bar.appendChild(svgSpanFlex('1', 'var(--track)', null));
+      } else {
+        segs.forEach(function (s) {
+          if (s.value <= 0) return;
+          bar.appendChild(svgSpanFlex(String(s.value), s.color, s.label + ': ' + s.value));
+        });
+      }
+      box.appendChild(bar);
+      var lg = el('div', 'legend');
+      segs.forEach(function (s) {
+        var item = el('div', 'lg');
+        var d = el('span', 'dot'); d.style.background = s.color; item.appendChild(d);
+        item.appendChild(document.createTextNode(s.label));
+        var b = document.createElement('b'); b.textContent = String(s.value); item.appendChild(b);
+        lg.appendChild(item);
+      });
+      box.appendChild(lg);
+    }
+    function svgSpanFlex(grow, color, title) {
+      var span = document.createElement('span');
+      span.style.flex = grow + ' 0 0';
+      span.style.background = color;
+      if (title) span.title = title;
+      return span;
+    }
+
+    // Area + line trend with a crosshair + tooltip (touch = hover in the webview).
+    function trend(box, series) {
+      var W = Math.max(240, box.clientWidth || 320), H = 134;
+      var padL = 6, padR = 6, padT = 14, padB = 20, n = series.length;
+      var iw = W - padL - padR, ih = H - padT - padB;
+      var max = 1, i;
+      for (i = 0; i < n; i++) if (series[i].cnt > max) max = series[i].cnt;
+      function X(i2) { return n <= 1 ? padL + iw / 2 : padL + i2 * iw / (n - 1); }
+      function Y(v) { return padT + ih * (1 - v / max); }
+
+      var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, width: W, height: H });
+      var defs = svgEl('defs', {});
+      var lg = svgEl('linearGradient', { id: 'tgfill', x1: '0', y1: '0', x2: '0', y2: '1' });
+      lg.appendChild(svgEl('stop', { offset: '0', 'stop-color': ACCENT, 'stop-opacity': '0.26' }));
+      lg.appendChild(svgEl('stop', { offset: '1', 'stop-color': ACCENT, 'stop-opacity': '0.02' }));
+      defs.appendChild(lg); svg.appendChild(defs);
+
+      svg.appendChild(svgEl('line', { x1: padL, x2: W - padR, y1: Y(0), y2: Y(0), stroke: 'var(--track)', 'stroke-width': '1' }));
+
+      var da = 'M' + X(0).toFixed(1) + ' ' + Y(0).toFixed(1), dl = '';
+      for (i = 0; i < n; i++) {
+        var px = X(i).toFixed(1), py = Y(series[i].cnt).toFixed(1);
+        da += ' L' + px + ' ' + py;
+        dl += (i ? ' L' : 'M') + px + ' ' + py;
+      }
+      da += ' L' + X(n - 1).toFixed(1) + ' ' + Y(0).toFixed(1) + ' Z';
+      svg.appendChild(svgEl('path', { d: da, fill: 'url(#tgfill)' }));
+      svg.appendChild(svgEl('path', { d: dl, fill: 'none', stroke: ACCENT, 'stroke-width': '2', 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+
+      // peak marker label (top-left, recessive)
+      svg.appendChild(svgEl('text', { x: padL, y: 10, class: 'axis' })).textContent = 'peak ' + max;
+      var t0 = svgEl('text', { x: padL, y: H - 5, class: 'axis', 'text-anchor': 'start' }); t0.textContent = fmtDay(series[0].day); svg.appendChild(t0);
+      var t1 = svgEl('text', { x: W - padR, y: H - 5, class: 'axis', 'text-anchor': 'end' }); t1.textContent = fmtDay(series[n - 1].day); svg.appendChild(t1);
+
+      var cross = svgEl('line', { y1: padT, y2: Y(0), stroke: 'var(--hint)', 'stroke-width': '1', 'stroke-dasharray': '3 3', visibility: 'hidden' });
+      var dot = svgEl('circle', { r: '4', fill: ACCENT, stroke: 'var(--bg)', 'stroke-width': '2', visibility: 'hidden' });
+      svg.appendChild(cross); svg.appendChild(dot);
+      box.appendChild(svg);
+
+      function at(clientX) {
+        var rect = svg.getBoundingClientRect();
+        var vx = (clientX - rect.left) * (W / rect.width);
+        var i3 = n <= 1 ? 0 : Math.round((vx - padL) / (iw / (n - 1)));
+        if (i3 < 0) i3 = 0; if (i3 > n - 1) i3 = n - 1;
+        var cx = X(i3), cy = Y(series[i3].cnt);
+        cross.setAttribute('x1', cx); cross.setAttribute('x2', cx); cross.setAttribute('visibility', 'visible');
+        dot.setAttribute('cx', cx); dot.setAttribute('cy', cy); dot.setAttribute('visibility', 'visible');
+        showTip(rect.left + cx * (rect.width / W), rect.top + cy * (rect.height / H), fmtDay(series[i3].day) + ' · ' + series[i3].cnt);
+      }
+      svg.addEventListener('pointerdown', function (e) { at(e.clientX); });
+      svg.addEventListener('pointermove', function (e) { at(e.clientX); });
+      svg.addEventListener('pointerleave', hideTip);
+      svg.addEventListener('pointerup', hideTip);
+    }
+
+    function showError(msg) {
+      loading.hidden = true;
+      content.hidden = false;
+      content.innerHTML = '';
+      content.appendChild(el('div', 'err', msg));
+    }
+
+    function render(data) {
+      var s = data.stats, f = s.findings;
+      loading.hidden = true;
+      content.hidden = false;
+      content.innerHTML = '';
+      sidx = 0;
+      if (data.viewer) viewerEl.textContent = '👤 ' + data.viewer.username + ' · ' + data.viewer.role;
+
+      // Headline stat tiles.
+      var g = section(null);
+      var grid = el('div', 'grid'); g.appendChild(grid);
+      grid.appendChild(card(s.companies, 'Companies'));
+      grid.appendChild(card(s.domains, 'Domains'));
+      grid.appendChild(card(s.people, 'Contacts'));
+      grid.appendChild(card(s.services, 'Services'));
+      grid.appendChild(card(s.secrets, 'Secrets'));
+      grid.appendChild(card(s.activeJobs, 'Active Jobs'));
+
+      // Findings discovered over time (single-series trend).
+      var tb = panel(section('Findings discovered · last 14 days'));
+      var trendSum = 0; (s.trend || []).forEach(function (r) { trendSum += r.cnt; });
+      var series = buildTrend(s.trend || [], s.sinceDay);
+      if (trendSum === 0) emptyInto(tb, 'No findings recorded in the last 14 days.');
+      else trend(tb, series);
+
+      // Findings by severity (status palette, fixed order, labelled).
+      var sb = panel(section('Findings by severity · ' + f.total + ' total'));
+      if (f.total === 0) emptyInto(sb, 'No findings yet.');
+      else bars(sb, [
+        { label: 'Critical', value: f.critical, color: SEV.critical },
+        { label: 'High', value: f.high, color: SEV.high },
+        { label: 'Medium', value: f.medium, color: SEV.medium },
+        { label: 'Low', value: f.low, color: SEV.low },
+        { label: 'Info', value: f.info, color: SEV.info },
+        { label: 'Resolved', value: f.resolved, color: SEV.resolved }
+      ]);
+
+      // Scan queue composition (part-to-whole status bar).
+      var qb = panel(section('Scan queue'));
+      var jobs = s.jobs || [];
+      if (!jobs.length) emptyInto(qb, 'No scan jobs yet.');
+      else {
+        var order = ['running', 'pending', 'completed', 'failed', 'blocked', 'skipped'];
+        var map = {}; jobs.forEach(function (j) { map[j.status] = (map[j.status] || 0) + j.cnt; });
+        var segs = [];
+        order.forEach(function (k) { if (map[k]) segs.push({ label: cap(k), value: map[k], color: JOB[k] || JOB.skipped }); });
+        Object.keys(map).forEach(function (k) { if (order.indexOf(k) < 0) segs.push({ label: cap(k), value: map[k], color: JOB.skipped }); });
+        segments(qb, segs);
+      }
+
+      // Top targets by findings (single-hue ranking).
+      var ttRows = (s.topTargets || []).filter(function (r) { return r.cnt > 0; })
+        .map(function (r) { return { label: r.name, value: r.cnt }; });
+      var ttb = panel(section('Top targets by findings'));
+      if (!ttRows.length) emptyInto(ttb, 'No findings attributed to targets yet.');
+      else bars(ttb, ttRows, ACCENT);
+
+      // Most common open ports (single-hue ranking).
+      var portRows = (s.topPorts || []).map(function (r) { return { label: 'Port ' + r.port, value: r.cnt }; });
+      var pb = panel(section('Top open ports'));
+      if (!portRows.length) emptyInto(pb, 'No network services recorded yet.');
+      else bars(pb, portRows, ACCENT);
+
+      // System.
+      var sys = panel(section('System'));
+      sysRow(sys, 'Runners online', s.runnersOnline + ' / ' + s.runnersTotal);
+      sysRow(sys, 'Active / queued jobs', String(s.activeJobs));
+      sysRow(sys, 'Updated', new Date(data.generatedAt || Date.now()).toLocaleTimeString());
+    }
+
+    function sysRow(box, k, v) {
+      var row = el('div', 'srow');
+      row.appendChild(el('div', 'k', k));
+      row.appendChild(el('div', 'v', v));
+      box.appendChild(row);
+    }
+    function cap(s2) { return s2 ? s2.charAt(0).toUpperCase() + s2.slice(1) : s2; }
+    function buildTrend(raw, sinceDay) {
+      var m = {}; raw.forEach(function (r) { m[r.day] = r.cnt; });
+      var out = [], d = new Date((sinceDay || new Date().toISOString().slice(0, 10)) + 'T00:00:00');
+      for (var i = 0; i < 14; i++) {
+        var k = d.toISOString().slice(0, 10);
+        out.push({ day: k, cnt: m[k] || 0 });
+        d.setDate(d.getDate() + 1);
+      }
+      return out;
+    }
+
+    function load() {
+      var initData = (tg && tg.initData) || '';
+      loading.hidden = false;
+      content.hidden = true;
+      hideTip();
+      fetch('/app/api/summary', { headers: { 'Authorization': 'tma ' + initData } })
+        .then(function (r) {
+          if (r.status === 401) {
+            return r.json().then(function (j) {
+              throw new Error(j.error === 'pending'
+                ? 'Access pending. Ask an admin to grant your Telegram account a role.'
+                : 'Could not verify your Telegram session. Open this from the bot menu.');
+            });
+          }
+          if (!r.ok) throw new Error('Server error (' + r.status + ').');
+          return r.json();
+        })
+        .then(render)
+        .catch(function (e) { showError(e.message || 'Failed to load.'); });
+    }
+
+    if (!tg || !tg.initData) {
+      showError('Open this page from inside Telegram (via the bot menu).');
+    } else {
+      load();
+      tg.MainButton.setText('Refresh').show().onClick(function () {
+        if (tg.HapticFeedback) try { tg.HapticFeedback.impactOccurred('light'); } catch (_) {}
+        load();
+      });
+    }
+  })();
+  </script>
+</body>
+</html>`;
+
 // Health Check & DB Migration
 app.get('/', (c) => c.text('cHack Serverless Backend & Bot Running!'));
 app.get('/api/db/migrate', async (c) => {
@@ -5875,11 +6450,44 @@ app.post('/webhook', async (c) => {
     }
   }
   const bot = getBot(c.env);
+
+  // Ensure the command list is cleared and the menu button opens the Mini App.
+  // Runs once per isolate (and retries on failure); does not block the update.
+  if (!botConfigured) {
+    botConfigured = true;
+    c.executionCtx.waitUntil(
+      configureBotUI(c.env, bot).catch((err) => {
+        botConfigured = false;
+        console.error('configureBotUI failed:', err.message);
+      })
+    );
+  }
+
   bot.use((ctx, next) => {
     ctx.executionCtx = c.executionCtx;
     return next();
   });
   return await webhookCallback(bot, 'hono')(c);
+});
+
+// Telegram Mini App: static shell + authorized data API.
+app.get('/app', (c) => c.html(MINIAPP_HTML));
+app.get('/app/api/summary', async (c) => {
+  const authz = await authorizeMiniApp(c);
+  if (!authz.ok) {
+    return c.json({ error: authz.pending ? 'pending' : 'unauthorized' }, 401);
+  }
+  try {
+    const stats = await collectDashboardStats(c.env);
+    return c.json({
+      ok: true,
+      viewer: { username: authz.actor.username, role: authz.actor.role },
+      stats,
+      generatedAt: Date.now(),
+    });
+  } catch (err) {
+    return c.json({ error: 'internal', detail: err.message }, 500);
+  }
 });
 
 // Runner APIs (Background Scan Executer)

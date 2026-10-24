@@ -17,3 +17,9 @@ RUNNER_TOKEN=your_shared_runner_token
 # whose X-Telegram-Bot-Api-Secret-Token header does not match.
 # Register it with setWebhook(secret_token=...). Generate: openssl rand -hex 32
 TELEGRAM_WEBHOOK_SECRET=your_webhook_secret
+
+# Optional: this Worker's public https URL (e.g. https://chack-back.<acct>.workers.dev).
+# Used to build the Telegram Mini App button/URL (/app). Falls back to
+# GRAPHQL_ENDPOINT's origin when unset. Telegram requires https, so the Mini App
+# button is hidden for local http dev.
+PUBLIC_URL=https://your-worker.workers.dev
