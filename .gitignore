@@ -31,5 +31,8 @@ temp_job_*.json
 # Authorized-scope allowlist (per-operator; never commit real scope)
 scope.txt
 
-# Claude Code local workspace (worktrees, plans, settings)
-.claude/
+# Claude Code local workspace (worktrees, plans, settings) — but keep
+# shared, repo-level skills (.claude/skills/) checked in and visible to
+# any agent working in this repo.
+.claude/*
+!.claude/skills/

@@ -208,6 +208,73 @@ snippets are masked in results. ASN is not yet captured by the pipeline, so the
 
 ---
 
+## 🧠 BYOK AI Assistant
+
+An optional, bring-your-own-key triage layer over data the pipeline **already
+collected** for one of your own in-scope targets. It never runs scans or
+produces new exploit payloads — it reads your stored report, optionally
+grounds itself in your own methodology notes, and helps you prioritize and
+decide what to verify by hand next. Your key, your provider, your bill; cHack
+never ships or proxies a key for you.
+
+```bash
+# List available skills
+python3 ai_assistant.py skills
+
+# Triage a target's stored findings (dedupe, re-rank, flag likely noise,
+# suggest a next manual-verification step per finding)
+./cHack.sh --ai-review acme.com
+
+# Same, but ground it in your own knowledge-base notes (see AI_KB_PATH below)
+./cHack.sh --ai-review acme.com --ai-kb --ai-save
+
+# Review JS-secret scanner output for true-positive likelihood
+./cHack.sh --ai-review acme.com --ai-skill js_secrets_review
+
+# Short exec summary suitable for pasting into Telegram/a teammate
+./cHack.sh --ai-review acme.com --ai-skill recon_summary
+
+# Past AI reviews stored for a target (requires --ai-save at review time)
+./cHack.sh --ai-history acme.com
+```
+
+**Configure (`.env`):**
+
+```bash
+AI_PROVIDER=anthropic        # anthropic (default) | openai | generic
+AI_API_KEY=                  # your own key — never committed, never shipped
+AI_MODEL=                    # optional override; sane per-provider default
+AI_BASE_URL=                 # required for AI_PROVIDER=generic (self-hosted /
+                              # OpenAI-compatible endpoint)
+AI_KB_PATH=                  # path to a local clone of your own vuln-notes
+                              # repo (one Vulns/<Name>.md per class) for
+                              # skills that take --ai-kb
+```
+
+**Skills** live as plain Markdown prompt templates in `ai_skills/*.skill.md` —
+drop in a new file to add one, no code changes needed (see
+`ai_skills/README.md`). Shipped skills:
+
+| Skill | What it does |
+| :--- | :--- |
+| `triage_findings` (default) | Re-ranks findings by real risk, flags likely false positives, gives one next-step per finding |
+| `js_secrets_review` | Sanity-checks `js_secrets.py`'s confirmed-live/candidate/informational tiering, groups by provider |
+| `recon_summary` | Short, non-technical exec summary of a target's current report |
+| `kb_crossref` | Maps each finding's vuln class to your own KB checklist and flags unverified checklist items |
+
+When `--ai-kb` is set, only the methodology/overview/impact/remediation/
+testing-checklist sections of the matching `Vulns/<Name>.md` note are sent to
+the model by default — the payload-dictionary sections are left out unless
+you also pass `--ai-kb --kb-payloads` (via `python3 ai_assistant.py review ...
+--kb --kb-payloads` directly), since that's denser content you may not want
+leaving your machine by default.
+
+> ⚠️ Same authorized-use scope as the rest of cHack: only point this at
+> targets you already have a right to test, and treat whatever text you send
+> to a third-party AI provider accordingly.
+
+---
+
 ## 🤖 Telegram Bot
 
 Once the Worker is deployed and a runner daemon is online, control everything from Telegram:
@@ -446,6 +513,8 @@ cHack/
 ├── js_secrets.py         # JavaScript secret/credential scanner
 ├── client_bugs.py        # Client-side bug analyzer (DOM XSS, CORS, open redirect, ...)
 ├── db_sqlite.py          # local SQLite store + D1 sync layer
+├── ai_assistant.py       # BYOK AI triage assistant over stored scan data
+├── ai_skills/            # Markdown prompt templates used by ai_assistant.py
 ├── install.sh            # VPS provisioning (Go, toolchain, Python deps)
 ├── back/                 # Cloudflare Worker: Telegram bot + GraphQL API
 │   ├── src/index.js

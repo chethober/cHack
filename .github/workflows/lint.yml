@@ -33,7 +33,7 @@ jobs:
       - name: Lint
         run: ruff check --output-format=github . || true
       - name: Syntax check
-        run: python -m py_compile js_secrets.py db_sqlite.py client_bugs.py
+        run: python -m py_compile js_secrets.py db_sqlite.py client_bugs.py ai_assistant.py
 
   secrets:
     name: Secret Scan (gitleaks)

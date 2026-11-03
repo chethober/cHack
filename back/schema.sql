@@ -165,6 +165,21 @@ CREATE INDEX IF NOT EXISTS idx_findings_company_id ON findings(company_id);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
 CREATE INDEX IF NOT EXISTS idx_findings_vuln_type ON findings(vuln_type);
 
+-- BYOK AI assistant review history (see ai_assistant.py). Stores the
+-- analyst-facing output of a skill run against a target's own stored
+-- report; never holds provider API keys or raw secret values.
+CREATE TABLE IF NOT EXISTS ai_reviews (
+  id TEXT PRIMARY KEY,
+  domain_id TEXT REFERENCES domains(id) ON DELETE CASCADE,
+  company_id TEXT REFERENCES companies(id) ON DELETE CASCADE,
+  skill TEXT NOT NULL,
+  model TEXT,
+  output TEXT NOT NULL,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_reviews_domain_id ON ai_reviews(domain_id);
+
 -- Discovered Endpoints / URLs table
 CREATE TABLE IF NOT EXISTS endpoints (
   id TEXT PRIMARY KEY,
