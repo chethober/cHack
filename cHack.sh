@@ -2903,6 +2903,14 @@ show_usage() {
     echo "  --format FMT              Report format: json (default) | sarif | stix"
     echo "  --include-secrets         Include secret values in reports (default: redacted)"
     echo ""
+    echo "BYOK AI Assistant (triage aid over your own stored data; see .env.example):"
+    echo "  --ai-review TARGET        Run an AI triage skill against a target's stored report"
+    echo "  --ai-skill NAME           Skill to run (default: triage_findings; list with"
+    echo "                            'python3 ai_assistant.py skills')"
+    echo "  --ai-kb                   Ground the review in your AI_KB_PATH notes repo"
+    echo "  --ai-save                 Store the AI output in local.db (see --ai-history)"
+    echo "  --ai-history TARGET       Show past AI reviews stored for a target"
+    echo ""
     echo "Target & Entity Management:"
     echo "  --sync DOMAIN             Sync on-disk scan data to Cloudflare D1 & local SQLite"
     echo "  --sync-all                Sync all targets from disk to Cloudflare D1 & SQLite"
@@ -3123,6 +3131,11 @@ main() {
     local SYNC_ALL=false
     local REPORT_TARGET=""
     local REPORT_FORMAT="json"
+    local AI_REVIEW_TARGET=""
+    local AI_SKILL="triage_findings"
+    local AI_USE_KB=false
+    local AI_SAVE=false
+    local AI_HISTORY_TARGET=""
     SENDER_ID=""
 
     while [[ $# -gt 0 ]]; do
@@ -3176,6 +3189,29 @@ main() {
             --include-secrets)
                 INCLUDE_SECRETS=true
                 shift
+                ;;
+            --ai-review)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                AI_REVIEW_TARGET="$2"
+                shift 2
+                ;;
+            --ai-skill)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                AI_SKILL="$2"
+                shift 2
+                ;;
+            --ai-kb)
+                AI_USE_KB=true
+                shift
+                ;;
+            --ai-save)
+                AI_SAVE=true
+                shift
+                ;;
+            --ai-history)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                AI_HISTORY_TARGET="$2"
+                shift 2
                 ;;
             --sync-all)
                 SYNC_ALL=true
@@ -3272,6 +3308,19 @@ main() {
     if ! check_requirements; then
         log_error "Requirement checks failed. Exiting."
         exit 1
+    fi
+
+    # BYOK AI Assistant (triage aid over the target's own stored report)
+    if [ -n "$AI_REVIEW_TARGET" ]; then
+        local ai_args=(review "$AI_REVIEW_TARGET" --skill "$AI_SKILL")
+        [ "$AI_USE_KB" = true ] && ai_args+=(--kb)
+        [ "$AI_SAVE" = true ] && ai_args+=(--save)
+        python3 "$SCRIPT_DIR/ai_assistant.py" "${ai_args[@]}"
+        exit $?
+    fi
+    if [ -n "$AI_HISTORY_TARGET" ]; then
+        python3 "$SCRIPT_DIR/ai_assistant.py" history "$AI_HISTORY_TARGET"
+        exit $?
     fi
 
     # Report Export (json | sarif | stix)

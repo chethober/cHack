@@ -953,6 +953,37 @@ def get_findings_for_domain(domain_or_slug, severity=None):
     conn.close()
     return findings
 
+def save_ai_review(domain_or_slug, skill, model, output):
+    """Store a BYOK AI assistant review (ai_assistant.py) against whichever
+    company the domain/slug resolves to. Never stores the provider API key
+    or raw secret values — only the model's analyst-facing output text."""
+    conn = get_db()
+    company_id = _resolve_company_id(conn, domain_or_slug.lower())
+    review_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO ai_reviews (id, domain_id, company_id, skill, model, output) "
+        "VALUES (?, NULL, ?, ?, ?, ?)",
+        (review_id, company_id, skill, model, output),
+    )
+    conn.commit()
+    conn.close()
+    return review_id
+
+
+def get_ai_reviews(domain_or_slug, limit=10):
+    conn = get_db()
+    company_id = _resolve_company_id(conn, domain_or_slug.lower())
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT skill, model, output, created_at FROM ai_reviews "
+        "WHERE company_id = ? ORDER BY created_at DESC LIMIT ?",
+        (company_id, limit),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
 def get_secrets_for_domain(domain_or_slug):
     conn = get_db()
     cursor = conn.cursor()
