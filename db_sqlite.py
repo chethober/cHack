@@ -7,7 +7,9 @@ import base64
 import uuid
 from datetime import datetime, timezone
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local.db")
+DB_PATH = os.environ.get(
+    "CHACK_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "local.db")
+)
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -70,6 +72,22 @@ def migrate_db(conn):
             ("requested_by_number_id", "INTEGER"),
             ("company_id", "TEXT"),
             ("source", "TEXT DEFAULT 'telegram'"),
+            # Orchestration columns added after the original scan_jobs schema.
+            # Without these, schema.sql's idx_scan_jobs_dispatch (which indexes
+            # `priority`) fails on a legacy DB and aborts the whole executescript.
+            ("region", "TEXT"),
+            ("priority", "INTEGER NOT NULL DEFAULT 0"),
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("max_attempts", "INTEGER NOT NULL DEFAULT 3"),
+            ("next_eligible_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("assigned_runner", "TEXT"),
+            ("started_at", "INTEGER"),
+            # DAG columns — also needed before executescript builds their indexes.
+            ("job_type", "TEXT"),
+            ("pipeline_id", "TEXT"),
+            ("parent_id", "TEXT"),
+            ("result", "TEXT DEFAULT '{}'"),
+            ("depends_on", "TEXT DEFAULT '[]'"),
         ],
     }
     for table, cols in additions.items():
@@ -1963,6 +1981,210 @@ def detect_drift(target, scan_type="scan", sender_id=None):
     return summary
 
 
+# ===========================================================================
+# Autonomous program onboarding (Phase 1) — store candidates, gate, apply.
+# The scope allowlist (scope.txt) is the authorization boundary: apply_program
+# is the ONLY path here that writes it, it only runs on an approved program, and
+# it never emits a wildcard or an out-of-scope asset (scope_parser enforces that).
+# ===========================================================================
+
+SCOPE_FILE = os.environ.get(
+    "SCOPE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "scope.txt")
+)
+
+
+def _scope_hash(text):
+    import hashlib
+    return hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()
+
+
+def _parse_scope_text(scope_raw, roe_raw=""):
+    """Call scope_parser.parse_scope; import lazily so the module stays optional."""
+    import scope_parser
+    return scope_parser.parse_scope(scope_raw, roe_raw)
+
+
+def onboard_program(platform, handle, name, url, scope_raw, roe_raw="", created_by=None):
+    """Create/refresh a candidate program row from raw scope text.
+
+    Runs the scope parser, stores the verbatim text + parsed proposal, and sets
+    status to 'pending_approval' (awaiting the Telegram gate). Returns the stored
+    program dict including the parsed proposal. Does NOT touch scope.txt.
+    """
+    parsed = _parse_scope_text(scope_raw, roe_raw)
+    conn = get_db()
+    cur = conn.cursor()
+    pid = str(uuid.uuid4())
+    h = _scope_hash(scope_raw)
+    platform = (platform or "manual").lower()
+    # Upsert on (platform, lower(handle)) when a handle is known.
+    existing = None
+    if handle:
+        cur.execute(
+            "SELECT id, status FROM bb_programs WHERE platform = ? AND lower(handle) = lower(?)",
+            (platform, handle),
+        )
+        existing = cur.fetchone()
+    if existing:
+        pid = existing["id"]
+        cur.execute(
+            """UPDATE bb_programs SET name=?, url=?, scope_raw=?, roe_raw=?,
+                 scope_parsed=?, roe_flags=?, status='pending_approval',
+                 last_seen_hash=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+               WHERE id=?""",
+            (name, url, scope_raw, roe_raw, json.dumps(parsed),
+             json.dumps(parsed.get("roe_flags", [])), h, pid),
+        )
+    else:
+        cur.execute(
+            """INSERT INTO bb_programs
+                 (id, platform, handle, name, url, scope_raw, roe_raw, scope_parsed,
+                  roe_flags, status, last_seen_hash, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?)""",
+            (pid, platform, handle, name, url, scope_raw, roe_raw, json.dumps(parsed),
+             json.dumps(parsed.get("roe_flags", [])), h, created_by),
+        )
+    conn.commit()
+    conn.close()
+    write_audit("program.onboard", actor_number_id=created_by or 0, source="cli",
+                target_type="program", target=(handle or name or url),
+                detail={"platform": platform, "emit": parsed["stats"]["emit_count"],
+                        "wildcards": parsed["stats"]["wildcard_count"],
+                        "roe_flags": parsed["roe_flags"]})
+    return get_program(pid)
+
+
+def get_program(program_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM bb_programs WHERE id = ?", (program_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    for k in ("scope_parsed", "roe_flags"):
+        try:
+            d[k] = json.loads(d.get(k) or ("[]" if k == "roe_flags" else "{}"))
+        except Exception:
+            pass
+    return d
+
+
+def list_programs(status=None):
+    conn = get_db()
+    cur = conn.cursor()
+    if status:
+        cur.execute("SELECT id, platform, handle, name, status, created_at FROM bb_programs WHERE status = ? ORDER BY created_at DESC", (status,))
+    else:
+        cur.execute("SELECT id, platform, handle, name, status, created_at FROM bb_programs ORDER BY created_at DESC")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def _existing_scope_entries():
+    """Lowercased set of non-comment entries already in scope.txt."""
+    entries = set()
+    if not os.path.exists(SCOPE_FILE):
+        return entries
+    with open(SCOPE_FILE, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            e = line.split("#", 1)[0].strip().lower()
+            if e:
+                entries.add(e)
+    return entries
+
+
+def apply_program(program_id, decided_by=None, edited_hosts=None):
+    """Append an APPROVED program's emittable hosts to scope.txt and activate it.
+
+    edited_hosts (optional list) overrides the parser's proposal with an
+    operator-edited list — but each entry is re-validated through the parser so a
+    typo or a wildcard can never slip into the allowlist via the edit path.
+    Returns a summary dict. This is the authorization-boundary write.
+    """
+    prog = get_program(program_id)
+    if not prog:
+        return {"error": "program not found"}
+    parsed = prog.get("scope_parsed") or {}
+
+    if edited_hosts:
+        # Re-validate operator edits: feed them back through the parser.
+        reparsed = _parse_scope_text("\n".join(edited_hosts))
+        emit = reparsed.get("scope_txt_lines", [])
+        rejected = sorted({h for h in edited_hosts} - set(emit))
+    else:
+        emit = parsed.get("scope_txt_lines", [])
+        rejected = []
+
+    existing = _existing_scope_entries()
+    to_add = [h for h in emit if h.lower() not in existing]
+
+    if to_add:
+        label = prog.get("name") or prog.get("handle") or program_id
+        platform = prog.get("platform") or "manual"
+        handle = prog.get("handle") or ""
+        header = f"\n# --- onboarded: {label} ({platform}/{handle}) {datetime.now(timezone.utc).strftime('%Y-%m-%d')} via cHack --onboard ---\n"
+        with open(SCOPE_FILE, "a", encoding="utf-8") as f:
+            f.write(header)
+            for h in to_add:
+                f.write(h + "\n")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE bb_programs SET status='active', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+        (program_id,),
+    )
+    cur.execute(
+        "UPDATE pending_approvals SET status='approved', decision=?, decided_by=?, decided_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE program_id=? AND status='pending'",
+        (json.dumps(to_add), decided_by, program_id),
+    )
+    conn.commit()
+    conn.close()
+    write_audit("program.apply", actor_number_id=decided_by or 0, source="cli",
+                target_type="program", target=(prog.get("handle") or prog.get("name")),
+                detail={"added": to_add, "rejected": rejected, "scope_file": SCOPE_FILE})
+    return {"program_id": program_id, "added": to_add, "already_present": [h for h in emit if h.lower() in existing],
+            "rejected": rejected, "scope_file": SCOPE_FILE, "status": "active"}
+
+
+def onboard_scope_append(label, hosts):
+    """Append a backend-approved host list to scope.txt (remote-apply path).
+
+    Every host is re-validated through scope_parser before it is written, so the
+    allowlist can only ever gain exact hosts/IPs/CIDRs — never a wildcard or a
+    malformed entry — regardless of what the backend sent. Deduped against the
+    existing file. Returns {"added": [...]}.
+    """
+    reparsed = _parse_scope_text("\n".join(hosts or []))
+    emit = reparsed.get("scope_txt_lines", [])
+    existing = _existing_scope_entries()
+    to_add = [h for h in emit if h.lower() not in existing]
+    if to_add:
+        header = f"\n# --- onboarded: {label} {datetime.now(timezone.utc).strftime('%Y-%m-%d')} via cHack (remote apply) ---\n"
+        with open(SCOPE_FILE, "a", encoding="utf-8") as f:
+            f.write(header)
+            for h in to_add:
+                f.write(h + "\n")
+    write_audit("program.apply_remote", source="daemon", target_type="program",
+                target=label, detail={"added": to_add, "scope_file": SCOPE_FILE})
+    return {"added": to_add, "scope_file": SCOPE_FILE}
+
+
+def skip_program(program_id, decided_by=None):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE bb_programs SET status='skipped', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", (program_id,))
+    cur.execute("UPDATE pending_approvals SET status='skipped', decided_by=?, decided_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE program_id=? AND status='pending'", (decided_by, program_id))
+    conn.commit()
+    conn.close()
+    write_audit("program.skip", actor_number_id=decided_by or 0, source="cli",
+                target_type="program", target=program_id)
+    return {"program_id": program_id, "status": "skipped"}
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: db_sqlite.py <command> [args...]")
@@ -2081,6 +2303,68 @@ def main():
         scan_type = sys.argv[3] if len(sys.argv) > 3 else 'scan'
         sender_id = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
         print(json.dumps(detect_drift(sys.argv[2], scan_type, sender_id), indent=2))
+    elif cmd == 'onboard':
+        # onboard <scope_file> [roe_file] --platform P --handle H --name N --url U --by ID
+        if len(sys.argv) < 3:
+            print("Usage: db_sqlite.py onboard <scope_file|-> [roe_file] [--platform P] [--handle H] [--name N] [--url U] [--by ID]")
+            sys.exit(1)
+        args = sys.argv[2:]
+        opts = {}
+        pos = []
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a.startswith('--'):
+                opts[a[2:]] = args[i + 1] if i + 1 < len(args) else ''
+                i += 2
+            else:
+                pos.append(a)
+                i += 1
+        scope_src = pos[0]
+        scope_raw = sys.stdin.read() if scope_src == '-' else open(scope_src, encoding='utf-8', errors='replace').read()
+        roe_raw = ''
+        if len(pos) > 1 and pos[1] not in ('', '-'):
+            roe_raw = open(pos[1], encoding='utf-8', errors='replace').read()
+        prog = onboard_program(opts.get('platform', 'manual'), opts.get('handle'),
+                               opts.get('name'), opts.get('url'), scope_raw, roe_raw,
+                               int(opts['by']) if opts.get('by', '').isdigit() else None)
+        print(json.dumps(prog, indent=2))
+    elif cmd == 'programs':
+        print(json.dumps(list_programs(sys.argv[2] if len(sys.argv) > 2 else None), indent=2))
+    elif cmd == 'program':
+        if len(sys.argv) < 3:
+            print("Usage: db_sqlite.py program <program_id>")
+            sys.exit(1)
+        print(json.dumps(get_program(sys.argv[2]), indent=2))
+    elif cmd == 'onboard_apply':
+        if len(sys.argv) < 3:
+            print("Usage: db_sqlite.py onboard_apply <program_id> [--by ID] [--hosts h1,h2,...]")
+            sys.exit(1)
+        by = None
+        hosts = None
+        rest = sys.argv[3:]
+        for j, a in enumerate(rest):
+            if a == '--by' and j + 1 < len(rest):
+                by = int(rest[j + 1]) if rest[j + 1].isdigit() else None
+            if a == '--hosts' and j + 1 < len(rest):
+                hosts = [h.strip() for h in rest[j + 1].split(',') if h.strip()]
+        print(json.dumps(apply_program(sys.argv[2], by, hosts), indent=2))
+    elif cmd == 'onboard_skip':
+        if len(sys.argv) < 3:
+            print("Usage: db_sqlite.py onboard_skip <program_id> [by_id]")
+            sys.exit(1)
+        by = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else None
+        print(json.dumps(skip_program(sys.argv[2], by), indent=2))
+    elif cmd == 'onboard_scope_append':
+        # onboard_scope_append <label> <json_array_of_hosts>
+        if len(sys.argv) < 4:
+            print("Usage: db_sqlite.py onboard_scope_append <label> <json_hosts>")
+            sys.exit(1)
+        try:
+            hosts = json.loads(sys.argv[3])
+        except Exception:
+            hosts = [h.strip() for h in sys.argv[3].split(',') if h.strip()]
+        print(json.dumps(onboard_scope_append(sys.argv[2], hosts), indent=2))
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)

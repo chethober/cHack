@@ -2911,6 +2911,18 @@ show_usage() {
     echo "  --ai-save                 Store the AI output in local.db (see --ai-history)"
     echo "  --ai-history TARGET       Show past AI reviews stored for a target"
     echo ""
+    echo "Program onboarding (autonomous pipeline, Phase 1 — human-gated):"
+    echo "  --onboard SRC             Parse a program's scope (file, URL, or - for stdin) into"
+    echo "                            a pending-approval candidate. Does NOT authorize scanning."
+    echo "    --onboard-roe FILE        Optional rules-of-engagement text (red-flag scan)"
+    echo "    --onboard-platform P      hackerone | bugcrowd | intigriti | yeswehack | manual"
+    echo "    --onboard-handle H        Program handle/slug   --onboard-name N   Display name"
+    echo "    --onboard-url U           Program URL"
+    echo "  --onboard-list            List candidates awaiting approval"
+    echo "  --onboard-apply ID        Approve: write the candidate's exact hosts to scope.txt"
+    echo "    --onboard-hosts a,b,c     Override with an operator-edited host list (re-validated)"
+    echo "  --onboard-skip ID         Discard a candidate"
+    echo ""
     echo "Target & Entity Management:"
     echo "  --sync DOMAIN             Sync on-disk scan data to Cloudflare D1 & local SQLite"
     echo "  --sync-all                Sync all targets from disk to Cloudflare D1 & SQLite"
@@ -3057,6 +3069,13 @@ runner_poll_for_jobs() {
             runner_update_status "$job_id" "failed"
             return
         fi
+    elif [ "$job_type" = "onboard" ]; then
+        # Onboarding parses a candidate program's scope and (on human approval)
+        # appends approved hosts to scope.txt. It scans nothing, so host-
+        # scope_guard does not apply — a brand-new program is by definition not
+        # yet in scope. The parse/apply themselves only ever ADD exact hosts via
+        # scope_parser (never a wildcard), and apply runs only after approval.
+        :
     elif [ -n "$domain" ] && [ "$domain" != "null" ]; then
         # Enforce scope before executing a queue-supplied job. Fail closed (daemon
         # context) so a poisoned/misconfigured queue can't aim the fleet off-scope.
@@ -3136,6 +3155,19 @@ main() {
     local AI_USE_KB=false
     local AI_SAVE=false
     local AI_HISTORY_TARGET=""
+    # Autonomous onboarding (Phase 1)
+    local ONBOARD_SRC=""
+    local ONBOARD_ROE=""
+    local ONBOARD_PLATFORM="manual"
+    local ONBOARD_HANDLE=""
+    local ONBOARD_NAME=""
+    local ONBOARD_URL=""
+    local ONBOARD_APPLY_ID=""
+    local ONBOARD_SKIP_ID=""
+    local ONBOARD_HOSTS=""
+    local ONBOARD_LIST=false
+    local ONBOARD_PROCESS_ID=""
+    local ONBOARD_APPLY_REMOTE_ID=""
     SENDER_ID=""
 
     while [[ $# -gt 0 ]]; do
@@ -3161,6 +3193,65 @@ main() {
             --allow-out-of-scope)
                 ALLOW_OUT_OF_SCOPE=true
                 shift
+                ;;
+            --onboard)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument (scope file, URL, or - for stdin)."; exit 1; fi
+                ONBOARD_SRC="$2"
+                shift 2
+                ;;
+            --onboard-roe)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                ONBOARD_ROE="$2"
+                shift 2
+                ;;
+            --onboard-platform)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                ONBOARD_PLATFORM="$2"
+                shift 2
+                ;;
+            --onboard-handle)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                ONBOARD_HANDLE="$2"
+                shift 2
+                ;;
+            --onboard-name)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                ONBOARD_NAME="$2"
+                shift 2
+                ;;
+            --onboard-url)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                ONBOARD_URL="$2"
+                shift 2
+                ;;
+            --onboard-apply)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument (program id)."; exit 1; fi
+                ONBOARD_APPLY_ID="$2"
+                shift 2
+                ;;
+            --onboard-hosts)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                ONBOARD_HOSTS="$2"
+                shift 2
+                ;;
+            --onboard-skip)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument (program id)."; exit 1; fi
+                ONBOARD_SKIP_ID="$2"
+                shift 2
+                ;;
+            --onboard-list)
+                ONBOARD_LIST=true
+                shift
+                ;;
+            --onboard-process)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires a program id."; exit 1; fi
+                ONBOARD_PROCESS_ID="$2"
+                shift 2
+                ;;
+            --onboard-apply-remote)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires a program id."; exit 1; fi
+                ONBOARD_APPLY_REMOTE_ID="$2"
+                shift 2
                 ;;
             --update-tools)
                 UPDATE_TOOLS=true
@@ -3308,6 +3399,105 @@ main() {
     if ! check_requirements; then
         log_error "Requirement checks failed. Exiting."
         exit 1
+    fi
+
+    # --------------------------------------------------------------------
+    # Autonomous onboarding (Phase 1): parse a program's scope, store it as a
+    # pending-approval candidate, and (on approval) write scope.txt. The parse
+    # and store steps NEVER authorize a scan — only --onboard-apply writes the
+    # allowlist, and only scope_parser-approved exact hosts/IPs/CIDRs get in.
+    # --------------------------------------------------------------------
+    if [ "$ONBOARD_LIST" = true ]; then
+        python3 "$SCRIPT_DIR/db_sqlite.py" programs pending_approval | jq -r '.[] | "  🔎 \(.name // .handle) [\(.platform)]  id=\(.id)  (\(.status))"' 2>/dev/null \
+            || python3 "$SCRIPT_DIR/db_sqlite.py" programs pending_approval
+        exit 0
+    fi
+    if [ -n "$ONBOARD_SRC" ]; then
+        local onb_scope_file="$ONBOARD_SRC"
+        local onb_tmp=""
+        # A URL source is fetched best-effort; platform pages are JS-heavy, so a
+        # saved scope file or stdin ('-') is the reliable Phase-1 input.
+        if [[ "$ONBOARD_SRC" =~ ^https?:// ]]; then
+            onb_tmp="$(mktemp)" || { log_error "mktemp failed"; exit 1; }
+            if ! curl -fsSL --max-time 30 -A "cHack-onboard" "$ONBOARD_SRC" -o "$onb_tmp" 2>/dev/null; then
+                log_error "Failed to fetch $ONBOARD_SRC — save the scope text to a file and pass that instead."
+                rm -f "$onb_tmp"; exit 1
+            fi
+            onb_scope_file="$onb_tmp"
+            [ -z "$ONBOARD_URL" ] && ONBOARD_URL="$ONBOARD_SRC"
+        fi
+        local onb_args=(onboard "$onb_scope_file")
+        [ -n "$ONBOARD_ROE" ] && onb_args+=("$ONBOARD_ROE")
+        onb_args+=(--platform "$ONBOARD_PLATFORM")
+        [ -n "$ONBOARD_HANDLE" ] && onb_args+=(--handle "$ONBOARD_HANDLE")
+        [ -n "$ONBOARD_NAME" ] && onb_args+=(--name "$ONBOARD_NAME")
+        [ -n "$ONBOARD_URL" ] && onb_args+=(--url "$ONBOARD_URL")
+        [ -n "${SENDER_ID:-}" ] && onb_args+=(--by "$SENDER_ID")
+        python3 "$SCRIPT_DIR/db_sqlite.py" "${onb_args[@]}"
+        local onb_rc=$?
+        [ -n "$onb_tmp" ] && rm -f "$onb_tmp"
+        echo
+        log_info "Candidate stored as pending_approval. Review it, then approve with:"
+        log_info "  ./cHack.sh --onboard-apply <program_id>    (writes approved hosts to scope.txt)"
+        log_info "  ./cHack.sh --onboard-skip  <program_id>    (discard)"
+        exit $onb_rc
+    fi
+    if [ -n "$ONBOARD_APPLY_ID" ]; then
+        local apply_args=(onboard_apply "$ONBOARD_APPLY_ID")
+        [ -n "${SENDER_ID:-}" ] && apply_args+=(--by "$SENDER_ID")
+        [ -n "$ONBOARD_HOSTS" ] && apply_args+=(--hosts "$ONBOARD_HOSTS")
+        python3 "$SCRIPT_DIR/db_sqlite.py" "${apply_args[@]}"
+        exit $?
+    fi
+    if [ -n "$ONBOARD_SKIP_ID" ]; then
+        python3 "$SCRIPT_DIR/db_sqlite.py" onboard_skip "$ONBOARD_SKIP_ID" "${SENDER_ID:-}"
+        exit $?
+    fi
+    # Runner <-> backend onboarding (driven by the Telegram gate). These run as
+    # queued jobs on the daemon: fetch a candidate's raw scope from the backend,
+    # parse it locally, and push the proposal back for human approval; then, on
+    # approval, write the approved hosts to scope.txt and report back.
+    if [ -n "$ONBOARD_PROCESS_ID" ]; then
+        local pr_res pr_scope pr_roe pr_parsed pr_sfile pr_rfile
+        pr_res=$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${RUNNER_TOKEN:-}" "${BACKEND_URL}/api/runner/program?id=${ONBOARD_PROCESS_ID}" 2>/dev/null) \
+            || { log_error "onboard-process: failed to fetch program ${ONBOARD_PROCESS_ID}"; exit 1; }
+        pr_sfile=$(mktemp); pr_rfile=$(mktemp)
+        printf '%s' "$pr_res" | jq -r '.program.scope_raw // ""' > "$pr_sfile"
+        printf '%s' "$pr_res" | jq -r '.program.roe_raw // ""' > "$pr_rfile"
+        pr_parsed=$(python3 "$SCRIPT_DIR/scope_parser.py" "$pr_sfile" "$pr_rfile" 2>/dev/null)
+        rm -f "$pr_sfile" "$pr_rfile"
+        if [ -z "$pr_parsed" ]; then log_error "onboard-process: parser produced no output"; exit 1; fi
+        local pr_flags
+        pr_flags=$(printf '%s' "$pr_parsed" | jq -c '.roe_flags // []')
+        local pr_payload
+        pr_payload=$(jq -n --arg id "$ONBOARD_PROCESS_ID" --argjson sp "$pr_parsed" --argjson rf "$pr_flags" \
+            '{id:$id, scope_parsed:$sp, roe_flags:$rf}')
+        curl -fsSL --max-time 30 -X POST "${BACKEND_URL}/api/runner/program/parsed" \
+            -H "Authorization: Bearer ${RUNNER_TOKEN:-}" -H "Content-Type: application/json" \
+            -d "$pr_payload" >/dev/null 2>&1 \
+            || { log_error "onboard-process: failed to push parsed result"; exit 1; }
+        local pr_emit
+        pr_emit=$(printf '%s' "$pr_parsed" | jq -r '.stats.emit_count')
+        log_info "onboard-process: parsed ${ONBOARD_PROCESS_ID} (${pr_emit} emittable hosts) — awaiting approval."
+        emit_result "{\"job_type\":\"onboard\",\"stage\":\"parsed\",\"emit\":${pr_emit:-0}}"
+        exit 0
+    fi
+    if [ -n "$ONBOARD_APPLY_REMOTE_ID" ]; then
+        local ar_res ar_emit ar_label ar_added
+        ar_res=$(curl -fsSL --max-time 30 -H "Authorization: Bearer ${RUNNER_TOKEN:-}" "${BACKEND_URL}/api/runner/program?id=${ONBOARD_APPLY_REMOTE_ID}" 2>/dev/null) \
+            || { log_error "onboard-apply: failed to fetch program ${ONBOARD_APPLY_REMOTE_ID}"; exit 1; }
+        # scope_parsed is stored as a JSON string in the DB.
+        ar_emit=$(printf '%s' "$ar_res" | jq -c '(.program.scope_parsed | if type=="string" then fromjson else . end).scope_txt_lines // []' 2>/dev/null)
+        ar_label=$(printf '%s' "$ar_res" | jq -r '.program.handle // .program.name // "program"')
+        [ -z "$ar_emit" ] && ar_emit="[]"
+        ar_added=$(python3 "$SCRIPT_DIR/db_sqlite.py" onboard_scope_append "$ar_label" "$ar_emit" | jq -c '.added // []')
+        curl -fsSL --max-time 30 -X POST "${BACKEND_URL}/api/runner/program/applied" \
+            -H "Authorization: Bearer ${RUNNER_TOKEN:-}" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg id "$ONBOARD_APPLY_REMOTE_ID" --argjson a "$ar_added" '{id:$id, added:$a}')" >/dev/null 2>&1 \
+            || log_warn "onboard-apply: failed to notify backend (scope.txt already updated locally)"
+        log_info "onboard-apply: wrote $(printf '%s' "$ar_added" | jq 'length') host(s) to scope.txt for ${ar_label}."
+        emit_result "{\"job_type\":\"onboard\",\"stage\":\"applied\"}"
+        exit 0
     fi
 
     # BYOK AI Assistant (triage aid over the target's own stored report)

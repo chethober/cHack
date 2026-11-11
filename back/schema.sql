@@ -477,3 +477,52 @@ CREATE TABLE IF NOT EXISTS target_playbooks (
 CREATE INDEX IF NOT EXISTS idx_target_playbooks_playbook ON target_playbooks(playbook_id);
 CREATE INDEX IF NOT EXISTS idx_target_playbooks_domain ON target_playbooks(domain_id);
 CREATE INDEX IF NOT EXISTS idx_target_playbooks_group ON target_playbooks(group_id);
+
+-- =====================================================================
+-- Autonomous bug-bounty program onboarding (Phase 1)
+-- =====================================================================
+-- Candidate programs discovered (or manually submitted via /onboard) from the
+-- public platforms. Raw scope/RoE text is stored verbatim for audit; the
+-- parsed proposal (scope_parser.py output) drives the Telegram approval gate.
+-- Nothing here is authorized to be scanned until a human approves it and the
+-- runner writes the approved hosts into scope.txt.
+CREATE TABLE IF NOT EXISTS bb_programs (
+  id TEXT PRIMARY KEY,
+  platform TEXT NOT NULL DEFAULT 'manual', -- hackerone | bugcrowd | intigriti | yeswehack | manual
+  handle TEXT,                             -- program slug/handle on the platform
+  name TEXT,
+  url TEXT,
+  scope_raw TEXT,                          -- verbatim scope text (audit)
+  roe_raw TEXT,                            -- verbatim rules-of-engagement text (audit)
+  scope_parsed TEXT DEFAULT '{}',          -- JSON: scope_parser.py result
+  roe_flags TEXT DEFAULT '[]',             -- JSON array of red-flag labels
+  status TEXT NOT NULL DEFAULT 'new',      -- new | pending_approval | active | skipped | error
+  last_seen_hash TEXT,                     -- hash of scope_raw, for change detection
+  company_id TEXT REFERENCES companies(id) ON DELETE SET NULL,
+  created_by INTEGER,                      -- Telegram id of submitter (manual) or NULL (discovery)
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS bb_programs_platform_handle_uq ON bb_programs(platform, lower(handle));
+CREATE INDEX IF NOT EXISTS idx_bb_programs_status ON bb_programs(status);
+
+-- Generic human-decision gate. A row is raised whenever the pipeline must stop
+-- and ask the operator (currently: onboard a program). Reusable for future
+-- gates (wildcard, scope_change) without a schema change.
+CREATE TABLE IF NOT EXISTS pending_approvals (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL DEFAULT 'onboard',    -- onboard | wildcard | roe | scope_change
+  program_id TEXT REFERENCES bb_programs(id) ON DELETE CASCADE,
+  payload TEXT DEFAULT '{}',               -- JSON: proposed scope diff, flags, counts
+  chat_id INTEGER,                         -- Telegram chat the gate message was sent to
+  message_id INTEGER,                      -- Telegram message id of the gate (for edits)
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | edited | skipped
+  decision TEXT,                           -- free-text / edited host list
+  decided_by INTEGER,                      -- Telegram id of the operator who decided
+  decided_at TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_approvals_status ON pending_approvals(status);
+CREATE INDEX IF NOT EXISTS idx_pending_approvals_program ON pending_approvals(program_id);

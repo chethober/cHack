@@ -3301,6 +3301,75 @@ const getBot = (env) => {
   });
 
   // ----------------------------------------------------
+  // Autonomous onboarding (Phase 1) — human-gated program intake
+  // ----------------------------------------------------
+  // /onboard <platform> <handle>  then paste the program's scope text on the
+  // following lines (or reply to a message that contains it). The scope is
+  // stored in D1 and a runner parses it; the operator approves the proposed
+  // hosts before anything is written to scope.txt. Nothing is scanned here.
+  bot.command("onboard", async (ctx) => {
+    await registerUser(ctx);
+    if (!(await requireRole(ctx, 'operator', 'program.onboard', 'program'))) return;
+
+    const raw = (ctx.match || "").trim();
+    const replied = ctx.message?.reply_to_message?.text || ctx.message?.reply_to_message?.caption || "";
+    const nl = raw.indexOf("\n");
+    const header = (nl === -1 ? raw : raw.slice(0, nl)).trim();
+    let scopeText = (nl === -1 ? "" : raw.slice(nl + 1)).trim();
+    if (!scopeText && replied) scopeText = replied.trim();
+
+    const parts = header.split(/\s+/).filter(Boolean);
+    const valid = ["hackerone", "bugcrowd", "intigriti", "yeswehack", "manual"];
+    const platform = valid.includes((parts[0] || "").toLowerCase()) ? parts[0].toLowerCase() : "manual";
+    const handle = (platform === "manual" ? parts[0] : parts[1]) || null;
+
+    if (!scopeText) {
+      return await ctx.reply(
+        "🪪 <b>Onboard a bug-bounty program</b>\n\n" +
+        "<code>/onboard &lt;platform&gt; &lt;handle&gt;</code>\n" +
+        "then paste the program's scope text on the next lines, " +
+        "or reply to a message containing it.\n\n" +
+        "Platforms: <code>hackerone</code> · <code>bugcrowd</code> · <code>intigriti</code> · <code>yeswehack</code> · <code>manual</code>\n\n" +
+        "Nothing is scanned until you approve the parsed scope.",
+        { parse_mode: "HTML" }
+      );
+    }
+
+    const pid = crypto.randomUUID();
+    try {
+      await env.DB.prepare(
+        "INSERT INTO bb_programs (id, platform, handle, name, scope_raw, status, created_by) VALUES (?, ?, ?, ?, ?, 'new', ?)"
+      ).bind(pid, platform, handle, handle || platform, scopeText, ctx.from.id).run();
+    } catch (e) {
+      return await ctx.reply("❌ Could not store program: " + escapeHtml(e.message), { parse_mode: "HTML" });
+    }
+
+    // Queue a parse job referenced only by id (no scope text in the command
+    // string, which the daemon eval-guards). domain='' so the daemon skips host
+    // scope_guard (job_type 'onboard' is read-only).
+    const runner = ctx.session?.selected_runner || 'default';
+    const jobId = crypto.randomUUID();
+    await env.DB.prepare(
+      "INSERT INTO scan_jobs (id, command, domain, runner, status, job_type, requested_by_number_id, source) VALUES (?, ?, '', ?, 'pending', 'onboard', ?, 'telegram')"
+    ).bind(jobId, `--onboard-process ${pid} --sender-id ${ctx.from.id}`, runner, ctx.from.id).run();
+
+    await auditLog(env, {
+      actor_number_id: ctx.from.id, actor_label: ctx.from.username,
+      source: 'telegram', action: 'program.onboard', decision: 'allow',
+      target_type: 'program', target: handle || platform,
+      detail: { program_id: pid, job_id: jobId, platform },
+    });
+
+    await ctx.reply(
+      `🔎 <b>Parsing scope for</b> <code>${escapeHtml(handle || platform)}</code> [${platform}]…\n\n` +
+      `• Runner: <code>${runner}</code>\n` +
+      `• Job: <code>${jobId}</code>\n\n` +
+      `I'll send the proposed scope for your approval once it's parsed.`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ----------------------------------------------------
   // Continuous monitoring commands
   // ----------------------------------------------------
   bot.command("monitor", async (ctx) => {
@@ -4217,6 +4286,29 @@ const getBot = (env) => {
         parse_mode: "HTML",
         reply_markup: menuMarkup
       });
+    } else if (data.startsWith("onboard_ok:")) {
+      if (!(await requireRole(ctx, 'operator', 'program.apply', 'program'))) return;
+      const pid = data.slice("onboard_ok:".length);
+      const prog = await env.DB.prepare("SELECT * FROM bb_programs WHERE id = ?").bind(pid).first();
+      if (!prog) { await ctx.answerCallbackQuery({ text: "Program not found", show_alert: true }).catch(() => {}); return; }
+      const runner = ctx.session?.selected_runner || 'default';
+      const jobId = crypto.randomUUID();
+      await env.DB.prepare(
+        "INSERT INTO scan_jobs (id, command, domain, runner, status, job_type, requested_by_number_id, source) VALUES (?, ?, '', ?, 'pending', 'onboard', ?, 'telegram')"
+      ).bind(jobId, `--onboard-apply-remote ${pid} --sender-id ${ctx.from.id}`, runner, ctx.from.id).run();
+      await env.DB.prepare("UPDATE pending_approvals SET status='approved', decided_by=?, decided_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE program_id=? AND status='pending'").bind(ctx.from.id, pid).run();
+      await auditLog(env, { actor_number_id: ctx.from.id, actor_label: ctx.from.username, source: 'telegram', action: 'program.apply', decision: 'allow', target_type: 'program', target: prog.handle || prog.name, detail: { program_id: pid, job_id: jobId } });
+      await ctx.answerCallbackQuery({ text: "Approved — writing scope.txt on the runner" }).catch(() => {});
+      await safeEditMessageText(ctx, `✅ <b>Approved</b> <code>${escapeHtml(prog.handle || prog.name || pid)}</code>\n\nThe runner is appending the approved hosts to <code>scope.txt</code>, then monitoring will pick them up.`, { parse_mode: "HTML" });
+    } else if (data.startsWith("onboard_no:")) {
+      if (!(await requireRole(ctx, 'operator', 'program.skip', 'program'))) return;
+      const pid = data.slice("onboard_no:".length);
+      const prog = await env.DB.prepare("SELECT handle, name FROM bb_programs WHERE id = ?").bind(pid).first();
+      await env.DB.prepare("UPDATE bb_programs SET status='skipped', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").bind(pid).run();
+      await env.DB.prepare("UPDATE pending_approvals SET status='skipped', decided_by=?, decided_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE program_id=? AND status='pending'").bind(ctx.from.id, pid).run();
+      await auditLog(env, { actor_number_id: ctx.from.id, actor_label: ctx.from.username, source: 'telegram', action: 'program.skip', decision: 'allow', target_type: 'program', target: (prog && (prog.handle || prog.name)) || pid, detail: { program_id: pid } });
+      await ctx.answerCallbackQuery({ text: "Skipped" }).catch(() => {});
+      await safeEditMessageText(ctx, `🚫 <b>Skipped</b> <code>${escapeHtml((prog && (prog.handle || prog.name)) || pid)}</code>. Nothing was added to scope.`, { parse_mode: "HTML" });
     } else if (data === "admin_home") {
       if (!await ensureAdminCallback(ctx)) return;
       await safeEditMessageText(ctx, ADMIN_MENU_TEXT, { parse_mode: "HTML", reply_markup: buildAdminMenu() });
@@ -6837,6 +6929,91 @@ app.post('/api/runner/status', async (c) => {
         console.error("DAG orchestration error:", e.message);
       }
     }
+  }
+  return c.json({ success: true });
+});
+
+// --------------------------------------------------------------------------
+// Autonomous onboarding (Phase 1): runner <-> backend program exchange.
+// RUNNER_TOKEN-authed. The runner fetches a candidate's raw scope, parses it
+// locally (scope_parser.py), and pushes the parsed proposal back; the backend
+// raises the Telegram approval gate. scope.txt is only ever written on the
+// runner, on approval (--onboard-apply-remote).
+// --------------------------------------------------------------------------
+app.get('/api/runner/program', async (c) => {
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
+  const id = c.req.query('id');
+  if (!id) return c.json({ error: 'id required' }, 400);
+  const row = await c.env.DB.prepare("SELECT * FROM bb_programs WHERE id = ?").bind(id).first();
+  if (!row) return c.json({ error: 'not found' }, 404);
+  return c.json({ program: row });
+});
+
+app.post('/api/runner/program/parsed', async (c) => {
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
+  const body = await c.req.json().catch(() => ({}));
+  const { id } = body;
+  if (!id || !body.scope_parsed) return c.json({ error: 'id and scope_parsed required' }, 400);
+  const prog = await c.env.DB.prepare("SELECT * FROM bb_programs WHERE id = ?").bind(id).first();
+  if (!prog) return c.json({ error: 'not found' }, 404);
+
+  const parsed = typeof body.scope_parsed === 'string' ? JSON.parse(body.scope_parsed) : body.scope_parsed;
+  const flags = body.roe_flags || parsed.roe_flags || [];
+  await c.env.DB.prepare(
+    "UPDATE bb_programs SET scope_parsed=?, roe_flags=?, status='pending_approval', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?"
+  ).bind(JSON.stringify(parsed), JSON.stringify(flags), id).run();
+
+  const emit = parsed.scope_txt_lines || [];
+  const wild = parsed.wildcards || [];
+  const chatId = prog.created_by;
+
+  const apprId = crypto.randomUUID();
+  await c.env.DB.prepare(
+    "INSERT INTO pending_approvals (id, kind, program_id, payload, chat_id, status) VALUES (?, 'onboard', ?, ?, ?, 'pending')"
+  ).bind(apprId, id, JSON.stringify({ emit, wild, flags }), chatId || null).run();
+
+  if (chatId) {
+    try {
+      const bot = getBot(c.env);
+      const esc = (s) => String(s).replace(/[&<>]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
+      const emitList = emit.length ? emit.map(h => `  • <code>${esc(h)}</code>`).join("\n") : "  (none — nothing emittable)";
+      const wildLine = wild.length ? `\n⚠️ <b>${wild.length} wildcard(s)</b> NOT added (need manual scope): ${wild.map(w => `<code>*.${esc(w)}</code>`).join(", ")}` : "";
+      const roeLine = flags.length ? `\n🚩 <b>RoE flags:</b> ${flags.map(f => `<code>${esc(f)}</code>`).join(", ")}` : "";
+      const text =
+        `🪪 <b>Approve onboarding:</b> <code>${esc(prog.handle || prog.name || id)}</code> [${esc(prog.platform)}]\n\n` +
+        `<b>${emit.length} host(s)/range(s) to add to scope.txt:</b>\n${emitList}` + wildLine + roeLine +
+        `\n\nApprove to write these to <code>scope.txt</code> on the runner and begin monitoring.`;
+      await bot.api.sendMessage(chatId, text, {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[
+          { text: "✅ Approve", callback_data: `onboard_ok:${id}` },
+          { text: "🚫 Skip", callback_data: `onboard_no:${id}` },
+        ]] },
+      });
+    } catch (e) {
+      console.error("onboard gate send failed:", e.message);
+    }
+  }
+  return c.json({ success: true, pending_approval: apprId });
+});
+
+app.post('/api/runner/program/applied', async (c) => {
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
+  const body = await c.req.json().catch(() => ({}));
+  const { id, added } = body;
+  if (!id) return c.json({ error: 'id required' }, 400);
+  await c.env.DB.prepare(
+    "UPDATE bb_programs SET status='active', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?"
+  ).bind(id).run();
+  const prog = await c.env.DB.prepare("SELECT created_by, handle, name FROM bb_programs WHERE id = ?").bind(id).first();
+  if (prog && prog.created_by) {
+    try {
+      const bot = getBot(c.env);
+      const n = Array.isArray(added) ? added.length : 0;
+      await bot.api.sendMessage(prog.created_by,
+        `✅ <b>Onboarded</b> <code>${String(prog.handle || prog.name || id).replace(/[&<>]/g, '')}</code> — ${n} host(s) now in scope.txt. Continuous monitoring will pick them up.`,
+        { parse_mode: "HTML" });
+    } catch (e) { console.error("applied notify failed:", e.message); }
   }
   return c.json({ success: true });
 });
