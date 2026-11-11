@@ -6004,42 +6004,46 @@ const MINIAPP_HTML = `<!doctype html>
 <title>cHack Intel</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-  /* ---- Design tokens (dark default; light via [data-theme=light]). Palette is
-     the validated data-viz reference: categorical slots 1-3 for node types,
-     fixed status palette for severity, blue sequential for trend/ranking. ---- */
   :root{
     color-scheme: dark;
     --plane:#0d0d0d; --surface:#1a1a19; --surface-2:#232321; --surface-3:#2b2b28;
     --ink:#f0efec; --ink-2:#c3c2b7; --muted:#898781;
-    --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10);
+    --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10); --border-2:rgba(255,255,255,.06);
     --c-company:#3987e5; --c-domain:#199e70; --c-person:#d95926;
     --s-crit:#d03b3b; --s-high:#ec835a; --s-med:#fab219; --s-low:#0ca30c; --s-info:#5a6b7a;
-    --seq:#3987e5;
+    --seq:#3987e5; --accent:#4a90e8;
+    --tabbar:rgba(13,13,13,.82);
     --radius:16px; --gap:14px;
     --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
   }
   :root[data-theme="light"]{
     color-scheme: light;
-    --plane:#f9f9f7; --surface:#fcfcfb; --surface-2:#f1f1ee; --surface-3:#e9e9e4;
+    --plane:#f4f4f1; --surface:#ffffff; --surface-2:#f1f1ec; --surface-3:#e7e7e1;
     --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
-    --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,.10);
+    --grid:#e6e5de; --axis:#c3c2b7; --border:rgba(11,11,11,.11); --border-2:rgba(11,11,11,.05);
     --c-company:#2a78d6; --c-domain:#1baf7a; --c-person:#eb6834;
-    --seq:#2a78d6;
+    --seq:#2a78d6; --accent:#2a78d6;
+    --tabbar:rgba(255,255,255,.82);
   }
   *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html,body{ margin:0; padding:0; background:var(--plane); color:var(--ink);
     font-family:var(--font); font-size:15px; line-height:1.4;
-    -webkit-font-smoothing:antialiased; overscroll-behavior:none; }
-  #app{ max-width:720px; margin:0 auto; padding:0 16px
-    calc(28px + env(safe-area-inset-bottom)); min-height:100vh; }
+    -webkit-font-smoothing:antialiased; overscroll-behavior-y:none; }
+  body.locked{ overflow:hidden; }
+  button{ font:inherit; }
 
-  /* Header */
+  /* ---------- Root shell ---------- */
+  #app{ max-width:720px; margin:0 auto; min-height:100vh;
+    transition:transform .34s var(--ease-drawer), filter .34s var(--ease-drawer); }
+  #app.behind{ transform:translateX(-18%) scale(.97); filter:brightness(.62); }
   header.hd{ position:sticky; top:0; z-index:20; background:var(--plane);
-    padding:14px 0 10px; display:flex; align-items:center; gap:12px; }
+    padding:14px 16px 10px; display:flex; align-items:center; gap:12px; }
   .mark{ width:34px; height:34px; border-radius:10px; flex:0 0 auto;
     background:linear-gradient(135deg,var(--c-company),var(--c-domain));
     display:grid; place-items:center; color:#fff; font-weight:800; font-size:16px;
-    box-shadow:0 2px 10px rgba(0,0,0,.35); }
+    box-shadow:0 2px 10px rgba(0,0,0,.3); }
   .hd h1{ font-size:17px; margin:0; letter-spacing:.2px; }
   .hd .sub{ color:var(--muted); font-size:11.5px; margin-top:1px; }
   .hd .spacer{ flex:1; }
@@ -6048,128 +6052,192 @@ const MINIAPP_HTML = `<!doctype html>
     white-space:nowrap; text-transform:capitalize; }
   .iconbtn{ width:34px; height:34px; border-radius:10px; border:1px solid var(--border);
     background:var(--surface-2); color:var(--ink-2); display:grid; place-items:center;
-    font-size:15px; cursor:pointer; }
-  .iconbtn:active{ transform:scale(.94); }
+    cursor:pointer; transition:transform .16s var(--ease-out); }
+  .iconbtn:active{ transform:scale(.9); }
+  .iconbtn svg{ width:17px; height:17px; }
+  main{ padding:0 16px calc(78px + env(safe-area-inset-bottom)); }
 
-  /* Tabs (custom segmented control) */
-  nav.tabs{ position:sticky; top:62px; z-index:15; background:var(--plane);
-    padding:4px 0 12px; display:grid; grid-template-columns:repeat(4,1fr); gap:6px; }
-  nav.tabs button{ appearance:none; border:1px solid var(--border);
-    background:var(--surface); color:var(--ink-2); border-radius:11px;
-    padding:9px 4px; font:inherit; font-size:12.5px; font-weight:600; cursor:pointer;
-    transition:background .12s, color .12s, border-color .12s; }
-  nav.tabs button[aria-selected="true"]{ background:var(--surface-3); color:var(--ink);
-    border-color:var(--border); box-shadow:inset 0 0 0 1px var(--border); }
-  nav.tabs button:active{ transform:scale(.97); }
+  /* ---------- Bottom tab bar ---------- */
+  nav.tabbar{ position:fixed; left:50%; transform:translateX(-50%); bottom:0; z-index:30;
+    width:100%; max-width:720px; display:grid; grid-template-columns:repeat(4,1fr);
+    background:var(--tabbar); backdrop-filter:blur(16px) saturate(1.3);
+    -webkit-backdrop-filter:blur(16px) saturate(1.3);
+    border-top:1px solid var(--border); padding-bottom:env(safe-area-inset-bottom); }
+  @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
+    nav.tabbar{ background:var(--surface); }
+  }
+  nav.tabbar button{ appearance:none; border:0; background:none; cursor:pointer;
+    display:flex; flex-direction:column; align-items:center; gap:3px;
+    padding:9px 4px 7px; color:var(--muted); }
+  nav.tabbar button .ic{ display:grid; place-items:center;
+    transition:transform .18s var(--ease-out), color .15s ease; }
+  nav.tabbar button .ic svg{ width:23px; height:23px; }
+  nav.tabbar button .lb{ font-size:10.5px; font-weight:600; letter-spacing:.2px;
+    transition:color .15s ease; }
+  nav.tabbar button:active .ic{ transform:scale(.86); }
+  nav.tabbar button[aria-selected="true"]{ color:var(--accent); }
+  nav.tabbar button[aria-selected="true"] .lb{ color:var(--accent); }
 
-  /* Cards + layout */
+  /* ---------- Detail sheets (push navigation) ---------- */
+  .sheet{ position:fixed; inset:0; z-index:40; background:var(--plane);
+    display:flex; flex-direction:column; transform:translateX(100%);
+    transition:transform .34s var(--ease-drawer); will-change:transform;
+    box-shadow:-14px 0 40px rgba(0,0,0,.3); max-width:720px; margin:0 auto; }
+  .sheet.in{ transform:translateX(0); }
+  .sheet.behind{ transition:transform .34s var(--ease-drawer), filter .34s var(--ease-drawer);
+    transform:translateX(-18%) scale(.97); filter:brightness(.62); }
+  .shd{ position:sticky; top:0; z-index:2; display:flex; align-items:center; gap:10px;
+    padding:14px 16px 12px; background:var(--plane);
+    border-bottom:1px solid var(--border-2); }
+  .backbtn{ appearance:none; border:1px solid var(--border); background:var(--surface-2);
+    color:var(--ink); width:34px; height:34px; border-radius:10px; flex:0 0 auto;
+    display:grid; place-items:center; cursor:pointer; transition:transform .16s var(--ease-out); }
+  .backbtn:active{ transform:scale(.9); }
+  .backbtn svg{ width:18px; height:18px; }
+  .shd-t{ min-width:0; }
+  .shd-title{ font-size:16px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .shd-sub{ font-size:11.5px; color:var(--muted); margin-top:1px; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .sheet-body{ flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch;
+    padding:14px 16px calc(28px + env(safe-area-inset-bottom)); }
+
+  /* ---------- Cards & primitives ---------- */
   .card{ background:var(--surface); border:1px solid var(--border);
     border-radius:var(--radius); padding:14px; margin-bottom:var(--gap); }
   .card h2{ font-size:13px; font-weight:700; color:var(--ink); margin:0 0 2px; }
   .card .cap{ font-size:11.5px; color:var(--muted); margin:0 0 12px; }
-  .grid-tiles{ display:grid; grid-template-columns:repeat(2,1fr); gap:var(--gap);
-    margin-bottom:var(--gap); }
-  .tile{ background:var(--surface); border:1px solid var(--border);
-    border-radius:var(--radius); padding:13px 14px; position:relative; overflow:hidden; }
-  .tile .k{ font-size:11px; color:var(--muted); font-weight:600;
-    text-transform:uppercase; letter-spacing:.4px; }
-  .tile .v{ font-size:30px; font-weight:750; margin-top:3px; line-height:1;
-    letter-spacing:-.5px; }
+  .grid-tiles{ display:grid; grid-template-columns:repeat(2,1fr); gap:var(--gap); margin-bottom:var(--gap); }
+  .tile{ background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+    padding:13px 14px; position:relative; overflow:hidden; }
+  .tile .k{ font-size:11px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.4px; }
+  .tile .v{ font-size:30px; font-weight:750; margin-top:3px; line-height:1; letter-spacing:-.5px; }
   .tile .s{ font-size:11.5px; color:var(--ink-2); margin-top:5px; }
   .tile .accent{ position:absolute; left:0; top:0; bottom:0; width:3px; }
 
-  /* Labeled severity rows */
-  .sevrow{ display:grid; grid-template-columns:70px 1fr 34px; align-items:center;
-    gap:10px; margin:7px 0; }
+  .sevrow{ display:grid; grid-template-columns:70px 1fr 34px; align-items:center; gap:10px; margin:7px 0; }
   .sevrow .lab{ display:flex; align-items:center; gap:7px; font-size:12px; color:var(--ink-2); }
   .dot{ width:9px; height:9px; border-radius:3px; flex:0 0 auto; }
   .track{ height:9px; background:var(--surface-2); border-radius:5px; overflow:hidden; }
   .fill{ height:100%; border-radius:5px; }
-  .sevrow .num{ font-size:12.5px; color:var(--ink); text-align:right;
-    font-variant-numeric:tabular-nums; font-weight:650; }
+  .sevrow .num{ font-size:12.5px; color:var(--ink); text-align:right; font-variant-numeric:tabular-nums; font-weight:650; }
 
-  /* Ranking bars */
-  .rank{ display:grid; grid-template-columns:1fr; gap:9px; }
-  .rank .row{ display:grid; grid-template-columns:1fr; gap:4px; }
+  .rank{ display:grid; gap:9px; }
+  .rank .row{ display:grid; gap:4px; }
   .rank .top{ display:flex; justify-content:space-between; font-size:12.5px; }
-  .rank .top .nm{ color:var(--ink-2); overflow:hidden; text-overflow:ellipsis;
-    white-space:nowrap; max-width:74%; }
+  .rank .top .nm{ color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:74%; }
   .rank .top .vl{ color:var(--ink); font-weight:650; font-variant-numeric:tabular-nums; }
   .rank .bar{ height:8px; background:var(--surface-2); border-radius:4px; overflow:hidden; }
   .rank .bar i{ display:block; height:100%; border-radius:4px; background:var(--seq); }
 
-  /* Company / people list cards */
-  .listcard{ background:var(--surface); border:1px solid var(--border);
-    border-radius:14px; padding:12px 13px; margin-bottom:11px; }
-  .listcard .r1{ display:flex; align-items:baseline; gap:8px; }
-  .listcard .name{ font-size:14px; font-weight:700; overflow:hidden;
-    text-overflow:ellipsis; white-space:nowrap; }
-  .listcard .r1 .big{ margin-left:auto; font-size:20px; font-weight:750;
-    font-variant-numeric:tabular-nums; }
-  .listcard .r1 .big small{ font-size:11px; color:var(--muted); font-weight:600;
-    margin-left:3px; }
+  .listcard{ background:var(--surface); border:1px solid var(--border); border-radius:14px;
+    padding:12px 13px; margin-bottom:11px; }
+  .listcard.tappable{ cursor:pointer; transition:transform .16s var(--ease-out), border-color .15s ease; }
+  .listcard.tappable:active{ transform:scale(.985); border-color:var(--border); }
+  .listcard .r1{ display:flex; align-items:center; gap:8px; }
+  .listcard .name{ font-size:14px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .listcard .big{ margin-left:auto; font-size:20px; font-weight:750; font-variant-numeric:tabular-nums; display:flex; align-items:baseline; gap:3px; }
+  .listcard .big small{ font-size:11px; color:var(--muted); font-weight:600; }
+  .chev{ flex:0 0 auto; color:var(--muted); display:grid; place-items:center; margin-left:2px; }
+  .chev svg{ width:16px; height:16px; }
   .chips{ display:flex; flex-wrap:wrap; gap:6px; margin-top:9px; }
-  .chip{ font-size:11px; color:var(--ink-2); background:var(--surface-2);
-    border:1px solid var(--border); border-radius:8px; padding:3px 8px;
-    display:inline-flex; align-items:center; gap:5px; font-variant-numeric:tabular-nums; }
+  .chip{ font-size:11px; color:var(--ink-2); background:var(--surface-2); border:1px solid var(--border);
+    border-radius:8px; padding:3px 8px; display:inline-flex; align-items:center; gap:5px; font-variant-numeric:tabular-nums; }
   .chip b{ color:var(--ink); font-weight:650; }
-  .microbar{ display:flex; height:7px; border-radius:4px; overflow:hidden;
-    margin-top:10px; background:var(--surface-2); gap:2px; }
+  .chip.tap{ cursor:pointer; transition:transform .14s var(--ease-out); }
+  .chip.tap:active{ transform:scale(.94); }
+  .chip.tap svg{ width:13px; height:13px; opacity:.7; }
+  .microbar{ display:flex; height:7px; border-radius:4px; overflow:hidden; margin-top:10px; background:var(--surface-2); gap:2px; }
   .microbar i{ height:100%; }
+  .avatar{ width:26px; height:26px; border-radius:8px; display:inline-grid; place-items:center;
+    background:var(--surface-3); color:var(--ink-2); font-size:11px; font-weight:700; flex:0 0 auto; }
 
-  /* Search */
   .search{ position:relative; margin-bottom:12px; }
-  .search input{ width:100%; background:var(--surface); color:var(--ink);
-    border:1px solid var(--border); border-radius:12px; padding:11px 12px 11px 34px;
-    font:inherit; font-size:14px; outline:none; }
-  .search input:focus{ border-color:var(--c-company); }
-  .search .ic{ position:absolute; left:11px; top:50%; transform:translateY(-50%);
-    color:var(--muted); font-size:14px; }
+  .search input{ width:100%; background:var(--surface); color:var(--ink); border:1px solid var(--border);
+    border-radius:12px; padding:11px 12px 11px 36px; font:inherit; font-size:14px; outline:none;
+    transition:border-color .15s ease; }
+  .search input:focus{ border-color:var(--accent); }
+  .search .ic{ position:absolute; left:12px; top:50%; transform:translateY(-50%); color:var(--muted); display:grid; }
+  .search .ic svg{ width:16px; height:16px; }
 
-  /* Graph / map */
-  .maptools{ display:flex; align-items:center; gap:8px; margin-bottom:10px;
-    flex-wrap:wrap; }
-  .legend{ display:flex; gap:12px; flex-wrap:wrap; }
-  .legend span{ display:inline-flex; align-items:center; gap:6px; font-size:12px;
-    color:var(--ink-2); }
-  .graphwrap{ position:relative; background:var(--surface); border:1px solid var(--border);
-    border-radius:var(--radius); overflow:hidden; height:62vh; min-height:380px;
-    touch-action:none; }
-  .graphwrap svg{ width:100%; height:100%; display:block; cursor:grab; }
-  .graphwrap svg:active{ cursor:grabbing; }
-  .gnode-label{ font-size:10px; fill:var(--ink-2); pointer-events:none;
-    paint-order:stroke; stroke:var(--surface); stroke-width:3px; }
-  .gcount{ position:absolute; left:10px; bottom:9px; font-size:11px; color:var(--muted);
-    background:var(--surface-2); border:1px solid var(--border); padding:3px 8px;
-    border-radius:8px; pointer-events:none; }
+  /* Section header inside detail */
+  .sect{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.5px;
+    color:var(--muted); margin:18px 2px 9px; display:flex; align-items:center; gap:7px; }
+  .sect .count{ color:var(--ink-2); background:var(--surface-2); border:1px solid var(--border);
+    border-radius:999px; padding:1px 7px; font-size:10.5px; letter-spacing:0; }
+  .row-item{ display:flex; align-items:center; gap:10px; background:var(--surface);
+    border:1px solid var(--border); border-radius:12px; padding:11px 12px; margin-bottom:8px; }
+  .row-item.tappable{ cursor:pointer; transition:transform .16s var(--ease-out); }
+  .row-item.tappable:active{ transform:scale(.985); }
+  .row-item .main{ min-width:0; flex:1; }
+  .row-item .ttl{ font-size:13.5px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .row-item .meta{ font-size:11.5px; color:var(--muted); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .row-item .rt{ font-size:12px; color:var(--ink-2); font-variant-numeric:tabular-nums; flex:0 0 auto; }
+  .mono{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px; }
+  .sevtag{ font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.3px;
+    padding:2px 6px; border-radius:6px; color:#fff; flex:0 0 auto; }
 
-  /* Tooltip */
-  #tooltip{ position:fixed; z-index:50; pointer-events:none; opacity:0;
-    transform:translate(-50%,-115%); transition:opacity .08s;
-    background:var(--surface-3); color:var(--ink); border:1px solid var(--border);
-    border-radius:9px; padding:7px 9px; font-size:12px; max-width:220px;
-    box-shadow:0 6px 20px rgba(0,0,0,.4); }
+  /* Hero (detail top) */
+  .hero{ background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+    padding:16px; margin-bottom:var(--gap); }
+  .hero .htop{ display:flex; align-items:center; gap:12px; }
+  .hero .hname{ font-size:18px; font-weight:750; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .hero .hdesc{ font-size:12.5px; color:var(--muted); margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .hero .hbig{ margin-left:auto; text-align:right; flex:0 0 auto; }
+  .hero .hbig .n{ font-size:30px; font-weight:750; line-height:1; letter-spacing:-.5px; }
+  .hero .hbig .l{ font-size:11px; color:var(--muted); }
+
+  #tooltip{ position:fixed; z-index:60; pointer-events:none; opacity:0; transform:translate(-50%,-115%);
+    transition:opacity .08s; background:var(--surface-3); color:var(--ink); border:1px solid var(--border);
+    border-radius:9px; padding:7px 9px; font-size:12px; max-width:220px; box-shadow:0 6px 20px rgba(0,0,0,.4); }
   #tooltip .tt-t{ font-weight:700; margin-bottom:2px; }
   #tooltip .tt-s{ color:var(--ink-2); font-size:11.5px; }
 
-  /* States */
-  .empty{ text-align:center; color:var(--muted); padding:34px 10px; font-size:13px; }
+  .empty{ text-align:center; color:var(--muted); padding:34px 12px; font-size:13px; }
   .skel{ background:linear-gradient(90deg,var(--surface-2),var(--surface-3),var(--surface-2));
-    background-size:200% 100%; animation:sh 1.1s linear infinite; border-radius:10px; }
+    background-size:200% 100%; animation:sh 1.1s linear infinite; border-radius:12px; }
   @keyframes sh{ 0%{background-position:200% 0} 100%{background-position:-200% 0} }
   .muted{ color:var(--muted); }
   .axislab{ font-size:10px; fill:var(--muted); }
-  .seg-hidden{ display:none; }
+
   table.tbl{ width:100%; border-collapse:collapse; font-size:12.5px; }
-  table.tbl th,table.tbl td{ text-align:left; padding:8px 6px; border-bottom:1px solid var(--grid);
-    font-variant-numeric:tabular-nums; }
-  table.tbl th{ color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase;
-    letter-spacing:.3px; }
+  table.tbl th,table.tbl td{ text-align:left; padding:8px 6px; border-bottom:1px solid var(--grid); font-variant-numeric:tabular-nums; }
+  table.tbl th{ color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.3px; }
   table.tbl td.r,table.tbl th.r{ text-align:right; }
   .viewtoggle{ display:flex; gap:6px; margin-left:auto; }
-  .viewtoggle button{ font-size:11px; padding:5px 10px; border-radius:8px;
-    border:1px solid var(--border); background:var(--surface-2); color:var(--ink-2); cursor:pointer; }
+  .viewtoggle button{ font-size:11px; padding:5px 10px; border-radius:8px; border:1px solid var(--border);
+    background:var(--surface-2); color:var(--ink-2); cursor:pointer; transition:transform .14s var(--ease-out); }
+  .viewtoggle button:active{ transform:scale(.95); }
   .viewtoggle button[aria-pressed="true"]{ background:var(--surface-3); color:var(--ink); }
+
+  .maptools{ display:flex; align-items:center; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  .legend{ display:flex; gap:12px; flex-wrap:wrap; }
+  .legend span{ display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--ink-2); }
+  .graphwrap{ position:relative; background:var(--surface); border:1px solid var(--border);
+    border-radius:var(--radius); overflow:hidden; height:62vh; min-height:360px; touch-action:none; }
+  .graphwrap svg{ width:100%; height:100%; display:block; cursor:grab; }
+  .graphwrap svg:active{ cursor:grabbing; }
+  .gnode-label{ font-size:10px; fill:var(--ink-2); pointer-events:none; paint-order:stroke; stroke:var(--surface); stroke-width:3px; }
+  .gcount{ position:absolute; left:10px; bottom:9px; font-size:11px; color:var(--muted);
+    background:var(--surface-2); border:1px solid var(--border); padding:3px 8px; border-radius:8px; pointer-events:none; }
+
+  /* Entrance: content fades on tab switch; list items stagger (capped) */
+  .fadein{ animation:fade .16s var(--ease-out) both; }
+  @keyframes fade{ from{ opacity:0 } to{ opacity:1 } }
+  .stag > *{ opacity:0; animation:rise .32s var(--ease-out) forwards; }
+  .stag > *:nth-child(1){ animation-delay:0ms } .stag > *:nth-child(2){ animation-delay:34ms }
+  .stag > *:nth-child(3){ animation-delay:68ms } .stag > *:nth-child(4){ animation-delay:102ms }
+  .stag > *:nth-child(5){ animation-delay:136ms } .stag > *:nth-child(6){ animation-delay:170ms }
+  .stag > *:nth-child(7){ animation-delay:204ms } .stag > *:nth-child(8){ animation-delay:238ms }
+  .stag > *:nth-child(n+9){ animation-delay:260ms }
+  @keyframes rise{ from{ opacity:0; transform:translateY(7px) } to{ opacity:1; transform:translateY(0) } }
+
+  @media (prefers-reduced-motion: reduce){
+    #app, #app.behind{ transform:none; filter:none; transition:none; }
+    .sheet{ transform:none; opacity:0; transition:opacity .2s ease; box-shadow:none; }
+    .sheet.in{ opacity:1; } .sheet.behind{ transform:none; filter:none; }
+    .fadein,.stag > *{ animation:none; opacity:1; }
+    .iconbtn,.backbtn,.listcard,.row-item,.chip,.viewtoggle button,nav.tabbar button .ic{ transition:none; }
+  }
 </style>
 </head>
 <body>
@@ -6182,16 +6250,10 @@ const MINIAPP_HTML = `<!doctype html>
     </div>
     <div class="spacer"></div>
     <span class="chip-role" id="role" hidden></span>
-    <button class="iconbtn" id="refresh" title="Refresh" aria-label="Refresh">&#x21bb;</button>
+    <button class="iconbtn" id="refresh" title="Refresh" aria-label="Refresh">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+    </button>
   </header>
-
-  <nav class="tabs" role="tablist">
-    <button role="tab" data-view="overview" aria-selected="true">Overview</button>
-    <button role="tab" data-view="companies" aria-selected="false">Companies</button>
-    <button role="tab" data-view="people" aria-selected="false">People</button>
-    <button role="tab" data-view="map" aria-selected="false">Map</button>
-  </nav>
-
   <main>
     <section id="view-overview"></section>
     <section id="view-companies" hidden></section>
@@ -6199,6 +6261,8 @@ const MINIAPP_HTML = `<!doctype html>
     <section id="view-map" hidden></section>
   </main>
 </div>
+
+<nav class="tabbar" role="tablist" id="tabbar"></nav>
 <div id="tooltip" role="tooltip"></div>
 
 <script>
@@ -6206,8 +6270,6 @@ const MINIAPP_HTML = `<!doctype html>
   "use strict";
   var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
   if (tg) { try { tg.ready(); tg.expand(); } catch(e){} }
-
-  // Theme: follow Telegram's color scheme; default dark.
   function applyTheme(){
     var scheme = tg && tg.colorScheme ? tg.colorScheme : 'dark';
     document.documentElement.setAttribute('data-theme', scheme === 'light' ? 'light' : 'dark');
@@ -6224,13 +6286,16 @@ const MINIAPP_HTML = `<!doctype html>
     { k:'low',      lab:'Low',      c:'var(--s-low)'  },
     { k:'info',     lab:'Info',     c:'var(--s-info)' }
   ];
+  var SEVC = { critical:'#d03b3b', high:'#ec835a', medium:'#fab219', low:'#0ca30c', info:'#5a6b7a' };
   var TYPE = { company:'var(--c-company)', domain:'var(--c-domain)', person:'var(--c-person)' };
 
-  var cache = {};           // endpoint -> json
+  var cache = {};
   var el = function(id){ return document.getElementById(id); };
   var esc = function(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(ch){
     return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[ch]; }); };
   var nf = function(n){ return (n==null?0:n).toLocaleString(); };
+  var plur = function(n, one, many){ return nf(n)+' '+((n===1)?one:many); };
+  function haptic(kind){ if(tg&&tg.HapticFeedback){ try{ kind==='sel'?tg.HapticFeedback.selectionChanged():tg.HapticFeedback.impactOccurred(kind||'light'); }catch(e){} } }
 
   function api(path, cb){
     if (cache[path]) { cb(null, cache[path]); return; }
@@ -6243,113 +6308,188 @@ const MINIAPP_HTML = `<!doctype html>
     }).catch(function(e){ cb({ error:e.message }, null); });
   }
 
-  // ---- Tooltip ----
+  // ---- icons ----
+  var IC = {
+    overview:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="5" rx="1.5"/><rect x="13" y="11" width="8" height="10" rx="1.5"/><rect x="3" y="14" width="8" height="7" rx="1.5"/></svg>',
+    companies:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18"/><path d="M5 21V7l7-4v18"/><path d="M19 21V11l-7-4"/><path d="M9 9h.01M9 13h.01M9 17h.01"/></svg>',
+    people:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M16 5.2a3.2 3.2 0 0 1 0 6.1"/><path d="M17 14.6A5.5 5.5 0 0 1 20.5 20"/></svg>',
+    map:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="7" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="17" cy="18" r="2.4"/><circle cx="7" cy="17" r="2.4"/><path d="M8 8.5l8-1M8.5 15.5l7.5 1.5M7 14.5l9.5-6"/></svg>',
+    chevR:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
+    back:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>',
+    search:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>'
+  };
+
+  // ---- tooltip ----
   var tip = el('tooltip');
   function showTip(x, y, title, sub){
-    tip.innerHTML = '<div class="tt-t">' + esc(title) + '</div>' +
-      (sub ? '<div class="tt-s">' + esc(sub) + '</div>' : '');
+    tip.innerHTML = '<div class="tt-t">' + esc(title) + '</div>' + (sub ? '<div class="tt-s">' + esc(sub) + '</div>' : '');
     tip.style.left = x + 'px'; tip.style.top = y + 'px'; tip.style.opacity = '1';
   }
   function hideTip(){ tip.style.opacity = '0'; }
 
-  // ---- Tab switching ----
+  function svg(tag, attrs){ var e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]); return e; }
+
+  // =====================================================================
+  //  Navigation: bottom tab bar + push-to-detail sheet stack
+  // =====================================================================
   var VIEWS = ['overview','companies','people','map'];
+  var LABELS = { overview:'Overview', companies:'Companies', people:'People', map:'Map' };
   var loaded = {};
-  function selectView(v){
-    VIEWS.forEach(function(name){
-      el('view-' + name).hidden = (name !== v);
+  var curView = 'overview';
+  var render = {};
+  var sheets = [];
+
+  (function buildTabs(){
+    var bar = el('tabbar');
+    VIEWS.forEach(function(v){
+      var b = document.createElement('button');
+      b.setAttribute('role','tab'); b.setAttribute('data-view', v);
+      b.setAttribute('aria-selected', v==='overview' ? 'true' : 'false');
+      b.innerHTML = '<span class="ic">'+IC[v]+'</span><span class="lb">'+LABELS[v]+'</span>';
+      b.addEventListener('click', function(){ haptic('sel'); selectTab(v); });
+      bar.appendChild(b);
     });
-    document.querySelectorAll('nav.tabs button').forEach(function(b){
+  })();
+
+  function selectTab(v){
+    while (sheets.length) popSheet(true);
+    curView = v;
+    VIEWS.forEach(function(name){ el('view-' + name).hidden = (name !== v); });
+    document.querySelectorAll('nav.tabbar button').forEach(function(b){
       b.setAttribute('aria-selected', b.getAttribute('data-view') === v ? 'true' : 'false');
     });
     hideTip();
     if (!loaded[v]) { loaded[v] = true; render[v](); }
-    window.scrollTo(0, 0);
+    window.scrollTo(0,0);
   }
-  document.querySelectorAll('nav.tabs button').forEach(function(b){
-    b.addEventListener('click', function(){
-      if (tg && tg.HapticFeedback) { try { tg.HapticFeedback.selectionChanged(); } catch(e){} }
-      selectView(b.getAttribute('data-view'));
-    });
-  });
 
-  // ---- SVG helpers ----
-  function svg(tag, attrs){
-    var e = document.createElementNS('http://www.w3.org/2000/svg', tag);
-    for (var k in attrs) e.setAttribute(k, attrs[k]);
-    return e;
+  function pushSheet(opts){
+    var below = sheets.length ? sheets[sheets.length-1].node : el('app');
+    var sheet = document.createElement('section');
+    sheet.className = 'sheet';
+    sheet.innerHTML =
+      '<div class="shd"><button class="backbtn" aria-label="Back">'+IC.back+'</button>'+
+      '<div class="shd-t"><div class="shd-title">'+esc(opts.title)+'</div>'+
+      (opts.subtitle ? '<div class="shd-sub">'+esc(opts.subtitle)+'</div>' : '')+'</div></div>'+
+      '<div class="sheet-body"></div>';
+    document.body.appendChild(sheet);
+    var body = sheet.querySelector('.sheet-body');
+    sheet.querySelector('.backbtn').addEventListener('click', function(){ haptic('light'); popSheet(); });
+    opts.build(body, sheet);
+    below.classList.add('behind');
+    document.body.classList.add('locked');
+    void sheet.offsetWidth;
+    requestAnimationFrame(function(){ sheet.classList.add('in'); });
+    sheets.push({ node:sheet, below:below, title:opts.title });
+    syncBack();
+    hideTip();
   }
+  function popSheet(instant){
+    if (!sheets.length) return;
+    var top = sheets.pop();
+    top.below.classList.remove('behind');
+    if (!sheets.length) document.body.classList.remove('locked');
+    var n = top.node;
+    if (instant){ n.remove(); syncBack(); return; }
+    n.classList.remove('in');
+    var done = false, fin = function(){ if(done) return; done=true; if(n.parentNode) n.remove(); };
+    n.addEventListener('transitionend', function te(ev){ if(ev.target===n){ n.removeEventListener('transitionend', te); fin(); } });
+    setTimeout(fin, 420);
+    syncBack(); hideTip();
+  }
+  function syncBack(){
+    if (tg && tg.BackButton){ try{ sheets.length ? tg.BackButton.show() : tg.BackButton.hide(); }catch(e){} }
+  }
+  if (tg && tg.onEvent){ try{ tg.onEvent('backButtonClicked', function(){ popSheet(); }); }catch(e){} }
+  document.addEventListener('keydown', function(e){ if(e.key==='Escape' && sheets.length) popSheet(); });
+
+  function stag(container){ var n = container.children.length; if (n && n <= 14) container.classList.add('stag'); }
 
   // =====================================================================
-  //  OVERVIEW
+  //  Shared chart / card builders
   // =====================================================================
   function tile(k, v, s, accent){
     return '<div class="tile">' + (accent ? '<div class="accent" style="background:'+accent+'"></div>' : '') +
       '<div class="k">' + esc(k) + '</div><div class="v">' + nf(v) + '</div>' +
       (s ? '<div class="s">' + esc(s) + '</div>' : '') + '</div>';
   }
-
-  function severityCard(f){
-    var total = f.total || 0;
+  function severityCard(f, title){
     var max = Math.max(f.critical, f.high, f.medium, f.low, f.info, 1);
     var rows = SEV.map(function(s){
-      var n = f[s.k] || 0;
-      var w = Math.round((n / max) * 100);
+      var n = f[s.k] || 0; var w = Math.round((n / max) * 100);
       return '<div class="sevrow"><div class="lab"><span class="dot" style="background:'+s.c+'"></span>'+s.lab+'</div>'+
         '<div class="track"><div class="fill" style="width:'+w+'%;background:'+s.c+'"></div></div>'+
         '<div class="num">'+nf(n)+'</div></div>';
     }).join('');
-    return '<div class="card"><h2>Findings by severity</h2>'+
-      '<p class="cap">'+nf(total)+' findings total &middot; '+nf(f.resolved||0)+' resolved</p>'+rows+'</div>';
+    return '<div class="card"><h2>'+esc(title||'Findings by severity')+'</h2>'+
+      '<p class="cap">'+nf(f.total||0)+' findings total · '+nf(f.resolved||0)+' resolved</p>'+rows+'</div>';
   }
-
-  function trendCard(trend, sinceDay){
-    var W = 320, H = 110, pad = { l:6, r:6, t:10, b:16 };
-    // Normalize to 14 continuous days.
-    var map = {}; (trend||[]).forEach(function(d){ map[d.day] = d.cnt; });
-    var days = [], base = new Date(sinceDay + 'T00:00:00Z');
-    for (var i=0;i<14;i++){ var d=new Date(base.getTime()+i*86400000);
-      var key=d.toISOString().slice(0,10); days.push({ day:key, cnt: map[key]||0 }); }
-    var max = Math.max.apply(null, days.map(function(d){ return d.cnt; }).concat([1]));
-    var iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
-    var X = function(i){ return pad.l + (days.length<2?iw/2:(i/(days.length-1))*iw); };
-    var Y = function(v){ return pad.t + ih - (v/max)*ih; };
-    var line = '', area = 'M' + X(0) + ' ' + Y(days[0].cnt);
-    days.forEach(function(d,i){ var c=(i===0?'M':'L')+X(i)+' '+Y(d.cnt); line+=c;
-      if(i>0) area += 'L'+X(i)+' '+Y(d.cnt); });
-    area += 'L'+X(days.length-1)+' '+(pad.t+ih)+'L'+X(0)+' '+(pad.t+ih)+'Z';
-    var totalN = days.reduce(function(a,d){ return a+d.cnt; },0);
-    var dots = days.map(function(d,i){ return '<circle cx="'+X(i)+'" cy="'+Y(d.cnt)+'" r="2.4" fill="var(--seq)"/>'; }).join('');
-    var grid = '';
-    for (var g=0; g<=2; g++){ var yy = pad.t + (g/2)*ih;
-      grid += '<line x1="'+pad.l+'" y1="'+yy+'" x2="'+(W-pad.r)+'" y2="'+yy+'" stroke="var(--grid)" stroke-width="1"/>'; }
-    var html = '<div class="card"><h2>Findings &mdash; last 14 days</h2>'+
-      '<p class="cap">'+nf(totalN)+' new &middot; peak '+nf(max)+'/day</p>'+
-      '<svg viewBox="0 0 '+W+' '+H+'" width="100%" preserveAspectRatio="none" id="trendSvg" style="overflow:visible">'+
-      grid +
-      '<path d="'+area+'" fill="var(--seq)" opacity="0.14"/>'+
-      '<path d="'+line+'" fill="none" stroke="var(--seq)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>'+
-      dots +
-      '<line id="trendCross" x1="0" y1="'+pad.t+'" x2="0" y2="'+(pad.t+ih)+'" stroke="var(--axis)" stroke-width="1" opacity="0"/>'+
-      '<text class="axislab" x="'+pad.l+'" y="'+H+'">'+days[0].day.slice(5)+'</text>'+
-      '<text class="axislab" x="'+(W-pad.r)+'" y="'+H+'" text-anchor="end">'+days[days.length-1].day.slice(5)+'</text>'+
-      '</svg></div>';
-    return { html:html, days:days, X:X, Y:Y, pad:pad, ih:ih };
+  function microbar(c){
+    var sevs = [['critical',c.crit!=null?c.crit:c.critical],['high',c.high],['medium',c.med!=null?c.med:c.medium],['low',c.low],['info',c.info]];
+    var tot = sevs.reduce(function(a,s){ return a+(s[1]||0); },0);
+    if (!tot) return '';
+    return '<div class="microbar">'+ sevs.map(function(s){ var w=(s[1]||0)/tot*100;
+      return w>0?'<i style="width:'+w+'%;background:'+SEVC[s[0]]+'"></i>':''; }).join('') +'</div>';
   }
-
   function rankingCard(title, rows, unit){
     if (!rows || !rows.length) return '<div class="card"><h2>'+esc(title)+'</h2><div class="empty">No data yet.</div></div>';
     var max = Math.max.apply(null, rows.map(function(r){ return r.cnt; }).concat([1]));
-    var body = rows.map(function(r){
-      var w = Math.round((r.cnt/max)*100);
-      return '<div class="row"><div class="top"><span class="nm">'+esc(r.name!=null?r.name:r.port)+'</span>'+
-        '<span class="vl">'+nf(r.cnt)+'</span></div>'+
-        '<div class="bar"><i style="width:'+Math.max(w,2)+'%"></i></div></div>';
+    var body = rows.map(function(r){ var w = Math.round((r.cnt/max)*100);
+      return '<div class="row"><div class="top"><span class="nm">'+esc(r.name)+'</span>'+
+        '<span class="vl">'+nf(r.cnt)+'</span></div><div class="bar"><i style="width:'+Math.max(w,2)+'%"></i></div></div>';
     }).join('');
     return '<div class="card"><h2>'+esc(title)+'</h2><p class="cap">by '+esc(unit)+'</p><div class="rank">'+body+'</div></div>';
   }
+  function trendCard(trend, sinceDay){
+    var W = 320, H = 110, pad = { l:6, r:6, t:10, b:16 };
+    var map = {}; (trend||[]).forEach(function(d){ map[d.day] = d.cnt; });
+    var days = [], base = new Date(sinceDay + 'T00:00:00Z');
+    for (var i=0;i<14;i++){ var dt=new Date(base.getTime()+i*86400000); var key=dt.toISOString().slice(0,10); days.push({ day:key, cnt: map[key]||0 }); }
+    var max = Math.max.apply(null, days.map(function(d){ return d.cnt; }).concat([1]));
+    var iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+    var X = function(i){ return pad.l + (i/(days.length-1))*iw; };
+    var Y = function(v){ return pad.t + ih - (v/max)*ih; };
+    var line='', area='M'+X(0)+' '+Y(days[0].cnt);
+    days.forEach(function(d,i){ line += (i===0?'M':'L')+X(i)+' '+Y(d.cnt); if(i>0) area += 'L'+X(i)+' '+Y(d.cnt); });
+    area += 'L'+X(days.length-1)+' '+(pad.t+ih)+'L'+X(0)+' '+(pad.t+ih)+'Z';
+    var dots = days.map(function(d,i){ return '<circle cx="'+X(i)+'" cy="'+Y(d.cnt)+'" r="2.4" fill="var(--seq)"/>'; }).join('');
+    var grid = '';
+    for (var g=0; g<=2; g++){ var yy=pad.t+(g/2)*ih; grid += '<line x1="'+pad.l+'" y1="'+yy+'" x2="'+(W-pad.r)+'" y2="'+yy+'" stroke="var(--grid)" stroke-width="1"/>'; }
+    var totalN = days.reduce(function(a,d){ return a+d.cnt; },0);
+    var html = '<div class="card"><h2>Findings — last 14 days</h2><p class="cap">'+nf(totalN)+' new · peak '+nf(max)+'/day</p>'+
+      '<svg viewBox="0 0 '+W+' '+H+'" width="100%" preserveAspectRatio="none" id="trendSvg" style="overflow:visible">'+
+      grid+'<path d="'+area+'" fill="var(--seq)" opacity="0.14"/>'+
+      '<path d="'+line+'" fill="none" stroke="var(--seq)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>'+dots+
+      '<line id="trendCross" x1="0" y1="'+pad.t+'" x2="0" y2="'+(pad.t+ih)+'" stroke="var(--axis)" stroke-width="1" opacity="0"/>'+
+      '<text class="axislab" x="'+pad.l+'" y="'+H+'">'+days[0].day.slice(5)+'</text>'+
+      '<text class="axislab" x="'+(W-pad.r)+'" y="'+H+'" text-anchor="end">'+days[days.length-1].day.slice(5)+'</text></svg></div>';
+    return { html:html, days:days, X:X, Y:Y, pad:pad };
+  }
+  function wireTrendHover(tc){
+    var sv = el('trendSvg'); if (!sv) return; var cross = el('trendCross');
+    sv.addEventListener('pointermove', function(ev){
+      var r = sv.getBoundingClientRect();
+      var rel = (ev.clientX - r.left) / r.width * 320;
+      var i = Math.round((rel - tc.pad.l) / (320 - tc.pad.l - 6) * (tc.days.length - 1));
+      i = Math.max(0, Math.min(tc.days.length - 1, i)); var d = tc.days[i];
+      cross.setAttribute('x1', tc.X(i)); cross.setAttribute('x2', tc.X(i)); cross.setAttribute('opacity','0.8');
+      showTip(ev.clientX, r.top + tc.Y(d.cnt), d.cnt + ' finding' + (d.cnt===1?'':'s'), d.day);
+    });
+    sv.addEventListener('pointerleave', function(){ cross.setAttribute('opacity','0'); hideTip(); });
+  }
+  function skeletonTiles(){ return '<div class="grid-tiles">'+
+    '<div class="tile skel" style="height:78px"></div><div class="tile skel" style="height:78px"></div>'+
+    '<div class="tile skel" style="height:78px"></div><div class="tile skel" style="height:78px"></div></div>'; }
+  function skeletonCards(n){ var s=''; for(var i=0;i<n;i++) s+='<div class="listcard skel" style="height:78px;margin-bottom:11px"></div>'; return s; }
+  function errorHtml(err){
+    if (err && err.pending) return '<div class="empty">Your access is pending. Ask an admin to grant you a role, then reopen.</div>';
+    return '<div class="empty">Could not load data.'+(err&&err.error?'<br><span class="muted">'+esc(err.error)+'</span>':'')+'</div>';
+  }
 
-  var render = {};
+  // =====================================================================
+  //  ROOT: Overview
+  // =====================================================================
   render.overview = function(){
     var box = el('view-overview');
     box.innerHTML = skeletonTiles() + '<div class="card skel" style="height:150px"></div>';
@@ -6358,91 +6498,75 @@ const MINIAPP_HTML = `<!doctype html>
       var s = data.stats;
       el('sub').textContent = nf(s.companies)+' targets · '+nf(s.findings.total)+' findings';
       if (data.viewer && data.viewer.role){ var rc=el('role'); rc.hidden=false; rc.textContent=data.viewer.role; }
-      var tiles = '<div class="grid-tiles">' +
-        tile('Companies', s.companies, nf(s.domains)+' domains', 'var(--c-company)') +
-        tile('People', s.people, 'associates mapped', 'var(--c-person)') +
-        tile('Findings', s.findings.total, nf(s.findings.critical+s.findings.high)+' crit/high', 'var(--s-crit)') +
-        tile('Secrets', s.secrets, nf(s.services)+' services', 'var(--c-domain)') +
-      '</div>';
-      var opsTile = '<div class="grid-tiles">'+
-        tile('Active jobs', s.activeJobs, 'in the queue', 'var(--s-med)')+
-        tile('Runners', s.runnersOnline, s.runnersOnline+' of '+s.runnersTotal+' online', 'var(--s-low)')+
-      '</div>';
+      var f = s.findings; f.total = f.total!=null ? f.total : (f.critical+f.high+f.medium+f.low+f.info);
       var tc = trendCard(s.trend, s.sinceDay);
-      box.innerHTML = tiles + severityCard(s.findings) + tc.html +
+      var html = '<div class="fadein">'+
+        '<div class="grid-tiles">'+
+          tile('Companies', s.companies, nf(s.domains)+' domains', 'var(--c-company)') +
+          tile('People', s.people, 'associates mapped', 'var(--c-person)') +
+          tile('Findings', f.total, nf(f.critical+f.high)+' crit/high', 'var(--s-crit)') +
+          tile('Secrets', s.secrets, nf(s.services)+' services', 'var(--c-domain)') +
+        '</div>'+
+        severityCard(f) + tc.html +
         rankingCard('Top targets', s.topTargets, 'finding count') +
         rankingCard('Common open ports', (s.topPorts||[]).map(function(p){ return { name:'Port '+p.port, cnt:p.cnt }; }), 'service count') +
-        opsTile;
+        '<div class="grid-tiles">'+
+          tile('Active jobs', s.activeJobs, 'in the queue', 'var(--s-med)')+
+          tile('Runners', s.runnersOnline, s.runnersOnline+' of '+s.runnersTotal+' online', 'var(--s-low)')+
+        '</div></div>';
+      box.innerHTML = html;
       wireTrendHover(tc);
     });
   };
 
-  function wireTrendHover(tc){
-    var sv = el('trendSvg'); if (!sv) return;
-    var cross = el('trendCross');
-    sv.addEventListener('pointermove', function(ev){
-      var r = sv.getBoundingClientRect();
-      var rel = (ev.clientX - r.left) / r.width * 320;
-      var i = Math.round((rel - tc.pad.l) / (320 - tc.pad.l - 6) * (tc.days.length - 1));
-      i = Math.max(0, Math.min(tc.days.length - 1, i));
-      var d = tc.days[i];
-      cross.setAttribute('x1', tc.X(i)); cross.setAttribute('x2', tc.X(i)); cross.setAttribute('opacity','0.8');
-      showTip(ev.clientX, r.top + tc.Y(d.cnt), d.cnt + ' finding' + (d.cnt===1?'':'s'), d.day);
-    });
-    sv.addEventListener('pointerleave', function(){ cross.setAttribute('opacity','0'); hideTip(); });
-  }
-
   // =====================================================================
-  //  COMPANIES
+  //  ROOT: Companies  (cards -> company detail)
   // =====================================================================
   render.companies = function(){
     var box = el('view-companies');
-    box.innerHTML = '<div class="search"><span class="ic">&#x1F50D;</span>'+
-      '<input id="cq" placeholder="Search companies…" autocomplete="off"></div>'+
-      '<div id="clist">'+skeletonCards(4)+'</div>';
+    box.innerHTML = '<div class="search"><span class="ic">'+IC.search+'</span>'+
+      '<input id="cq" placeholder="Search companies…" autocomplete="off"></div><div id="clist">'+skeletonCards(4)+'</div>';
     api('/app/api/companies', function(err, data){
       if (err) { el('clist').innerHTML = errorHtml(err); return; }
       var all = data.companies || [];
       function draw(q){
         var list = all.filter(function(c){ return !q || (c.name||'').toLowerCase().indexOf(q)>=0; });
-        if (!list.length){ el('clist').innerHTML = '<div class="empty">No companies'+(q?' match &ldquo;'+esc(q)+'&rdquo;':' yet')+'.</div>'; return; }
-        el('clist').innerHTML = list.map(companyCard).join('');
-        bindTipTargets(el('clist'));
+        var host = el('clist');
+        if (!list.length){ host.innerHTML = '<div class="empty">No companies'+(q?' match':' yet')+'.</div>'; return; }
+        host.innerHTML = list.map(companyCard).join('');
+        stag(host);
+        Array.prototype.forEach.call(host.children, function(node, i){
+          node.addEventListener('click', function(){ haptic('light'); openCompany(list[i].id, list[i].name); });
+        });
       }
       draw('');
       el('cq').addEventListener('input', function(e){ draw(e.target.value.trim().toLowerCase()); });
     });
   };
   function companyCard(c){
-    var sevs = [['critical',c.crit,'var(--s-crit)'],['high',c.high,'var(--s-high)'],
-      ['medium',c.med,'var(--s-med)'],['low',c.low,'var(--s-low)'],['info',c.info,'var(--s-info)']];
-    var tot = (c.crit||0)+(c.high||0)+(c.med||0)+(c.low||0)+(c.info||0);
-    var micro = tot ? '<div class="microbar">'+ sevs.map(function(s){
-      var w=(s[1]||0)/tot*100; return w>0?'<i style="width:'+w+'%;background:'+s[2]+'" data-tt="'+esc(s[0])+': '+(s[1]||0)+'"></i>':''; }).join('') +'</div>' : '';
-    return '<div class="listcard">'+
+    return '<div class="listcard tappable">'+
       '<div class="r1"><span class="name">'+esc(c.name||'(unnamed)')+'</span>'+
-        '<span class="big">'+nf(c.findings||0)+'<small>findings</small></span></div>'+
+        '<span class="big">'+nf(c.findings||0)+'<small>findings</small></span>'+
+        '<span class="chev">'+IC.chevR+'</span></div>'+
       '<div class="chips">'+
         '<span class="chip"><span class="dot" style="background:var(--c-domain)"></span><b>'+nf(c.domains||0)+'</b> domains</span>'+
         '<span class="chip"><span class="dot" style="background:var(--c-person)"></span><b>'+nf(c.people||0)+'</b> people</span>'+
         (c.crit? '<span class="chip"><span class="dot" style="background:var(--s-crit)"></span><b>'+nf(c.crit)+'</b> critical</span>':'')+
         (c.high? '<span class="chip"><span class="dot" style="background:var(--s-high)"></span><b>'+nf(c.high)+'</b> high</span>':'')+
-      '</div>'+ micro +'</div>';
+      '</div>'+ microbar(c) +'</div>';
   }
 
   // =====================================================================
-  //  PEOPLE
+  //  ROOT: People  (cards -> person detail)
   // =====================================================================
   var peopleMode = 'cards';
   render.people = function(){
     var box = el('view-people');
     box.innerHTML = '<div id="pstat"></div>'+
-      '<div class="search"><span class="ic">&#x1F50D;</span>'+
+      '<div class="search"><span class="ic">'+IC.search+'</span>'+
       '<input id="pq" placeholder="Search people / companies…" autocomplete="off"></div>'+
-      '<div style="display:flex;align-items:center;margin-bottom:10px">'+
-        '<span class="muted" style="font-size:12px" id="pcount"></span>'+
-        '<span class="viewtoggle"><button id="pcards" aria-pressed="true">Cards</button>'+
-        '<button id="ptable" aria-pressed="false">Table</button></span></div>'+
+      '<div style="display:flex;align-items:center;margin-bottom:10px"><span class="muted" style="font-size:12px" id="pcount"></span>'+
+        '<span class="viewtoggle"><button id="pcards" aria-pressed="true">Cards</button><button id="ptable" aria-pressed="false">Table</button></span></div>'+
       '<div id="plist">'+skeletonCards(4)+'</div>';
     api('/app/api/people', function(err, data){
       if (err) { el('plist').innerHTML = errorHtml(err); return; }
@@ -6453,27 +6577,31 @@ const MINIAPP_HTML = `<!doctype html>
         tile('People', all.length, 'associates mapped', 'var(--c-person)')+
         tile('Breached', withBreach, nf(withAcc)+' accounts found', 'var(--s-crit)')+'</div>';
       function draw(q){
-        var list = all.filter(function(p){ return !q ||
-          (p.name||'').toLowerCase().indexOf(q)>=0 || (p.company||'').toLowerCase().indexOf(q)>=0; });
+        var list = all.filter(function(p){ return !q || (p.name||'').toLowerCase().indexOf(q)>=0 || (p.company||'').toLowerCase().indexOf(q)>=0; });
         el('pcount').textContent = list.length + ' shown';
-        if (!list.length){ el('plist').innerHTML='<div class="empty">No people'+(q?' match':' yet')+'.</div>'; return; }
-        el('plist').innerHTML = peopleMode==='table' ? peopleTable(list) : list.map(personCard).join('');
+        var host = el('plist');
+        if (!list.length){ host.innerHTML='<div class="empty">No people'+(q?' match':' yet')+'.</div>'; return; }
+        if (peopleMode==='table'){ host.innerHTML = peopleTable(list);
+          Array.prototype.forEach.call(host.querySelectorAll('tbody tr'), function(tr,i){ tr.style.cursor='pointer';
+            tr.addEventListener('click', function(){ haptic('light'); openPerson(list[i].id, list[i].name); }); });
+        } else {
+          host.innerHTML = list.map(personCard).join(''); stag(host);
+          Array.prototype.forEach.call(host.children, function(node,i){ node.addEventListener('click', function(){ haptic('light'); openPerson(list[i].id, list[i].name); }); });
+        }
       }
       draw('');
       el('pq').addEventListener('input', function(e){ draw(e.target.value.trim().toLowerCase()); });
-      function setMode(m){ peopleMode=m;
-        el('pcards').setAttribute('aria-pressed', m==='cards'); el('ptable').setAttribute('aria-pressed', m==='table');
-        draw(el('pq').value.trim().toLowerCase()); }
+      function setMode(m){ peopleMode=m; el('pcards').setAttribute('aria-pressed', m==='cards'); el('ptable').setAttribute('aria-pressed', m==='table'); draw(el('pq').value.trim().toLowerCase()); }
       el('pcards').addEventListener('click', function(){ setMode('cards'); });
       el('ptable').addEventListener('click', function(){ setMode('table'); });
     });
   };
+  function initials(name){ return String(name||'?').trim().split(/ +/).map(function(w){return w[0];}).slice(0,2).join('').toUpperCase(); }
   function personCard(p){
-    var initials = (p.name||'?').split(/\s+/).map(function(w){return w[0];}).slice(0,2).join('').toUpperCase();
-    return '<div class="listcard"><div class="r1">'+
-      '<span class="dot" style="width:26px;height:26px;border-radius:8px;display:inline-grid;place-items:center;'+
-        'background:var(--surface-3);color:var(--ink-2);font-size:11px;font-weight:700">'+esc(initials)+'</span>'+
-      '<span class="name" style="margin-left:9px">'+esc(p.name)+'</span></div>'+
+    return '<div class="listcard tappable"><div class="r1">'+
+      '<span class="avatar">'+esc(initials(p.name))+'</span>'+
+      '<span class="name" style="margin-left:4px">'+esc(p.name)+'</span>'+
+      '<span class="chev" style="margin-left:auto">'+IC.chevR+'</span></div>'+
       '<div class="chips">'+
         (p.company? '<span class="chip"><span class="dot" style="background:var(--c-company)"></span>'+esc(p.company)+'</span>':'<span class="chip muted">no company</span>')+
         '<span class="chip"><b>'+nf(p.emails)+'</b> emails</span>'+
@@ -6482,42 +6610,134 @@ const MINIAPP_HTML = `<!doctype html>
       '</div></div>';
   }
   function peopleTable(list){
-    var head = '<table class="tbl"><thead><tr><th>Name</th><th>Company</th>'+
-      '<th class="r">Emails</th><th class="r">Acct</th><th class="r">Breach</th></tr></thead><tbody>';
+    var head = '<table class="tbl"><thead><tr><th>Name</th><th>Company</th><th class="r">Emails</th><th class="r">Acct</th><th class="r">Breach</th></tr></thead><tbody>';
     var body = list.map(function(p){ return '<tr><td>'+esc(p.name)+'</td><td class="muted">'+esc(p.company||'—')+'</td>'+
       '<td class="r">'+nf(p.emails)+'</td><td class="r">'+nf(p.accounts)+'</td>'+
       '<td class="r" style="color:'+(p.breaches?'var(--s-crit)':'inherit')+'">'+nf(p.breaches)+'</td></tr>'; }).join('');
     return head + body + '</tbody></table>';
   }
 
+  function sectionHead(label, count){
+    return '<div class="sect">'+esc(label)+(count!=null?'<span class="count">'+nf(count)+'</span>':'')+'</div>';
+  }
+
   // =====================================================================
-  //  MAP (force-directed connection graph)
+  //  DETAIL: Company
+  // =====================================================================
+  function openCompany(id, name){
+    pushSheet({ title: name || 'Company', subtitle:'Company', build: function(body){
+      body.innerHTML = '<div class="hero skel" style="height:92px"></div>'+skeletonCards(3);
+      api('/app/api/company?id='+encodeURIComponent(id), function(err, data){
+        if (err){ body.innerHTML = errorHtml(err); return; }
+        var co = data.company, sev = data.severity || {}, counts = data.counts || {};
+        sev.total = sev.total || 0;
+        var h = '<div class="fadein">';
+        h += '<div class="hero"><div class="htop"><div style="min-width:0">'+
+             '<div class="hname">'+esc(co.name||'(company)')+'</div>'+
+             (co.slug? '<div class="hdesc">'+esc(co.slug)+'</div>':'')+
+             '</div><div class="hbig"><div class="n">'+nf(sev.total)+'</div><div class="l">findings</div></div></div>'+
+             '<div class="chips" style="margin-top:12px">'+
+               '<span class="chip"><span class="dot" style="background:var(--c-domain)"></span><b>'+nf(counts.domains)+'</b> domains</span>'+
+               '<span class="chip"><span class="dot" style="background:var(--c-person)"></span><b>'+nf(counts.people)+'</b> people</span>'+
+               (sev.critical? '<span class="chip"><span class="dot" style="background:var(--s-crit)"></span><b>'+nf(sev.critical)+'</b> critical</span>':'')+
+               (sev.high? '<span class="chip"><span class="dot" style="background:var(--s-high)"></span><b>'+nf(sev.high)+'</b> high</span>':'')+
+             '</div>'+ microbar(sev) +'</div>';
+        if (sev.total) h += severityCard(sev);
+        var ppl = data.people || [];
+        h += sectionHead('Associates', ppl.length);
+        if (!ppl.length) h += '<div class="empty">No people mapped.</div>';
+        else h += '<div id="co-people">'+ ppl.map(function(p){
+          return '<div class="row-item tappable"><span class="avatar">'+esc(initials(p.name))+'</span>'+
+            '<div class="main"><div class="ttl">'+esc(p.name)+'</div>'+
+            '<div class="meta">'+plur(p.emails,'email','emails')+(p.breaches?' · '+plur(p.breaches,'breach','breaches'):'')+'</div></div>'+
+            '<span class="chev">'+IC.chevR+'</span></div>'; }).join('') +'</div>';
+        var doms = data.domains || [];
+        h += sectionHead('Assets (domains)', counts.domains);
+        if (!doms.length) h += '<div class="empty">No domains yet.</div>';
+        else h += doms.map(function(d){
+          return '<div class="row-item"><div class="main"><div class="ttl mono">'+esc(d.host)+'</div>'+
+            '<div class="meta">'+plur(d.findings,'finding','findings')+' · '+plur(d.services,'service','services')+'</div></div></div>'; }).join('');
+        var fs = data.findings || [];
+        h += sectionHead('Top findings', fs.length);
+        if (!fs.length) h += '<div class="empty">No findings recorded.</div>';
+        else h += fs.map(function(f){ var sv=(f.severity||'info').toLowerCase();
+          return '<div class="row-item"><span class="sevtag" style="background:'+(SEVC[sv]||SEVC.info)+'">'+esc(sv)+'</span>'+
+            '<div class="main"><div class="ttl">'+esc(f.title||f.vuln_type||'finding')+'</div>'+
+            '<div class="meta">'+esc(f.vuln_type||'')+(f.url?' · '+esc(f.url):'')+'</div></div></div>'; }).join('');
+        h += '</div>';
+        body.innerHTML = h;
+        var cp = body.querySelector('#co-people');
+        if (cp) Array.prototype.forEach.call(cp.children, function(node,i){ node.addEventListener('click', function(){ haptic('light'); openPerson(ppl[i].id, ppl[i].name); }); });
+      });
+    }});
+  }
+
+  // =====================================================================
+  //  DETAIL: Person
+  // =====================================================================
+  function openPerson(id, name){
+    pushSheet({ title: name || 'Person', subtitle:'Associate', build: function(body){
+      body.innerHTML = '<div class="hero skel" style="height:92px"></div>'+skeletonCards(2);
+      api('/app/api/person?id='+encodeURIComponent(id), function(err, data){
+        if (err){ body.innerHTML = errorHtml(err); return; }
+        var p = data.person;
+        var h = '<div class="fadein"><div class="hero"><div class="htop">'+
+          '<span class="avatar" style="width:46px;height:46px;border-radius:12px;font-size:16px">'+esc(initials(p.name))+'</span>'+
+          '<div style="min-width:0;margin-left:4px"><div class="hname">'+esc(p.name)+'</div>'+
+          (p.company? '<div class="hdesc">at '+esc(p.company)+'</div>':'<div class="hdesc muted">no company</div>')+'</div></div>'+
+          '<div class="chips" style="margin-top:12px">'+
+            (p.company_id? '<span class="chip tap" id="toCompany"><span class="dot" style="background:var(--c-company)"></span>'+esc(p.company)+' '+IC.chevR+'</span>':'')+
+            '<span class="chip"><b>'+nf((p.emails||[]).length)+'</b> emails</span>'+
+            '<span class="chip"><b>'+nf((p.accounts||[]).length)+'</b> accounts</span>'+
+            (p.breaches&&p.breaches.length? '<span class="chip"><span class="dot" style="background:var(--s-crit)"></span><b>'+nf(p.breaches.length)+'</b> breaches</span>':'')+
+          '</div></div>';
+        var emails = p.emails||[];
+        h += sectionHead('Emails', emails.length);
+        h += emails.length ? emails.map(function(e){ return '<div class="row-item"><div class="main"><div class="ttl mono">'+esc(e)+'</div></div></div>'; }).join('') : '<div class="empty">No emails found.</div>';
+        var phones = p.phones||[];
+        if (phones.length){ h += sectionHead('Phones', phones.length); h += phones.map(function(ph){ return '<div class="row-item"><div class="main"><div class="ttl mono">'+esc(ph)+'</div></div></div>'; }).join(''); }
+        var breaches = p.breaches||[];
+        if (breaches.length){ h += sectionHead('Breaches', breaches.length);
+          h += breaches.map(function(b){ return '<div class="row-item"><span class="sevtag" style="background:'+SEVC.critical+'">breach</span>'+
+            '<div class="main"><div class="ttl">'+esc(b.name||b.title||'breach')+'</div>'+
+            (b.date||b.domain? '<div class="meta">'+esc(b.date||'')+(b.domain?' · '+esc(b.domain):'')+'</div>':'')+'</div></div>'; }).join(''); }
+        var accounts = p.accounts||[];
+        if (accounts.length){ h += sectionHead('Accounts', accounts.length);
+          h += accounts.map(function(a){ return '<div class="row-item"><div class="main"><div class="ttl">'+esc(a.name||a.site||a.platform||'account')+'</div>'+
+            (a.url? '<div class="meta mono">'+esc(a.url)+'</div>':'')+'</div></div>'; }).join(''); }
+        if (p.notes){ h += sectionHead('Notes'); h += '<div class="card" style="font-size:13px;color:var(--ink-2)">'+esc(p.notes)+'</div>'; }
+        h += '</div>';
+        body.innerHTML = h;
+        var tc = body.querySelector('#toCompany');
+        if (tc) tc.addEventListener('click', function(){ haptic('light'); openCompany(p.company_id, p.company); });
+      });
+    }});
+  }
+
+  // =====================================================================
+  //  ROOT: Map (force-directed graph)
   // =====================================================================
   render.map = function(){
     var box = el('view-map');
-    box.innerHTML =
-      '<div class="maptools"><div class="legend">'+
+    box.innerHTML = '<div class="maptools"><div class="legend">'+
         '<span><span class="dot" style="background:var(--c-company)"></span>Company</span>'+
         '<span><span class="dot" style="background:var(--c-domain)"></span>Asset</span>'+
-        '<span><span class="dot" style="background:var(--c-person)"></span>Associate</span>'+
-        '</div><button class="iconbtn" id="gReset" style="margin-left:auto" title="Reset view">&#x2316;</button></div>'+
-      '<p class="muted" style="font-size:11.5px;margin:0 0 10px">Each company links to its assets (domains) and associates (people). Drag to pan, pinch/scroll to zoom, tap a node for detail.</p>'+
+        '<span><span class="dot" style="background:var(--c-person)"></span>Associate</span></div>'+
+        '<button class="iconbtn" id="gReset" style="margin-left:auto" title="Reset view"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="4"/></svg></button></div>'+
+      '<p class="muted" style="font-size:11.5px;margin:0 0 10px">Each company links to its assets (domains) and associates (people). Drag to pan, pinch/scroll to zoom, tap a company to open it.</p>'+
       '<div class="graphwrap" id="gw"><div class="empty" id="gload">Building graph…</div></div>';
     api('/app/api/graph', function(err, data){
       if (err) { el('gw').innerHTML = errorHtml(err); return; }
       buildGraph(data.nodes || [], data.links || []);
     });
   };
-
   function buildGraph(nodes, links){
     var wrap = el('gw');
     if (!nodes.length){ wrap.innerHTML = '<div class="empty">No mapped assets yet. Onboard a program and run recon to populate the graph.</div>'; return; }
-    // Cap for mobile perf: keep companies + highest-degree neighbours.
     var CAP = 220;
     if (nodes.length > CAP){
       var deg = {}; links.forEach(function(l){ deg[l.s]=(deg[l.s]||0)+1; deg[l.d]=(deg[l.d]||0)+1; });
-      nodes.sort(function(a,b){ var ra=a.t==='company'?1e6:0, rb=b.t==='company'?1e6:0;
-        return (rb+(deg[b.id]||0)) - (ra+(deg[a.id]||0)); });
+      nodes.sort(function(a,b){ var ra=a.t==='company'?1e6:0, rb=b.t==='company'?1e6:0; return (rb+(deg[b.id]||0)) - (ra+(deg[a.id]||0)); });
       nodes = nodes.slice(0, CAP);
       var keep = {}; nodes.forEach(function(n){ keep[n.id]=1; });
       links = links.filter(function(l){ return keep[l.s] && keep[l.d]; });
@@ -6525,131 +6745,69 @@ const MINIAPP_HTML = `<!doctype html>
     var W = wrap.clientWidth, H = wrap.clientHeight;
     var id2n = {}; nodes.forEach(function(n,i){
       n.x = W/2 + Math.cos(i*2.4)*Math.min(W,H)*0.3*Math.random()+ (Math.random()-0.5)*40;
-      n.y = H/2 + Math.sin(i*2.4)*Math.min(W,H)*0.3*Math.random()+ (Math.random()-0.5)*40;
-      n.vx=0; n.vy=0; n.deg=0; id2n[n.id]=n; });
-    var edges = [];
-    links.forEach(function(l){ var s=id2n[l.s], d=id2n[l.d]; if(s&&d){ edges.push({s:s,d:d}); s.deg++; d.deg++; } });
-
-    function radius(n){ if(n.t==='company') return 7 + Math.min(10, Math.sqrt(n.v||0)*1.6);
-      return n.t==='domain' ? 4.2 : 4.8; }
-
+      n.y = H/2 + Math.sin(i*2.4)*Math.min(W,H)*0.3*Math.random()+ (Math.random()-0.5)*40; n.vx=0; n.vy=0; n.deg=0; id2n[n.id]=n; });
+    var edges = []; links.forEach(function(l){ var s=id2n[l.s], d=id2n[l.d]; if(s&&d){ edges.push({s:s,d:d}); s.deg++; d.deg++; } });
+    function radius(n){ if(n.t==='company') return 7 + Math.min(11, Math.sqrt(n.v||0)*1.7); return n.t==='domain'?4.2:4.8; }
     var svgEl = svg('svg', { viewBox:'0 0 '+W+' '+H });
-    var gRoot = svg('g', {});
-    var gLinks = svg('g', { stroke:'var(--axis)', 'stroke-width':'1', 'stroke-opacity':'0.45' });
-    var gNodes = svg('g', {});
-    var gLabels = svg('g', {});
-    gRoot.appendChild(gLinks); gRoot.appendChild(gNodes); gRoot.appendChild(gLabels);
-    svgEl.appendChild(gRoot);
+    var gRoot = svg('g', {}); var gLinks = svg('g', { stroke:'var(--axis)', 'stroke-width':'1', 'stroke-opacity':'0.45' });
+    var gNodes = svg('g', {}); var gLabels = svg('g', {});
+    gRoot.appendChild(gLinks); gRoot.appendChild(gNodes); gRoot.appendChild(gLabels); svgEl.appendChild(gRoot);
     wrap.innerHTML=''; wrap.appendChild(svgEl);
     var countEl = document.createElement('div'); countEl.className='gcount';
-    countEl.textContent = nodes.length + ' nodes · ' + edges.length + ' links';
-    wrap.appendChild(countEl);
-
+    countEl.textContent = nodes.length + ' nodes · ' + edges.length + ' links'; wrap.appendChild(countEl);
     var lineEls = edges.map(function(e){ var ln=svg('line',{}); gLinks.appendChild(ln); return ln; });
     var nodeEls = nodes.map(function(n){
       var c = svg('circle', { r:radius(n), fill:TYPE[n.t], stroke:'var(--surface)', 'stroke-width':'1.5' });
       c.style.cursor='pointer';
-      c.addEventListener('pointerenter', function(ev){ var rb=wrap.getBoundingClientRect();
-        showTip(ev.clientX, ev.clientY, n.label, n.t==='company'? ((n.v||0)+' findings · '+n.deg+' linked') : (n.t+' · linked to company')); });
+      c.addEventListener('pointerenter', function(ev){ showTip(ev.clientX, ev.clientY, n.label, n.t==='company'? ((n.v||0)+' findings · '+n.deg+' linked') : (n.t+' · linked to company')); });
       c.addEventListener('pointerleave', hideTip);
-      c.addEventListener('click', function(ev){ ev.stopPropagation(); var rb=wrap.getBoundingClientRect();
-        showTip(ev.clientX, ev.clientY, n.label, n.t==='company'? ((n.v||0)+' findings'):(n.t)); });
+      c.addEventListener('click', function(ev){ ev.stopPropagation(); if(n.t==='company' && n.id.indexOf('c:')===0){ haptic('light'); openCompany(n.id.slice(2), n.label); } });
       gNodes.appendChild(c); return c;
     });
-    // Labels only for companies (avoid clutter).
     var labelEls = nodes.map(function(n){ if(n.t!=='company') return null;
       var t = svg('text', { class:'gnode-label', 'text-anchor':'middle' });
-      t.textContent = n.label.length>18 ? n.label.slice(0,17)+'…' : n.label;
-      gLabels.appendChild(t); return t; });
-
-    // --- Force simulation (velocity Verlet; cooling alpha) ---
+      t.textContent = n.label.length>18 ? n.label.slice(0,17)+'…' : n.label; gLabels.appendChild(t); return t; });
     var alpha = 1, K = Math.sqrt((W*H) / Math.max(nodes.length,1));
     function step(){
       var i,j,a,b,dx,dy,dist,f;
-      // Repulsion (O(n^2); node count is capped).
       for (i=0;i<nodes.length;i++){ a=nodes[i];
-        for (j=i+1;j<nodes.length;j++){ b=nodes[j];
-          dx=a.x-b.x; dy=a.y-b.y; dist=Math.sqrt(dx*dx+dy*dy)||0.5;
-          f = (K*K)/(dist*dist) * alpha * 0.9;
-          var ux=dx/dist, uy=dy/dist;
-          a.vx+=ux*f; a.vy+=uy*f; b.vx-=ux*f; b.vy-=uy*f;
-        }
-      }
-      // Spring attraction along edges.
-      for (i=0;i<edges.length;i++){ a=edges[i].s; b=edges[i].d;
-        dx=b.x-a.x; dy=b.y-a.y; dist=Math.sqrt(dx*dx+dy*dy)||0.5;
-        f = (dist - (a.t==='company'||b.t==='company'?70:40)) * 0.02 * alpha;
-        var vx2=dx/dist*f, vy2=dy/dist*f;
-        a.vx+=vx2; a.vy+=vy2; b.vx-=vx2; b.vy-=vy2;
-      }
-      // Gravity to centre + integrate with damping.
-      for (i=0;i<nodes.length;i++){ a=nodes[i];
-        a.vx += (W/2 - a.x)*0.004*alpha; a.vy += (H/2 - a.y)*0.004*alpha;
-        a.vx*=0.86; a.vy*=0.86;
-        if (!a.fixed){ a.x+=Math.max(-18,Math.min(18,a.vx)); a.y+=Math.max(-18,Math.min(18,a.vy)); }
-        a.x=Math.max(8,Math.min(W-8,a.x)); a.y=Math.max(8,Math.min(H-8,a.y));
-      }
-      alpha *= 0.985;
+        for (j=i+1;j<nodes.length;j++){ b=nodes[j]; dx=a.x-b.x; dy=a.y-b.y; dist=Math.sqrt(dx*dx+dy*dy)||0.5;
+          f=(K*K)/(dist*dist)*alpha*0.9; var ux=dx/dist, uy=dy/dist; a.vx+=ux*f; a.vy+=uy*f; b.vx-=ux*f; b.vy-=uy*f; } }
+      for (i=0;i<edges.length;i++){ a=edges[i].s; b=edges[i].d; dx=b.x-a.x; dy=b.y-a.y; dist=Math.sqrt(dx*dx+dy*dy)||0.5;
+        f=(dist-(a.t==='company'||b.t==='company'?70:40))*0.02*alpha; var vx2=dx/dist*f, vy2=dy/dist*f; a.vx+=vx2; a.vy+=vy2; b.vx-=vx2; b.vy-=vy2; }
+      for (i=0;i<nodes.length;i++){ a=nodes[i]; a.vx+=(W/2-a.x)*0.004*alpha; a.vy+=(H/2-a.y)*0.004*alpha; a.vx*=0.86; a.vy*=0.86;
+        a.x+=Math.max(-18,Math.min(18,a.vx)); a.y+=Math.max(-18,Math.min(18,a.vy)); a.x=Math.max(8,Math.min(W-8,a.x)); a.y=Math.max(8,Math.min(H-8,a.y)); }
+      alpha*=0.985;
     }
     function draw(){
-      for (var i=0;i<edges.length;i++){ var e=edges[i], ln=lineEls[i];
-        ln.setAttribute('x1',e.s.x); ln.setAttribute('y1',e.s.y);
-        ln.setAttribute('x2',e.d.x); ln.setAttribute('y2',e.d.y); }
+      for (var i=0;i<edges.length;i++){ var e=edges[i], ln=lineEls[i]; ln.setAttribute('x1',e.s.x); ln.setAttribute('y1',e.s.y); ln.setAttribute('x2',e.d.x); ln.setAttribute('y2',e.d.y); }
       for (i=0;i<nodes.length;i++){ nodeEls[i].setAttribute('cx',nodes[i].x); nodeEls[i].setAttribute('cy',nodes[i].y);
         if (labelEls[i]){ labelEls[i].setAttribute('x',nodes[i].x); labelEls[i].setAttribute('y',nodes[i].y - radius(nodes[i]) - 4); } }
     }
-    var frames = 0;
-    function tick(){ var steps = alpha>0.3?2:1; for (var s=0;s<steps;s++) step(); draw();
-      frames++; if (alpha>0.02 && frames<600) requestAnimationFrame(tick); }
+    var frames=0;
+    function tick(){ var steps=alpha>0.3?2:1; for(var s=0;s<steps;s++) step(); draw(); frames++; if(alpha>0.02 && frames<600) requestAnimationFrame(tick); }
     requestAnimationFrame(tick);
-
-    // --- Pan + zoom (pointer) ---
-    var view = { x:0, y:0, k:1 };
+    var view={ x:0,y:0,k:1 };
     function applyView(){ gRoot.setAttribute('transform','translate('+view.x+','+view.y+') scale('+view.k+')'); }
     var dragging=false, last=null, pointers={};
-    svgEl.addEventListener('pointerdown', function(e){ pointers[e.pointerId]={x:e.clientX,y:e.clientY};
-      dragging=true; last={x:e.clientX,y:e.clientY}; svgEl.setPointerCapture(e.pointerId); });
+    svgEl.addEventListener('pointerdown', function(e){ pointers[e.pointerId]={x:e.clientX,y:e.clientY}; dragging=true; last={x:e.clientX,y:e.clientY}; svgEl.setPointerCapture(e.pointerId); });
     svgEl.addEventListener('pointermove', function(e){ if(!dragging) return;
-      if (Object.keys(pointers).length>=2){ // pinch
-        var ids=Object.keys(pointers); var p1=pointers[ids[0]], p2=pointers[ids[1]];
-        var prev=Math.hypot(p1.x-p2.x,p1.y-p2.y); pointers[e.pointerId]={x:e.clientX,y:e.clientY};
-        p1=pointers[ids[0]]; p2=pointers[ids[1]]; var now=Math.hypot(p1.x-p2.x,p1.y-p2.y);
-        if(prev>0){ view.k=Math.max(0.3,Math.min(3, view.k*(now/prev))); applyView(); }
-        return;
-      }
-      pointers[e.pointerId]={x:e.clientX,y:e.clientY};
-      view.x += e.clientX-last.x; view.y += e.clientY-last.y; last={x:e.clientX,y:e.clientY}; applyView(); hideTip();
-    });
+      if (Object.keys(pointers).length>=2){ var ids=Object.keys(pointers); var p1=pointers[ids[0]], p2=pointers[ids[1]]; var prev=Math.hypot(p1.x-p2.x,p1.y-p2.y);
+        pointers[e.pointerId]={x:e.clientX,y:e.clientY}; p1=pointers[ids[0]]; p2=pointers[ids[1]]; var now=Math.hypot(p1.x-p2.x,p1.y-p2.y);
+        if(prev>0){ view.k=Math.max(0.3,Math.min(3, view.k*(now/prev))); applyView(); } return; }
+      pointers[e.pointerId]={x:e.clientX,y:e.clientY}; view.x+=e.clientX-last.x; view.y+=e.clientY-last.y; last={x:e.clientX,y:e.clientY}; applyView(); hideTip(); });
     function up(e){ dragging=false; delete pointers[e.pointerId]; }
     svgEl.addEventListener('pointerup', up); svgEl.addEventListener('pointercancel', up);
-    svgEl.addEventListener('wheel', function(e){ e.preventDefault();
-      var f = e.deltaY<0?1.1:0.9; view.k=Math.max(0.3,Math.min(3,view.k*f)); applyView(); }, { passive:false });
-    el('gReset').addEventListener('click', function(){ view={x:0,y:0,k:1}; applyView(); });
-  }
-
-  // ---- shared bits ----
-  function bindTipTargets(scope){
-    scope.querySelectorAll('[data-tt]').forEach(function(n){
-      n.addEventListener('pointerenter', function(ev){ showTip(ev.clientX, ev.clientY, n.getAttribute('data-tt'), ''); });
-      n.addEventListener('pointerleave', hideTip);
-    });
-  }
-  function skeletonTiles(){ return '<div class="grid-tiles">'+
-    '<div class="tile skel" style="height:78px"></div><div class="tile skel" style="height:78px"></div>'+
-    '<div class="tile skel" style="height:78px"></div><div class="tile skel" style="height:78px"></div></div>'; }
-  function skeletonCards(n){ var s=''; for(var i=0;i<n;i++) s+='<div class="listcard skel" style="height:72px;margin-bottom:11px"></div>'; return s; }
-  function errorHtml(err){
-    if (err && err.pending) return '<div class="empty">Your access is pending. Ask an admin to grant you a role, then reopen.</div>';
-    return '<div class="empty">Could not load data.'+(err&&err.error?'<br><span class="muted">'+esc(err.error)+'</span>':'')+'</div>';
+    svgEl.addEventListener('wheel', function(e){ e.preventDefault(); var f=e.deltaY<0?1.1:0.9; view.k=Math.max(0.3,Math.min(3,view.k*f)); applyView(); }, { passive:false });
+    el('gReset').addEventListener('click', function(){ haptic('light'); view={x:0,y:0,k:1}; applyView(); });
   }
 
   // ---- boot ----
   el('refresh').addEventListener('click', function(){
-    if (tg && tg.HapticFeedback) { try { tg.HapticFeedback.impactOccurred('light'); } catch(e){} }
-    cache = {}; loaded = {};
-    var cur = document.querySelector('nav.tabs button[aria-selected="true"]').getAttribute('data-view');
-    loaded[cur] = true; render[cur]();
-    if (cur!=='overview') render.overview && (loaded.overview=true, render.overview());
+    haptic('light'); cache = {}; loaded = {};
+    while (sheets.length) popSheet(true);
+    loaded[curView] = true; render[curView]();
+    if (curView!=='overview'){ loaded.overview = true; render.overview(); }
   });
   document.body.addEventListener('click', hideTip);
 
@@ -7121,6 +7279,86 @@ app.get('/app/api/graph', async (c) => {
       links.push({ s: 'c:' + p.company_id, d: 'p:' + p.id });
     }
     return c.json({ ok: true, nodes, links });
+  } catch (err) { return c.json({ error: 'internal', detail: err.message }, 500); }
+});
+
+// Company detail: hero counts + severity breakdown, its domains (with per-host
+// finding/service counts), its associates, and its top findings.
+app.get('/app/api/company', async (c) => {
+  const authz = await authorizeMiniApp(c);
+  if (!authz.ok) return c.json({ error: authz.pending ? 'pending' : 'unauthorized' }, 401);
+  const id = c.req.query('id');
+  if (!id) return c.json({ error: 'missing id' }, 400);
+  try {
+    const company = await c.env.DB.prepare(
+      "SELECT id, name, slug, description FROM companies WHERE id=?"
+    ).bind(id).first();
+    if (!company) return c.json({ error: 'not found' }, 404);
+    const severity = await c.env.DB.prepare(
+      "SELECT count(*) AS total, " +
+      " sum(CASE WHEN lower(severity)='critical' THEN 1 ELSE 0 END) AS critical, " +
+      " sum(CASE WHEN lower(severity)='high' THEN 1 ELSE 0 END) AS high, " +
+      " sum(CASE WHEN lower(severity)='medium' THEN 1 ELSE 0 END) AS medium, " +
+      " sum(CASE WHEN lower(severity)='low' THEN 1 ELSE 0 END) AS low, " +
+      " sum(CASE WHEN lower(severity)='info' THEN 1 ELSE 0 END) AS info, " +
+      " sum(CASE WHEN status='resolved' THEN 1 ELSE 0 END) AS resolved " +
+      "FROM findings WHERE company_id=?"
+    ).bind(id).first();
+    const domains = (await c.env.DB.prepare(
+      "SELECT d.id, d.host, d.canonical_url, " +
+      " (SELECT count(*) FROM findings f WHERE f.domain_id=d.id) AS findings, " +
+      " (SELECT count(*) FROM network_services s WHERE s.domain_id=d.id) AS services " +
+      "FROM domains d WHERE d.company_id=? ORDER BY findings DESC, d.host LIMIT 400"
+    ).bind(id).all()).results || [];
+    const peopleRows = (await c.env.DB.prepare(
+      "SELECT id, given_name, family_name, emails, data FROM people WHERE company_id=? ORDER BY created_at DESC LIMIT 200"
+    ).bind(id).all()).results || [];
+    const people = peopleRows.map((p) => {
+      let em = [], os = {};
+      try { em = JSON.parse(p.emails || '[]'); } catch { em = []; }
+      try { const d = JSON.parse(p.data || '{}'); os = d.osint || d || {}; } catch { os = {}; }
+      const br = Array.isArray(os.breaches) ? os.breaches.length : (os.breaches || 0);
+      return { id: p.id, name: [p.given_name, p.family_name].filter(Boolean).join(' ') || '(unnamed)',
+        emails: em.length, breaches: Number(br) || 0 };
+    });
+    const findings = (await c.env.DB.prepare(
+      "SELECT id, title, severity, vuln_type, url, tool, status FROM findings WHERE company_id=? " +
+      "ORDER BY CASE lower(severity) WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 " +
+      "WHEN 'low' THEN 3 ELSE 4 END, created_at DESC LIMIT 80"
+    ).bind(id).all()).results || [];
+    const domainCount = (await c.env.DB.prepare("SELECT count(*) AS cnt FROM domains WHERE company_id=?").bind(id).first())?.cnt || 0;
+    const peopleCount = (await c.env.DB.prepare("SELECT count(*) AS cnt FROM people WHERE company_id=?").bind(id).first())?.cnt || 0;
+    return c.json({ ok: true, company, severity, domains, people, findings,
+      counts: { domains: domainCount, people: peopleCount, findings: severity?.total || 0 } });
+  } catch (err) { return c.json({ error: 'internal', detail: err.message }, 500); }
+});
+
+// Person detail: identity + company link + parsed OSINT (emails, phones,
+// breaches, accounts) from the people.data JSON blob.
+app.get('/app/api/person', async (c) => {
+  const authz = await authorizeMiniApp(c);
+  if (!authz.ok) return c.json({ error: authz.pending ? 'pending' : 'unauthorized' }, 401);
+  const id = c.req.query('id');
+  if (!id) return c.json({ error: 'missing id' }, 400);
+  try {
+    const p = await c.env.DB.prepare(
+      "SELECT p.id, p.given_name, p.family_name, p.emails, p.phones, p.notes, p.data, " +
+      " c.id AS company_id, c.name AS company " +
+      "FROM people p LEFT JOIN companies c ON p.company_id=c.id WHERE p.id=?"
+    ).bind(id).first();
+    if (!p) return c.json({ error: 'not found' }, 404);
+    let emails = [], phones = [], osint = {};
+    try { emails = JSON.parse(p.emails || '[]'); } catch { emails = []; }
+    try { phones = JSON.parse(p.phones || '[]'); } catch { phones = []; }
+    try { const d = JSON.parse(p.data || '{}'); osint = d.osint || d || {}; } catch { osint = {}; }
+    const arr = (x) => Array.isArray(x) ? x : [];
+    const breaches = arr(osint.breaches).map((b) => typeof b === 'string' ? { name: b } : (b || {}));
+    const accounts = arr(osint.accounts).map((a) => typeof a === 'string' ? { name: a } : (a || {}));
+    return c.json({ ok: true, person: {
+      id: p.id, name: [p.given_name, p.family_name].filter(Boolean).join(' ') || '(unnamed)',
+      company: p.company || null, company_id: p.company_id || null, notes: p.notes || null,
+      emails, phones, breaches, accounts,
+    } });
   } catch (err) { return c.json({ error: 'internal', detail: err.message }, 500); }
 });
 
