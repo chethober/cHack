@@ -3369,6 +3369,35 @@ const getBot = (env) => {
     );
   });
 
+  // Review discovered / pending programs and kick off parsing+approval.
+  bot.command(["programs", "discovered"], async (ctx) => {
+    await registerUser(ctx);
+    if (!(await requireRole(ctx, 'operator', 'program.list', 'program'))) return;
+    const { results } = await env.DB.prepare(
+      "SELECT id, platform, handle, name, status FROM bb_programs WHERE status IN ('new','pending_approval') ORDER BY created_at DESC LIMIT 15"
+    ).all();
+    if (!results || !results.length) {
+      return await ctx.reply("🗂️ No programs awaiting review. Discovery runs periodically (<code>/discover</code> to run now), or paste one with <code>/onboard</code>.", { parse_mode: "HTML" });
+    }
+    const kb = results.map(p => [{
+      text: `${p.status === 'pending_approval' ? '🪪' : '🔎'} ${(p.name || p.handle).slice(0, 48)} [${p.platform}]`,
+      callback_data: `onboard_review:${p.id}`,
+    }]);
+    await ctx.reply("🗂️ <b>Discovered / pending programs</b>\nTap one to parse its scope and review for approval:", { parse_mode: "HTML", reply_markup: { inline_keyboard: kb } });
+  });
+
+  // Manually trigger a discovery sweep (otherwise the cron runs it periodically).
+  bot.command("discover", async (ctx) => {
+    await registerUser(ctx);
+    if (!(await requireRole(ctx, 'operator', 'program.discover', 'program'))) return;
+    const runner = ctx.session?.selected_runner || 'default';
+    const jobId = crypto.randomUUID();
+    await env.DB.prepare(
+      "INSERT INTO scan_jobs (id, command, domain, runner, status, job_type, requested_by_number_id, source) VALUES (?, '--discover --sender-id 0', '', ?, 'pending', 'discover', ?, 'telegram')"
+    ).bind(jobId, runner, ctx.from.id).run();
+    await ctx.reply("🛰️ <b>Discovery sweep queued.</b> I'll message you when new programs are found, then review them with <code>/programs</code>.", { parse_mode: "HTML" });
+  });
+
   // ----------------------------------------------------
   // Continuous monitoring commands
   // ----------------------------------------------------
@@ -4300,6 +4329,25 @@ const getBot = (env) => {
       await auditLog(env, { actor_number_id: ctx.from.id, actor_label: ctx.from.username, source: 'telegram', action: 'program.apply', decision: 'allow', target_type: 'program', target: prog.handle || prog.name, detail: { program_id: pid, job_id: jobId } });
       await ctx.answerCallbackQuery({ text: "Approved — writing scope.txt on the runner" }).catch(() => {});
       await safeEditMessageText(ctx, `✅ <b>Approved</b> <code>${escapeHtml(prog.handle || prog.name || pid)}</code>\n\nThe runner is appending the approved hosts to <code>scope.txt</code>, then monitoring will pick them up.`, { parse_mode: "HTML" });
+    } else if (data.startsWith("onboard_review:")) {
+      if (!(await requireRole(ctx, 'operator', 'program.onboard', 'program'))) return;
+      const pid = data.slice("onboard_review:".length);
+      const prog = await env.DB.prepare("SELECT * FROM bb_programs WHERE id = ?").bind(pid).first();
+      if (!prog) { await ctx.answerCallbackQuery({ text: "Program not found", show_alert: true }).catch(() => {}); return; }
+      if (!prog.scope_raw) {
+        await ctx.answerCallbackQuery({ text: "No auto-scope — onboard manually", show_alert: true }).catch(() => {});
+        await ctx.reply(`ℹ️ <b>${escapeHtml(prog.name || prog.handle)}</b> has no machine-readable scope (that platform needs auth). Onboard it manually:\n<code>/onboard ${escapeHtml(prog.platform)} ${escapeHtml(prog.handle)}</code>\nthen paste its scope text.`, { parse_mode: "HTML" });
+        return;
+      }
+      // Route the resulting gate back to whoever tapped review.
+      await env.DB.prepare("UPDATE bb_programs SET created_by=? WHERE id=?").bind(ctx.from.id, pid).run();
+      const runner = ctx.session?.selected_runner || 'default';
+      const jobId = crypto.randomUUID();
+      await env.DB.prepare(
+        "INSERT INTO scan_jobs (id, command, domain, runner, status, job_type, requested_by_number_id, source) VALUES (?, ?, '', ?, 'pending', 'onboard', ?, 'telegram')"
+      ).bind(jobId, `--onboard-process ${pid} --sender-id ${ctx.from.id}`, runner, ctx.from.id).run();
+      await ctx.answerCallbackQuery({ text: "Parsing scope…" }).catch(() => {});
+      await safeEditMessageText(ctx, `🔎 Parsing <code>${escapeHtml(prog.name || prog.handle)}</code> [${escapeHtml(prog.platform)}]… I'll send the proposed scope to approve.`, { parse_mode: "HTML" });
     } else if (data.startsWith("onboard_no:")) {
       if (!(await requireRole(ctx, 'operator', 'program.skip', 'program'))) return;
       const pid = data.slice("onboard_no:".length);
@@ -7018,6 +7066,42 @@ app.post('/api/runner/program/applied', async (c) => {
   return c.json({ success: true });
 });
 
+// Phase 3 auto-discovery: the runner pushes discovered candidate programs here.
+// New ones (deduped by platform+handle) are stored as 'new' and the operator is
+// sent a single summary to review with /programs. Nothing is scanned or scoped
+// automatically — discovery only surfaces programs; onboarding stays human-gated.
+app.post('/api/runner/discovered', async (c) => {
+  if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
+  const body = await c.req.json().catch(() => ({}));
+  const cands = Array.isArray(body.candidates) ? body.candidates : [];
+  const adminRaw = String((c.env.ADMIN_IDS || '').split(',')[0] || '').trim();
+  const adminId = /^\d+$/.test(adminRaw) ? Number(adminRaw) : null;
+  const newNames = [];
+  for (const cand of cands) {
+    if (!cand || !cand.platform || !cand.handle) continue;
+    const id = crypto.randomUUID();
+    let res;
+    try {
+      res = await c.env.DB.prepare(
+        "INSERT OR IGNORE INTO bb_programs (id, platform, handle, name, url, scope_raw, roe_raw, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?)"
+      ).bind(id, String(cand.platform), String(cand.handle), String(cand.name || cand.handle), String(cand.url || ''), String(cand.scope_raw || ''), String(cand.roe_raw || ''), adminId).run();
+    } catch (e) { continue; }
+    if (res && res.meta && res.meta.changes > 0) newNames.push(`${cand.name || cand.handle} [${cand.platform}]`);
+  }
+  if (newNames.length && adminId) {
+    try {
+      const bot = getBot(c.env);
+      const esc = (s) => String(s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
+      const list = newNames.slice(0, 20).map(n => `  • ${esc(n)}`).join("\n");
+      const more = newNames.length > 20 ? `\n  …and ${newNames.length - 20} more` : "";
+      await bot.api.sendMessage(adminId,
+        `🛰️ <b>Discovery:</b> ${newNames.length} new bug-bounty program(s) found:\n${list}${more}\n\nReview and onboard with <code>/programs</code>.`,
+        { parse_mode: "HTML" });
+    } catch (e) { console.error('discovery notify:', e.message); }
+  }
+  return c.json({ success: true, new: newNames.length, total: cands.length });
+});
+
 // Start a new pipeline: seed a single root job and let triggers cascade.
 app.post('/api/pipeline/start', async (c) => {
   const body = await c.req.json().catch(() => ({}));
@@ -7089,6 +7173,28 @@ app.delete('/api/rules/:id', async (c) => {
 const scheduled = async (event, env, ctx) => {
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
+
+  // Phase 3 auto-discovery: at most once every DISCOVERY_INTERVAL_MS, enqueue a
+  // runner job that pulls public programs from the platform feeds. The runner
+  // posts new candidates to /api/runner/discovered; nothing is scoped until the
+  // operator reviews them via /programs. Self-throttled with a sessions key so
+  // it fires on only one of the (frequent) cron ticks.
+  try {
+    const DISCOVERY_INTERVAL_MS = Number(env.DISCOVERY_INTERVAL_MS) || 6 * 60 * 60 * 1000;
+    const row = await env.DB.prepare("SELECT value FROM sessions WHERE key = 'last_discovery_at'").first();
+    const last = row ? Number(row.value) || 0 : 0;
+    if (nowMs - last >= DISCOVERY_INTERVAL_MS) {
+      const jobId = crypto.randomUUID();
+      await env.DB.prepare(
+        "INSERT INTO scan_jobs (id, command, domain, runner, status, job_type, source) VALUES (?, '--discover --sender-id 0', '', 'default', 'pending', 'discover', 'daemon')"
+      ).bind(jobId).run();
+      await env.DB.prepare(
+        "INSERT INTO sessions (key, value) VALUES ('last_discovery_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      ).bind(String(nowMs)).run();
+    }
+  } catch (err) {
+    console.error("scheduled: discovery dispatch failed:", err.message);
+  }
 
   let due = [];
   try {

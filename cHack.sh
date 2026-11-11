@@ -3069,12 +3069,13 @@ runner_poll_for_jobs() {
             runner_update_status "$job_id" "failed"
             return
         fi
-    elif [ "$job_type" = "onboard" ]; then
+    elif [ "$job_type" = "onboard" ] || [ "$job_type" = "discover" ]; then
         # Onboarding parses a candidate program's scope and (on human approval)
-        # appends approved hosts to scope.txt. It scans nothing, so host-
-        # scope_guard does not apply — a brand-new program is by definition not
-        # yet in scope. The parse/apply themselves only ever ADD exact hosts via
-        # scope_parser (never a wildcard), and apply runs only after approval.
+        # appends approved hosts to scope.txt; discovery pulls public program
+        # lists. Neither scans a host, so host-scope_guard does not apply — a
+        # brand-new program is by definition not yet in scope. The parse/apply
+        # only ever ADD exact hosts via scope_parser (never a wildcard), and
+        # apply runs only after approval.
         :
     elif [ -n "$domain" ] && [ "$domain" != "null" ]; then
         # Enforce scope before executing a queue-supplied job. Fail closed (daemon
@@ -3168,6 +3169,9 @@ main() {
     local ONBOARD_LIST=false
     local ONBOARD_PROCESS_ID=""
     local ONBOARD_APPLY_REMOTE_ID=""
+    local DISCOVER=false
+    local DISCOVER_PLATFORMS="yeswehack,bugcrowd"
+    local DISCOVER_LIMIT="25"
     SENDER_ID=""
 
     while [[ $# -gt 0 ]]; do
@@ -3251,6 +3255,20 @@ main() {
             --onboard-apply-remote)
                 if [ $# -lt 2 ]; then log_error "Option $1 requires a program id."; exit 1; fi
                 ONBOARD_APPLY_REMOTE_ID="$2"
+                shift 2
+                ;;
+            --discover)
+                DISCOVER=true
+                shift
+                ;;
+            --discover-platforms)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                DISCOVER_PLATFORMS="$2"
+                shift 2
+                ;;
+            --discover-limit)
+                if [ $# -lt 2 ]; then log_error "Option $1 requires an argument."; exit 1; fi
+                DISCOVER_LIMIT="$2"
                 shift 2
                 ;;
             --update-tools)
@@ -3480,6 +3498,24 @@ main() {
         pr_emit=$(printf '%s' "$pr_parsed" | jq -r '.stats.emit_count')
         log_info "onboard-process: parsed ${ONBOARD_PROCESS_ID} (${pr_emit} emittable hosts) — awaiting approval."
         emit_result "{\"job_type\":\"onboard\",\"stage\":\"parsed\",\"emit\":${pr_emit:-0}}"
+        exit 0
+    fi
+    if [ "$DISCOVER" = true ]; then
+        # Pull public programs from the platform feeds and push new candidates to
+        # the backend, which dedupes and notifies the operator to review them.
+        # No scanning, no scope writes — discovery only surfaces programs.
+        log_info "discover: pulling public programs (${DISCOVER_PLATFORMS}, limit ${DISCOVER_LIMIT})…"
+        local disc_json disc_payload disc_new
+        disc_json=$(python3 "$SCRIPT_DIR/program_discovery.py" --platforms "$DISCOVER_PLATFORMS" --limit "$DISCOVER_LIMIT" 2>/dev/null)
+        if [ -z "$disc_json" ]; then log_error "discover: no output from program_discovery.py"; exit 1; fi
+        disc_payload=$(printf '%s' "$disc_json" | jq -c '{candidates: .candidates}')
+        local disc_count
+        disc_count=$(printf '%s' "$disc_json" | jq -r '.count')
+        disc_new=$(curl -fsSL --max-time 45 -X POST "${BACKEND_URL}/api/runner/discovered" \
+            -H "Authorization: Bearer ${RUNNER_TOKEN:-}" -H "Content-Type: application/json" \
+            -d "$disc_payload" 2>/dev/null | jq -r '.new // 0')
+        log_info "discover: ${disc_count} candidate(s) pulled, ${disc_new:-0} new stored."
+        emit_result "{\"job_type\":\"discover\",\"pulled\":${disc_count:-0},\"new\":${disc_new:-0}}"
         exit 0
     fi
     if [ -n "$ONBOARD_APPLY_REMOTE_ID" ]; then
