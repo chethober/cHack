@@ -2391,18 +2391,49 @@ const miniAppUrl = (env) => {
   return origin.startsWith('https://') ? `${origin}/app` : '';
 };
 
-// One-time (per isolate) bot UI setup: the product is driven entirely by the
-// interactive dashboard (inline keyboard) and the Mini App, so we clear the
-// slash-command list (removes the ☰ command menu + "/" hints, including any
-// left over from BotFather) and point the ☰ menu button at the Mini App.
+// The slash commands advertised in Telegram's "/" autocomplete and the ☰ menu.
+// Kept short and task-focused; the full surface still lives in the dashboard
+// and Mini App.
+const BOT_COMMANDS = [
+  { command: 'start', description: 'Open the cHack control center' },
+  { command: 'programs', description: 'Review discovered bug-bounty programs' },
+  { command: 'onboard', description: 'Onboard a program from pasted scope' },
+  { command: 'discover', description: 'Sweep platforms for new programs' },
+  { command: 'monitor', description: 'Schedule continuous monitoring' },
+  { command: 'recon', description: 'Full recon scan of a domain' },
+  { command: 'web', description: 'Crawl and JS secret mining' },
+  { command: 'network', description: 'Port scan a target' },
+  { command: 'vulns', description: 'Show vulnerability findings' },
+  { command: 'report', description: 'Export a target report' },
+  { command: 'dashboard', description: 'Stats and activity overview' },
+  { command: 'help', description: 'Show command help' },
+];
+
+const BOT_SHORT_DESCRIPTION =
+  'Authorized-use recon & bug-bounty automation — discovers programs, proposes scope, scans only what you approve.';
+
+const BOT_DESCRIPTION =
+  'cHack C2 — authorized-use offensive-security automation.\n\n' +
+  '• Discovers public bug-bounty programs and proposes their scope\n' +
+  '• You approve what enters scope; nothing is scanned un-authorized\n' +
+  '• Runs recon, web/JS, network and vuln scans on in-scope targets\n' +
+  '• Continuous monitoring + findings, driven from here or the Mini App\n\n' +
+  'Send /start to begin. Use only on assets you are authorized to test.';
+
+// One-time (per isolate) bot UI setup: advertise the slash commands + profile
+// descriptions, and point the ☰ menu button at the Mini App when available.
 let botConfigured = false;
 const configureBotUI = async (env, bot) => {
-  await bot.api.setMyCommands([]); // no advertised commands
+  await bot.api.setMyCommands(BOT_COMMANDS);
+  try {
+    await bot.api.setMyShortDescription({ short_description: BOT_SHORT_DESCRIPTION });
+    await bot.api.setMyDescription({ description: BOT_DESCRIPTION });
+  } catch (e) { /* description set is best-effort */ }
   const url = miniAppUrl(env);
   await bot.api.setChatMenuButton(
     url
       ? { menu_button: { type: 'web_app', text: 'Open App', web_app: { url } } }
-      : { menu_button: { type: 'default' } }
+      : { menu_button: { type: 'commands' } }
   );
 };
 
@@ -2726,10 +2757,23 @@ const getBot = (env) => {
     }
     ctx.session.step = 'MAIN_MENU';
     const menuMarkup = await createMainMenu(ctx, env);
-    await ctx.reply("🛰️ <b>cHack C2 Control Center</b>\n\nWelcome back! Manage your targets, active reconnaissance jobs, vulnerability findings, and scanner runners below:", {
-      parse_mode: "HTML",
-      reply_markup: menuMarkup
-    });
+    await ctx.reply(
+      "🛰️ <b>cHack C2 Control Center</b>\n\n" +
+      "Authorized-use recon &amp; bug-bounty automation. Use the menu below, or:\n\n" +
+      "🪪 <b>Onboard &amp; discover</b>\n" +
+      "• <code>/programs</code> — review discovered programs &amp; approve scope\n" +
+      "• <code>/discover</code> — sweep platforms for new programs now\n" +
+      "• <code>/onboard</code> — add a program from pasted scope\n\n" +
+      "🎯 <b>Scan &amp; monitor</b> (in-scope targets only)\n" +
+      "• <code>/recon</code> · <code>/web</code> · <code>/network</code> · <code>/vulns</code> · <code>/report</code>\n" +
+      "• <code>/monitor</code> — schedule continuous monitoring\n\n" +
+      "Every new program's scope is <b>approved by you</b> before anything is scanned. " +
+      "<code>/help</code> for the full list.",
+      {
+        parse_mode: "HTML",
+        reply_markup: menuMarkup
+      }
+    );
   });
 
   bot.command(["app", "webapp"], async (ctx) => {
@@ -4247,6 +4291,11 @@ const getBot = (env) => {
       `• <code>/dashboard</code> or <code>/stats</code> - System stats & asset counts\n` +
       `• <code>/resetdb</code> - Wipe & reset Cloudflare DB\n` +
       `• <code>/help</code> - Show this guide\n\n` +
+      `<b>Program Onboarding & Discovery:</b>\n` +
+      `• <code>/programs</code> - Review discovered programs & approve scope\n` +
+      `• <code>/discover</code> - Sweep platforms (YesWeHack, Bugcrowd) now\n` +
+      `• <code>/onboard &lt;platform&gt; &lt;handle&gt;</code> - Onboard from pasted scope\n` +
+      `  <i>Every new program's scope is approved by you before any scan.</i>\n\n` +
       `<b>Targets & Assets Management:</b>\n` +
       `• <code>/targets</code> - Interactive target companies list\n` +
       `• <code>/contacts</code> - Interactive contacts/leads list\n` +
