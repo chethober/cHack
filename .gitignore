@@ -36,3 +36,6 @@ scope.txt
 # any agent working in this repo.
 .claude/*
 !.claude/skills/
+
+# Runtime state (runner update-check timestamp) — not versioned
+.last_update_check
