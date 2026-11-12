@@ -7716,6 +7716,70 @@ app.post('/api/runner/program/parsed', async (c) => {
   return c.json({ success: true, pending_approval: apprId });
 });
 
+// When a program's hosts are applied to scope.txt, make it actionable in the
+// backend too: attach/create a company, register its domains, and schedule a
+// daily passive monitor that fans out to every host (the existing monitor cron
+// turns that into per-host scan jobs). Best-effort — the caller must never fail
+// the apply if this throws. Disable with AUTOSTART_ONBOARD=false.
+const autostartOnboardedProgram = async (env, prog, hosts) => {
+  const out = { company_id: null, name: null, created_company: false, domains_added: 0, monitor: false };
+  const slug = String(prog.handle || prog.name || '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || ('program-' + Date.now());
+  const name = prog.name || prog.handle || slug;
+  out.name = name;
+
+  // Resolve or create the company.
+  const existingCo = await env.DB.prepare(
+    "SELECT id FROM companies WHERE lower(slug)=lower(?) OR lower(name)=lower(?) LIMIT 1"
+  ).bind(slug, name).first();
+  let companyId;
+  if (existingCo) {
+    companyId = existingCo.id;
+  } else {
+    companyId = crypto.randomUUID();
+    await env.DB.prepare(
+      "INSERT INTO companies (id, name, slug, description, data) VALUES (?, ?, ?, ?, ?)"
+    ).bind(companyId, name, slug, 'Onboarded bug-bounty program',
+      JSON.stringify({ source: 'onboard', platform: prog.platform || null, program_id: prog.id || null })).run();
+    out.created_company = true;
+  }
+  out.company_id = companyId;
+
+  // Register domains not already attached to this company (dedup by host).
+  const existing = new Set();
+  try {
+    const er = await env.DB.prepare("SELECT lower(host) AS h FROM domains WHERE company_id=?").bind(companyId).all();
+    for (const r of (er.results || [])) existing.add(r.h);
+  } catch { /* table always exists; ignore */ }
+  const stmts = [];
+  for (const host of (hosts || [])) {
+    const h = String(host || '').trim().toLowerCase();
+    if (!h || existing.has(h)) continue;
+    existing.add(h);
+    stmts.push(env.DB.prepare(
+      "INSERT INTO domains (id, company_id, host, canonical_url) VALUES (?, ?, ?, ?)"
+    ).bind(crypto.randomUUID(), companyId, h, 'https://' + h));
+  }
+  if (stmts.length) { await env.DB.batch(stmts); out.domains_added = stmts.length; }
+
+  // Schedule a daily passive company monitor (fans out to every host on the
+  // next monitor-cron tick). Needs a known approver to route alerts to, and we
+  // never create a second monitor for the same company.
+  if (prog.created_by) {
+    const existingMon = await env.DB.prepare(
+      "SELECT id FROM monitors WHERE target_type='company' AND lower(target)=lower(?) AND enabled=1 LIMIT 1"
+    ).bind(slug).first();
+    if (!existingMon) {
+      await env.DB.prepare(
+        "INSERT INTO monitors (id, owner_chat_id, target_type, target, scan_type, runner, interval_minutes, enabled, next_run_at) " +
+        "VALUES (?, ?, 'company', ?, 'infogather', 'default', 1440, 1, ?)"
+      ).bind(crypto.randomUUID(), prog.created_by, slug, new Date().toISOString()).run();
+      out.monitor = true;
+    }
+  }
+  return out;
+};
+
 app.post('/api/runner/program/applied', async (c) => {
   if (!runnerTokenOk(c)) return c.json({ error: 'unauthorized' }, 401);
   const body = await c.req.json().catch(() => ({}));
@@ -7724,17 +7788,35 @@ app.post('/api/runner/program/applied', async (c) => {
   await c.env.DB.prepare(
     "UPDATE bb_programs SET status='active', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?"
   ).bind(id).run();
-  const prog = await c.env.DB.prepare("SELECT created_by, handle, name FROM bb_programs WHERE id = ?").bind(id).first();
+  const prog = await c.env.DB.prepare("SELECT created_by, handle, name, platform FROM bb_programs WHERE id = ?").bind(id).first();
+  const hosts = Array.isArray(added) ? added : [];
+
+  // Auto-start: seed company + domains + daily monitor so the program actually
+  // begins without a second manual step. Guarded and best-effort — only when the
+  // program exists, hosts were applied, and the feature isn't disabled.
+  let seeded = null;
+  if (prog && hosts.length && String(c.env.AUTOSTART_ONBOARD || '').toLowerCase() !== 'false') {
+    try {
+      seeded = await autostartOnboardedProgram(c.env, { ...prog, id }, hosts);
+    } catch (e) { console.error("autostart failed:", e.message); }
+  }
+
   if (prog && prog.created_by) {
     try {
       const bot = getBot(c.env);
-      const n = Array.isArray(added) ? added.length : 0;
-      await bot.api.sendMessage(prog.created_by,
-        `✅ <b>Onboarded</b> <code>${String(prog.handle || prog.name || id).replace(/[&<>]/g, '')}</code> — ${n} host(s) now in scope.txt. Continuous monitoring will pick them up.`,
-        { parse_mode: "HTML" });
+      const n = hosts.length;
+      let msg = `✅ <b>Onboarded</b> <code>${escapeHtml(prog.handle || prog.name || id)}</code> — ${n} host(s) now in scope.txt.`;
+      if (seeded && (seeded.created_company || seeded.domains_added || seeded.monitor)) {
+        msg += `\n\n🏢 Company <b>${escapeHtml(seeded.name)}</b> registered` +
+          (seeded.domains_added ? ` with ${seeded.domains_added} domain(s)` : '') + '.';
+        if (seeded.monitor) msg += `\n🛰️ Daily passive monitoring scheduled — the first sweep runs on the next monitor tick (within ~15 min). Watch it in the mini app or with <code>/dashboard</code>.`;
+      } else {
+        msg += ` Continuous monitoring will pick them up.`;
+      }
+      await bot.api.sendMessage(prog.created_by, msg, { parse_mode: "HTML" });
     } catch (e) { console.error("applied notify failed:", e.message); }
   }
-  return c.json({ success: true });
+  return c.json({ success: true, seeded });
 });
 
 // Phase 3 auto-discovery: the runner pushes discovered candidate programs here.
